@@ -20,6 +20,7 @@ import {
   getBrowserbaseSession,
   getDefaultContext,
   getOrCreatePage,
+  normalizeBrowserbaseLiveURL,
   resolveBrowserbaseConfig,
   resolveSessionTimeoutSeconds,
   resolveVerifiedModeEnabled,
@@ -664,6 +665,31 @@ test('Browserbase live inspection exposes the SDK debugger URL', async () => {
   assert.deepEqual(calls.debug, [{ id: 'session-1', query: { expiresIn: 600 } }]);
 
   await inspection.close();
+  await closeBrowser(browser);
+});
+
+test('Browserbase live inspection uses the SDK URL and upgrades the legacy inspector path', async () => {
+  const legacyQuery = 'wss=connect.browserbase.com%2Fsessions%2Fsession-1';
+  const legacy = `https://www.browserbase.com/devtools-fullscreen/inspector.html?${legacyQuery}`;
+  const current = `https://www.browserbase.com/devtools-fullscreen-compiled/index.html?${legacyQuery}`;
+  assert.equal(normalizeBrowserbaseLiveURL(legacy), current);
+  assert.equal(normalizeBrowserbaseLiveURL(current), current);
+  assert.equal(normalizeBrowserbaseLiveURL('not a url'), null);
+  assert.equal(normalizeBrowserbaseLiveURL('javascript:alert(1)'), null);
+
+  const { client, calls } = fakeBrowserbaseClient({ debugResponse: { debuggerFullscreenUrl: legacy } });
+  const browser = fakePlaywrightBrowser();
+  await connectBrowser({
+    client,
+    projectId: 'project-id',
+    connectOverCDP: async () => browser,
+  });
+  const page = { context: () => ({ browser: () => browser }) };
+
+  const inspection = await createLiveInspection(page, { timeoutMs: 60_000 });
+  assert.equal(inspection.liveURL, current);
+  assert.deepEqual(calls.debug, [{ id: 'session-1', query: { expiresIn: 60 } }]);
+
   await closeBrowser(browser);
 });
 
