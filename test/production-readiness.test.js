@@ -331,7 +331,10 @@ test('production allows Render origins and rejects unknown origins', async (t) =
 
 test('UI Clear All and sign-out flush backing state and dropdown entries', async (t) => {
   const { baseUrl } = await startServer(t);
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
   t.after(() => browser.close());
   const page = await browser.newPage();
   const pageErrors = [];

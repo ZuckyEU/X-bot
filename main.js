@@ -19,6 +19,10 @@ import { generateReply, MAX_REPLY_LENGTH, DEFAULT_TONE } from './lib/reply.js';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const AUTH_FILE = process.env.AUTH_FILE_PATH || join(ROOT, 'auth.json');
 const TWEET_URL_PATTERN = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
+const HEADLESS_BROWSER = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+const CONTAINER_BROWSER_ARGS = HEADLESS_BROWSER
+  ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  : [];
 
 const USAGE = `
 Usage: node main.js <tweet-url> [options]
@@ -353,13 +357,17 @@ async function main() {
 
   const authState = await loadAuthState();
 
+  const headless = options.headless || HEADLESS_BROWSER;
   const browser = await chromium.launch({
-    headless: options.headless,
-    args: options.headless ? [] : ['--start-maximized'],
+    headless,
+    args: [
+      ...CONTAINER_BROWSER_ARGS,
+      ...(headless ? [] : ['--start-maximized']),
+    ],
   });
 
   try {
-    const context = await browser.newContext({ viewport: options.headless ? undefined : null });
+    const context = await browser.newContext({ viewport: headless ? undefined : null });
     await context.addCookies(authState.cookies);
     const page = await context.newPage();
 

@@ -36,6 +36,11 @@ const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const IS_RENDER = Boolean(process.env.RENDER);
+const HEADLESS_BROWSER = IS_PRODUCTION || IS_RENDER;
+const CONTAINER_BROWSER_ARGS = HEADLESS_BROWSER
+  ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  : [];
 const MAX_BODY = '16kb';
 
 /** Only these cookies can be written through the API. */
@@ -1188,15 +1193,23 @@ async function waitForLogin(context, signal) {
 }
 
 /**
- * Launches headed Chromium with a fresh, empty browser context, waits for the user
+ * Launches Chromium with a fresh, empty browser context, waits for the user
  * to finish logging in, then saves Playwright storage state for that user/X account.
+ * Production/Render runs headless because containers have no X display.
  */
 async function runBrowserLogin({ send, signal, generation, user, requestedXUsername = null }) {
-  send({ type: 'start', command: `browser sign-in -> ${LOGIN_URL} (fresh empty context, headed Chromium)` });
+  send({
+    type: 'start',
+    command: `browser sign-in -> ${LOGIN_URL} (fresh empty context, ${HEADLESS_BROWSER ? 'headless' : 'headed'} Chromium)`,
+  });
 
   const browser = await chromium.launch({
-    headless: false,
-    args: ['--disable-blink-features=AutomationControlled', '--start-maximized'],
+    headless: HEADLESS_BROWSER,
+    args: [
+      ...CONTAINER_BROWSER_ARGS,
+      '--disable-blink-features=AutomationControlled',
+      ...(HEADLESS_BROWSER ? [] : ['--start-maximized']),
+    ],
     ignoreDefaultArgs: ['--enable-automation'],
   });
   let context = null;

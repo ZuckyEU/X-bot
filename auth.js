@@ -9,15 +9,19 @@ import { chromium } from 'playwright';
 /**
  * Manual X (Twitter) login helper.
  *
- * Opens a real, non-headless Chromium window on the X login page. You log in
- * yourself (password, 2FA, captcha — whatever X asks for), then press ENTER in
- * this terminal. The script then saves the session cookies to auth.json.
+ * Opens Chromium on the X login page. It stays headed locally so you can log in
+ * yourself, and runs headless in production/Render where no display is available.
+ * The script then saves the session cookies to auth.json.
  */
 
 const LOGIN_URL = 'https://x.com/login';
 const AUTH_FILE = join(dirname(fileURLToPath(import.meta.url)), 'auth.json');
 const SESSION_COOKIE = 'auth_token'; // set by X once you are actually logged in
 const LOGIN_WAIT_MS = 15_000;
+const HEADLESS_BROWSER = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+const CONTAINER_BROWSER_ARGS = HEADLESS_BROWSER
+  ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  : [];
 
 const banner = `
 ────────────────────────────────────────────────────────────
@@ -51,10 +55,19 @@ async function waitForSessionCookie(context, timeoutMs) {
 
 async function main() {
   console.log(banner);
+  if (HEADLESS_BROWSER) {
+    console.warn(
+      '[auth] Running headless because production/Render has no display. ' +
+        'Interactive sign-in needs a desktop session; run `npm run auth` locally and provide auth.json instead.',
+    );
+  }
 
   const browser = await chromium.launch({
-    headless: false,
-    args: ['--start-maximized'],
+    headless: HEADLESS_BROWSER,
+    args: [
+      ...CONTAINER_BROWSER_ARGS,
+      ...(HEADLESS_BROWSER ? [] : ['--start-maximized']),
+    ],
   });
 
   try {

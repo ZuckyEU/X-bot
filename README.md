@@ -114,7 +114,7 @@ Notes:
 
 Flow:
 
-1. You press the button in the admin UI → the server launches the **bundled Chromium** with a fresh, empty browser context (`chromium.launch({ headless: false })`, `--disable-blink-features=AutomationControlled`, `ignoreDefaultArgs: ["--enable-automation"]`) and opens the X login flow.
+1. You press the button in the admin UI → the server launches the **bundled Chromium** with a fresh, empty browser context and opens the X login flow. It runs headed locally, but headless on Render/production (`NODE_ENV=production` or `RENDER`) with `--no-sandbox`, `--disable-setuid-sandbox`, and `--disable-dev-shm-usage` for container stability. The interactive flow requires a display.
 2. You complete the login yourself in that window (password, 2FA, captcha, …).
 3. The server polls the browser context until X sets the `auth_token` session cookie, captures `context.cookies()` and saves them to `auth.json`.
 4. The browser closes; the session status refreshes.
@@ -122,7 +122,7 @@ Flow:
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
 ```
-{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (fresh empty context, headed Chromium)"}
+{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (fresh empty context, Chromium)"}
 {"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
 {"type":"stdout","data":"Waiting for you to finish logging in to X …"}
 {"type":"exit","code":0,"result":{"ok":true,"cookieCount":2}}
