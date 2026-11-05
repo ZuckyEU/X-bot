@@ -20,6 +20,8 @@ import {
   getBrowserbaseSession,
   getDefaultContext,
   getOrCreatePage,
+  hasXSessionCookies,
+  isXHomeURL,
   resolveBrowserbaseLiveURL,
   resolveBrowserbaseConfig,
   resolveSessionTimeoutSeconds,
@@ -30,7 +32,6 @@ import {
   X_LOGIN_URL,
   X_REFERER,
 } from '../lib/browser.js';
-import { automateXCredentialLogin } from '../lib/x-credentials.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
@@ -388,13 +389,6 @@ test('production accepts a strong secret and emits hardened session cookies', as
   assert.match(cookie, /SameSite=Strict/i);
   assert.match(cookie, /Secure/i);
 
-  const insecureCredentialRequest = await fetch(`${baseUrl}/auth/x/credentials`, {
-    method: 'POST',
-    headers: jsonHeaders(cookie.split(';', 1)[0]),
-    body: JSON.stringify({ identifier: 'production_user', password: 'not-sent-to-x' }),
-  });
-  assert.equal(insecureCredentialRequest.status, 400);
-  assert.match((await insecureCredentialRequest.json()).error, /requires HTTPS/);
 });
 test('production allows Render origins and rejects unknown origins', async (t) => {
   const { baseUrl } = await startServer(t, {
@@ -790,69 +784,15 @@ test('storage state restores cookies and localStorage while tenant profiles omit
   assert.deepEqual(trustedProfile.origins, [state.origins[0]]);
 });
 
-test('credential automation submits the X form and waits for an auth cookie', async () => {
-  const actions = [];
-  let authenticated = false;
-  const page = {
-    locator(selector) {
-      const kind = selector === 'input[name="username_or_email"]'
-        ? 'identifier'
-        : selector === 'input[name="password"]'
-          ? 'password'
-          : selector === 'body'
-            ? 'body'
-            : 'missing';
-      return {
-        first() { return this; },
-        isVisible: async () => kind === 'identifier' || kind === 'password',
-        fill: async (value) => actions.push({ kind, value }),
-        press: async (key) => {
-          actions.push({ kind, key });
-          if (kind === 'password' && key === 'Enter') authenticated = true;
-        },
-        innerText: async () => '',
-      };
-    },
-    waitForTimeout: async () => {},
-  };
-  const context = {
-    cookies: async () => authenticated ? [{ name: 'auth_token', value: 'session' }] : [],
-  };
+test('remote X sign-in detection recognizes home and both required cookies', () => {
+  assert.equal(isXHomeURL('https://x.com/home'), true);
+  assert.equal(isXHomeURL('https://mobile.twitter.com/home/'), true);
+  assert.equal(isXHomeURL('https://x.com/i/flow/login'), false);
+  assert.equal(isXHomeURL('https://example.test/home'), false);
 
-  const result = await automateXCredentialLogin({
-    context,
-    page,
-    identifier: 'test_user',
-    password: 'test-password',
-    timeoutMs: 2_000,
-  });
-  assert.deepEqual(result, { status: 'authenticated' });
-  assert.deepEqual(actions, [
-    { kind: 'identifier', value: 'test_user' },
-    { kind: 'password', value: 'test-password' },
-    { kind: 'password', key: 'Enter' },
-  ]);
-});
-
-test('credential automation stops immediately when X reports a temporary limit', async () => {
-  const page = {
-    locator(selector) {
-      return {
-        first() { return this; },
-        isVisible: async () => false,
-        innerText: async () => selector === 'body' ? "We've temporarily limited your login" : '',
-      };
-    },
-    waitForTimeout: async () => {},
-  };
-  const result = await automateXCredentialLogin({
-    context: { cookies: async () => [] },
-    page,
-    identifier: 'test_user',
-    password: 'test-password',
-    timeoutMs: 2_000,
-  });
-  assert.deepEqual(result, { status: 'temporarily_limited' });
+  assert.equal(hasXSessionCookies([{ name: 'auth_token', value: 'session' }, { name: 'ct0', value: 'csrf' }]), true);
+  assert.equal(hasXSessionCookies([{ name: 'auth_token' }]), false);
+  assert.equal(hasXSessionCookies([{ name: 'ct0' }]), false);
 });
 
 test('Browserbase contexts and pages use a realistic Chrome identity and stealth profile', async () => {
@@ -921,51 +861,6 @@ test('Browserbase contexts and pages use a realistic Chrome identity and stealth
   assert.equal(commands[1].method, 'Network.setUserAgentOverride');
 });
 
-test('remote sign-in completion requires an active sign-in run', async (t) => {
-  const { baseUrl } = await startServer(t);
-  const { cookie } = await register(baseUrl, 'remotecomplete');
-
-  const unauthorized = await fetch(`${baseUrl}/auth/x/complete`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({}),
-  });
-  assert.equal(unauthorized.status, 401);
-
-  const noRun = await fetch(`${baseUrl}/auth/x/complete`, {
-    method: 'POST',
-    headers: jsonHeaders(cookie),
-    body: JSON.stringify({}),
-  });
-  assert.equal(noRun.status, 409);
-  assert.match((await noRun.json()).error, /No X sign-in/);
-});
-
-test('credential sign-in requires app authentication and validates secrets before Browserbase', async (t) => {
-  const { baseUrl } = await startServer(t);
-  const { cookie } = await register(baseUrl, 'credentials');
-  const testPassword = 'X-Credential-Test-Password!';
-
-  const unauthorized = await fetch(`${baseUrl}/auth/x/credentials`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ identifier: 'x_user', password: testPassword }),
-  });
-  const unauthorizedText = await unauthorized.text();
-  assert.equal(unauthorized.status, 401);
-  assert.equal(unauthorizedText.includes(testPassword), false);
-
-  const missingPassword = await fetch(`${baseUrl}/auth/x/credentials`, {
-    method: 'POST',
-    headers: jsonHeaders(cookie),
-    body: JSON.stringify({ identifier: 'x_user' }),
-  });
-  const invalidBody = await missingPassword.text();
-  assert.equal(missingPassword.status, 400);
-  assert.equal(invalidBody.includes(testPassword), false);
-  assert.match(invalidBody, /password is required/i);
-});
-
 test('remote sign-in cancellation is authenticated and idempotent', async (t) => {
   const { baseUrl } = await startServer(t);
   const { cookie } = await register(baseUrl, 'remotecancel');
@@ -1004,9 +899,11 @@ test('container exposes the Render port and starts Node directly', async () => {
     server.indexOf("app.post('/auth/x'"),
   );
   assert.ok(loginFlow.indexOf('createLiveInspection(page') < loginFlow.indexOf('safeGoto(page, LOGIN_URL'));
+  assert.match(loginFlow, /waitForRemoteSignIn\(page, context, signal, send\)/);
+  assert.equal(server.includes('/auth/x/credentials'), false);
 });
 
-test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain stable', async (t) => {
+test('UI mobile dropdown, remote X handoff, Clear All, and sign-out remain stable', async (t) => {
   const { baseUrl } = await startServer(t);
   // Keep this browser local: the remote browser cannot reach the ephemeral 127.0.0.1 test server.
   const browser = await chromium.launch({
@@ -1058,38 +955,6 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
   }
   await page.setViewportSize({ width: 1280, height: 720 });
 
-  let submittedCredentials = null;
-  await page.route('**/auth/x/credentials', async (route) => {
-    submittedCredentials = JSON.parse(route.request().postData() ?? '{}');
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        ok: true,
-        username: 'directuser',
-        activeXAccount: 'directuser',
-        cookieCount: 3,
-        accounts: [{ xUsername: 'directuser', active: true, status: 'ready' }],
-      }),
-    });
-  });
-  await page.locator('#account-chip').click();
-  await page.locator('#add-x-account').click();
-  await page.locator('#x-credentials-modal').waitFor({ state: 'visible' });
-  await page.locator('#x-credential-identifier').fill('directuser');
-  await page.locator('#x-credential-password').fill('Direct-X-Password-123!');
-  await page.locator('#toggle-x-credential-password').click();
-  assert.equal(await page.locator('#x-credential-password').getAttribute('type'), 'text');
-  await page.locator('#x-credentials-submit').click();
-  await page.locator('#x-credentials-modal').waitFor({ state: 'hidden' });
-  assert.deepEqual(submittedCredentials, {
-    identifier: 'directuser',
-    password: 'Direct-X-Password-123!',
-  });
-  assert.equal(await page.locator('#x-credential-password').inputValue(), '');
-  assert.equal(await page.locator('.linked-account-item').count(), 1);
-  await page.unroute('**/auth/x/credentials');
-
   const liveUrl = `${baseUrl}/?browserless-live-test=1`;
   await page.route('**/auth/x', async (route) => {
     const events = [
@@ -1103,10 +968,9 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
     });
   });
   await page.locator('#account-chip').click();
-  await page.locator('#add-x-account').click();
   const [automaticRemoteTab] = await Promise.all([
     page.waitForEvent('popup'),
-    page.locator('#x-credentials-remote').click(),
+    page.locator('#add-x-account').click(),
   ]);
   await automaticRemoteTab.waitForURL(liveUrl);
   assert.equal(automaticRemoteTab.url(), liveUrl);
@@ -1123,8 +987,7 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
   assert.equal(await page.locator('#remote-login-open').getAttribute('target'), '_blank');
   assert.equal(await page.locator('#remote-login-open').getAttribute('rel'), 'noopener noreferrer');
   assert.equal(await page.locator('#remote-login-open').getAttribute('href'), 'about:blank');
-  assert.equal(await page.locator('#remote-login-complete').isEnabled(), true);
-  assert.equal(await page.locator('#remote-login-complete').textContent(), 'I’ve completed sign-in');
+  assert.equal(await page.locator('#remote-login-complete').count(), 0);
   assert.equal(await page.locator('#remote-login-iframe').count(), 0);
   assert.match(await page.locator('#remote-login-empty').textContent(), /new tab/i);
   const [remoteTab] = await Promise.all([
@@ -1158,7 +1021,6 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
     linkedAccounts: eval('linkedXAccounts.length'),
     targetUrls: eval('targetUrls.length'),
     controllerIsNull: eval('controller === null'),
-    credentialControllerIsNull: eval('credentialController === null'),
   }));
   assert.deepEqual(state, {
     currentUser: null,
@@ -1168,7 +1030,6 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
     linkedAccounts: 0,
     targetUrls: 0,
     controllerIsNull: true,
-    credentialControllerIsNull: true,
   });
   assert.equal(await page.locator('.linked-account-item').count(), 0);
   assert.equal(await page.locator('#run-url').inputValue(), '');

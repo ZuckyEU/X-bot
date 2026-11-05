@@ -113,31 +113,27 @@ Notes:
 - Automated posting/liking may violate X's automation rules and can get an account limited. This script handles one reply per run, on your own account — don't turn it into a mass-reply loop.
 - Gemini runs with thinking disabled (`thinkingBudget: 0`) so the whole token budget goes to the reply. Overload 503s are retried 3× with backoff before failing.
 
-## X sign-in via the web UI (Add X Account)
+## X sign-in via the web UI (Connect X Account)
 
-**Add X Account** opens a direct credential form by default. `POST /auth/x/credentials` accepts an X username/email/phone plus password over same-origin HTTPS, keeps the password in request memory only, and types it into a top-level **Browserbase remote Chromium** page at `https://x.com/i/flow/login`. The password is deleted from the parsed request immediately, never logged, never written to disk, and never returned by the API.
+**Connect X Account** starts an interactive Browserbase session immediately. The application never asks for or fills X credentials; enter the username, password, 2FA code, captcha, or other challenge directly in X's live remote browser at `https://x.com/i/flow/login`.
 
-After X sets `auth_token`, the server captures the complete Playwright storage state, atomically writes `sessions/<userId>/<xUsername>.json`, updates the linked-account list, and returns the refreshed accounts so the dropdown updates immediately. If X requests 2FA, email/phone verification, or a captcha, the API returns `challenge_required` and the modal offers the remote-window fallback. It does not attempt to bypass those checks. Production credential requests are rejected unless they arrive through HTTPS.
-
-### Remote challenge fallback
-
-`POST /auth/x` starts the interactive fallback on the same direct X login URL.
+`POST /auth/x` starts this interactive handoff and streams the live URL plus status events to the authenticated dashboard.
 
 Flow:
 
 1. The server creates a **Browserbase** session with `sessions.create()` using standard Free-tier-compatible stealth defaults (`browserSettings.verified` is not requested unless `BROWSERBASE_VERIFIED_MODE=true`), connects with `chromium.connectOverCDP(session.connectUrl)`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
 2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserbase debugger URL with `sessions.debug()`, and immediately emits it to the authenticated NDJSON client. The backend passes through the SDK's `debuggerFullscreenUrl` without rewriting or hardcoding Browserbase's debugger domain. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
-3. The dashboard intentionally does **not** embed the live stream. The 2FA/captcha action pre-opens a native tab and routes it to the debugger URL as soon as the event arrives; **Open Remote Sign-In Window** remains an explicit `window.open(liveUrl, '_blank')` fallback. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
+3. The dashboard intentionally does **not** embed the live stream. Clicking **Connect X Account** pre-opens a native tab and routes it to the debugger URL as soon as the event arrives; **Open Remote Sign-In Window** remains an explicit `window.open(liveUrl, '_blank')` fallback. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
 4. Sign in to X in the remote window, including 2FA or any challenge.
-5. Click **I’ve completed sign-in** in the dashboard. The server checks for the `auth_token` cookie, captures cookies and localStorage with `context.storageState()`, writes `sessions/<userId>/<xUsername>.json` under persistent `DATA_DIR`, updates the user's linked accounts, and refreshes the account list.
+5. The server watches for navigation to X's `/home` timeline or for both `auth_token` and `ct0`. It then captures cookies and localStorage with `context.storageState()`, atomically writes `sessions/<userId>/<xUsername>.json` under persistent `DATA_DIR`, updates the user's linked accounts, and refreshes the account list automatically.
 6. The browser disconnects and the Browserbase session is released with `REQUEST_RELEASE`, invalidating the debugger URL. The live link is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
-7. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and releases the Browserbase session so **Add X Account** can start a fresh session.
+7. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and releases the Browserbase session so **Connect X Account** can start a fresh session.
 
 Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keeps X guest/device cookies and X localStorage while deliberately removing `auth_token`, `ct0`, `twid`, and other account-authentication cookies, so adding another account reuses a consistent browser identity without silently opening the previously linked account. A request that explicitly supplies an already linked `xUsername` restores that account's complete storage state. Login state is checkpointed during the live session and saved atomically.
 
 An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserbase session region is still important.
 
-If the live link cannot be minted, the dashboard still exposes **I’ve completed sign-in** so an operator who can reach the Browserbase dashboard can finish there and confirm it.
+If the live link cannot be minted, start a new **Connect X Account** sign-in when the Browserbase session is available again.
 
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
@@ -145,13 +141,11 @@ If the live link cannot be minted, the dashboard still exposes **I’ve complete
 {"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (Browserbase remote Chromium)"}
 {"type":"live","status":"ready","url":"https://browserbase.com/sessions/…","expiresAt":"…"}
 {"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
-{"type":"stdout","data":"Waiting for you to complete sign-in in the remote window …"}
-{"type":"status","stage":"signed-in","data":"X session detected. Click I’ve completed sign-in to save it."}
-{"type":"stdout","data":"Login confirmed. Waiting for X home and account identity …"}
+{"type":"stdout","data":"Waiting for X sign-in to finish in the remote window …"}
+{"type":"status","stage":"signed-in","data":"X session cookies detected — saving the account automatically…"}
+{"type":"stdout","data":"Waiting for X home and account identity …"}
 {"type":"exit","code":0,"result":{"ok":true,"cookieCount":2,"username":"…"}}
 ```
-
-`POST /auth/x/complete` requires the same authenticated session as the active sign-in, asks the running Playwright flow to save the X session, and returns `{"ok":true}`. It returns `409` when no X sign-in is in progress and `403` if the active run belongs to another app user.
 
 `POST /auth/x/cancel` is idempotent: it returns `{ "ok": true, "cancelled": false }` when nothing is running, and otherwise clears the active sign-in lock, aborts the Playwright run, and releases the Browserbase session before replying. It is scoped to the authenticated app user.
 
@@ -176,9 +170,7 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `POST /api/auth/logout` | Clear `auth.json` |
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |
-| `POST /auth/x/credentials` | Direct X credential sign-in; password is memory-only, verifies `auth_token`, saves per-tenant storage state |
-| `POST /auth/x` | NDJSON: start → live → stdout/stderr/status → exit (Browserbase browser sign-in) |
-| `POST /auth/x/complete` | Confirm the active remote X sign-in; saves storage state and updates linked accounts |
+| `POST /auth/x` | NDJSON: start → live → auto-detect X session → save → exit (interactive Browserbase sign-in) |
 | `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and release the Browserbase session |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
 

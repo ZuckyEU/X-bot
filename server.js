@@ -16,13 +16,16 @@ import {
   createLiveInspection,
   getDefaultContext,
   getOrCreatePage,
+  hasXSessionCookies,
+  isXHomeURL,
   restoreStorageState,
   safeContextCall,
   safeGoto,
+  X_AUTH_COOKIE,
+  X_CSRF_COOKIE,
   X_LOGIN_URL,
   X_REFERER,
 } from './lib/browser.js';
-import { automateXCredentialLogin } from './lib/x-credentials.js';
 
 /**
  * Local service for the X reply automation.
@@ -31,10 +34,8 @@ import { automateXCredentialLogin } from './lib/x-credentials.js';
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
- *   POST /auth/x/credentials -> direct memory-only credential sign-in
  *   POST /auth/x     -> Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
- *   POST /auth/x/complete -> confirm the remote sign-in and save the X session
- *   POST /auth/x/cancel   -> cancel the active remote sign-in and close Browserbase
+ *   POST /auth/x/cancel -> cancel the active remote sign-in and release Browserbase
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
@@ -97,7 +98,6 @@ const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
 const LOGIN_URL = X_LOGIN_URL;
 const HOME_URL = 'https://x.com/home';
-const SESSION_COOKIE = 'auth_token';
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LIVE_VIEW_TIMEOUT_MS = (() => {
   const configured = Number(process.env.BROWSERBASE_LIVE_TIMEOUT_MS ?? process.env.BROWSERLESS_LIVE_TIMEOUT_MS);
@@ -106,8 +106,6 @@ const LIVE_VIEW_TIMEOUT_MS = (() => {
 })();
 const POST_LOGIN_TIMEOUT_MS = 60 * 1000;
 const AUTH_RUN_TIMEOUT_MS = LOGIN_TIMEOUT_MS + POST_LOGIN_TIMEOUT_MS + 5_000;
-const CREDENTIAL_LOGIN_TIMEOUT_MS = 60_000;
-const CREDENTIAL_RUN_TIMEOUT_MS = 110_000;
 const LOGIN_PROFILE_CHECKPOINT_MS = 15_000;
 const RESERVED_X_ROUTES = new Set(['home', 'explore', 'notifications', 'messages', 'search', 'compose', 'settings', 'i']);
 
@@ -361,12 +359,6 @@ function getClientIP(req) {
     'unknown';
 }
 
-function isSecureRequest(req) {
-  if (!IS_PRODUCTION) return true;
-  const forwardedProtocol = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase();
-  return req.secure || forwardedProtocol === 'https';
-}
-
 function publicUser(user) {
   return {
     id: user.id,
@@ -553,39 +545,6 @@ class ValidationError extends HttpError {
   }
 }
 
-class CredentialLoginError extends HttpError {
-  constructor(status, code, message) {
-    super(status, message);
-    this.code = code;
-  }
-}
-
-function validateXCredentials(body) {
-  const rawIdentifier = String(body?.identifier ?? body?.username ?? '').trim();
-  const identifier = /^\+?[\d\s().-]+$/.test(rawIdentifier)
-    ? rawIdentifier.replace(/[\s().-]/g, '')
-    : rawIdentifier;
-  const password = body?.password;
-  if (!identifier || identifier.length > 254 || /[\s\u0000-\u001f]/.test(identifier)) {
-    throw new ValidationError('Enter a valid X username, email address, or phone number');
-  }
-  if (typeof password !== 'string' || password.length < 1 || password.length > 256 || password.includes('\0')) {
-    throw new ValidationError('X password is required and must be at most 256 characters');
-  }
-  return { identifier, password };
-}
-
-function xUsernameCandidateFromIdentifier(identifier) {
-  const value = String(identifier ?? '').trim();
-  if (/^\+?\d{7,15}$/.test(value)) return null;
-  if (value.startsWith('@')) {
-    const candidate = value.slice(1).toLowerCase();
-    return /^[a-z0-9_]{1,15}$/.test(candidate) ? candidate : null;
-  }
-  const candidate = value.toLowerCase();
-  return /^[a-z0-9_]{1,15}$/.test(candidate) ? candidate : null;
-}
-
 function getGroqConfiguration(user) {
   const apiKey = String(user?.groqApiKey ?? '').trim() || null;
   return {
@@ -673,50 +632,6 @@ function createCompletionSignal() {
     resolve = done;
   });
   return { promise, resolve };
-}
-
-/** Coordinates the completion confirmation with the long-running login stream. */
-function createLoginControl() {
-  let requested = false;
-  let wake = null;
-
-  return {
-    get requested() {
-      return requested;
-    },
-    request() {
-      requested = true;
-      const resume = wake;
-      wake = null;
-      resume?.();
-    },
-    reset() {
-      requested = false;
-    },
-    wake() {
-      const resume = wake;
-      wake = null;
-      resume?.();
-    },
-    wait(timeoutMs) {
-      if (requested) return Promise.resolve(true);
-
-      return new Promise((resolve) => {
-        let settled = false;
-        const finish = (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          if (wake === onWake) wake = null;
-          resolve(value);
-        };
-        const onWake = () => finish(true);
-        const timer = setTimeout(() => finish(false), timeoutMs);
-        timer.unref?.();
-        wake = onWake;
-      });
-    },
-  };
 }
 
 async function stopActiveRunForUser(userId, { xUsername = null, type = null } = {}) {
@@ -1313,16 +1228,6 @@ function throwIfAborted(signal) {
   throw error;
 }
 
-function isXHomeUrl(value) {
-  try {
-    const url = value instanceof URL ? value : new URL(String(value));
-    const hostname = url.hostname.toLowerCase().replace(/^www\./, '');
-    return hostname === 'x.com' && /^\/home\/?$/.test(url.pathname);
-  } catch {
-    return false;
-  }
-}
-
 function usernameFromProfileHref(href) {
   try {
     const url = new URL(String(href ?? ''), HOME_URL);
@@ -1347,10 +1252,10 @@ async function waitForXHome(page, signal, deadline) {
 
   while (Date.now() < automaticRedirectDeadline) {
     throwIfAborted(signal);
-    if (isXHomeUrl(page.url())) return true;
+    if (isXHomeURL(page.url())) return true;
 
     try {
-      await page.waitForURL((url) => isXHomeUrl(url), {
+      await page.waitForURL((url) => isXHomeURL(url), {
         waitUntil: 'domcontentloaded',
         timeout: Math.max(1, Math.min(1_000, automaticRedirectDeadline - Date.now())),
       });
@@ -1369,7 +1274,7 @@ async function waitForXHome(page, signal, deadline) {
     .goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: Math.min(20_000, remaining) })
     .catch(() => null);
   throwIfAborted(signal);
-  return isXHomeUrl(page.url());
+  return isXHomeURL(page.url());
 }
 
 async function readSignedInUsername(page, signal) {
@@ -1439,8 +1344,10 @@ async function persistSignedInBrowserSession({
   );
   if (!storedState.ok) throw storedState.error;
   const storageState = storedState.value;
-  if (!storageState.cookies.some((cookie) => cookie.name === SESSION_COOKIE)) {
-    throw new Error('X authentication cookie was not present in the saved browser state');
+  if (!hasXSessionCookies(storageState.cookies)) {
+    throw new Error(
+      `X session cookies (${X_AUTH_COOKIE}, ${X_CSRF_COOKIE}) were not both present in the saved browser state`,
+    );
   }
 
   const payload = {
@@ -1475,10 +1382,11 @@ async function persistSignedInBrowserSession({
 }
 
 /**
- * Waits for the person to finish signing in in the remote window and click
- * confirmation button. A missing session cookie keeps the run open for a retry.
+ * Waits for the remote browser to reach X's home timeline or expose the two
+ * cookies required for a reusable session. The caller saves and releases the
+ * session immediately when either signal appears.
  */
-async function waitForManualSignIn(context, signal, loginControl, send) {
+async function waitForRemoteSignIn(page, context, signal, send) {
   const deadline = Date.now() + LOGIN_TIMEOUT_MS;
   let readyAnnounced = false;
 
@@ -1491,28 +1399,30 @@ async function waitForManualSignIn(context, signal, loginControl, send) {
       return { loggedIn: false, error: cookieResult.error };
     }
 
-    const hasSessionCookie = cookieResult.value.some((cookie) => cookie.name === SESSION_COOKIE);
-    if (hasSessionCookie && !readyAnnounced) {
-      readyAnnounced = true;
-      send({
-        type: 'status',
-        stage: 'signed-in',
-        data: 'X session detected. Click I’ve completed sign-in to save it.',
-      });
+    const cookiesReady = hasXSessionCookies(cookieResult.value);
+    let currentUrl = '';
+    try {
+      currentUrl = page?.url?.() ?? '';
+    } catch {
+      // The page can close while the remote viewer is being reused.
+    }
+    const homeReady = isXHomeURL(currentUrl);
+
+    if (cookiesReady || homeReady) {
+      if (!readyAnnounced) {
+        readyAnnounced = true;
+        send({
+          type: 'status',
+          stage: 'signed-in',
+          data: cookiesReady
+            ? 'X session cookies detected — saving the account automatically…'
+            : 'X home timeline detected — saving the account automatically…',
+        });
+      }
+      return { loggedIn: true, error: null };
     }
 
-    if (loginControl.requested) {
-      if (hasSessionCookie) return { loggedIn: true, error: null };
-
-      loginControl.reset();
-      send({
-        type: 'status',
-        stage: 'complete-pending',
-        data: 'No X session cookie found yet. Finish signing in in the remote window, then click I’ve completed sign-in again.',
-      });
-    }
-
-    await loginControl.wait(1_000);
+    await sleep(1_000);
   }
 
   throwIfAborted(signal);
@@ -1529,7 +1439,6 @@ async function runBrowserLogin({
   generation,
   user,
   requestedXUsername = null,
-  loginControl = createLoginControl(),
   onBrowserConnected = null,
 }) {
   send({
@@ -1566,7 +1475,6 @@ async function runBrowserLogin({
     return profileCheckpointPromise;
   };
   const closeBrowserOnAbort = () => {
-    loginControl.wake();
     void closeBrowser(browser);
   };
   signal?.addEventListener('abort', closeBrowserOnAbort, { once: true });
@@ -1619,13 +1527,13 @@ async function runBrowserLogin({
             send({
               type: 'status',
               stage: 'viewer-disconnected',
-              data: 'Remote viewer disconnected. Click I’ve completed sign-in once login is finished.',
+              data: 'Remote viewer disconnected. Sign-in will still be saved automatically when X reaches the home timeline.',
             });
           } else if (reason === 'closed') {
             send({
               type: 'status',
               stage: 'live-closed',
-              data: 'The remote sign-in link closed. The browser is still waiting for confirmation.',
+              data: 'The remote sign-in link closed. The browser is still waiting for X to finish signing in.',
             });
           }
         },
@@ -1639,13 +1547,13 @@ async function runBrowserLogin({
       });
       send({
         type: 'stdout',
-        data: 'Remote sign-in window ready. Finish signing in there, then confirm completion in the dashboard.',
+        data: 'Remote sign-in window ready. Finish signing in there; the session saves automatically.',
       });
     } catch (error) {
       send({ type: 'live', status: 'error', message: error.message });
       send({
         type: 'stderr',
-        data: `${error.message}. If you can open the Browserbase dashboard, finish there and then confirm sign-in.`,
+        data: `${error.message}. If you can open the Browserbase dashboard, finish there; the session saves automatically.`,
       });
     }
 
@@ -1671,9 +1579,9 @@ async function runBrowserLogin({
     profileCheckpointTimer = setInterval(() => void checkpointTrustedProfile(), LOGIN_PROFILE_CHECKPOINT_MS);
     profileCheckpointTimer.unref?.();
 
-    send({ type: 'stdout', data: 'Waiting for you to complete sign-in in the remote window …' });
+    send({ type: 'stdout', data: 'Waiting for X sign-in to finish in the remote window …' });
 
-    const login = await waitForManualSignIn(context, signal, loginControl, send);
+    const login = await waitForRemoteSignIn(page, context, signal, send);
     if (login.error) {
       send({
         type: 'stderr',
@@ -1685,7 +1593,7 @@ async function runBrowserLogin({
       send({
         type: 'stderr',
         data: login.timedOut
-          ? 'X sign-in timed out before completion was confirmed — nothing was saved.'
+          ? 'X sign-in timed out before the home timeline or session cookies appeared — nothing was saved.'
           : 'X sign-in was not verified — the session was not saved.',
       });
       return { ok: false };
@@ -1714,96 +1622,6 @@ async function runBrowserLogin({
     if (!signal?.aborted) await checkpointTrustedProfile();
     signal?.removeEventListener('abort', closeBrowserOnAbort);
     await liveInspection?.close();
-    await closeBrowser(browser);
-  }
-}
-
-async function runCredentialBrowserLogin({
-  user,
-  identifier,
-  password,
-  requestedXUsername = null,
-  signal,
-  generation,
-  onBrowserConnected = null,
-}) {
-  let browser = null;
-  let context = null;
-  try {
-    browser = await connectBrowser();
-    onBrowserConnected?.(browser);
-    throwIfAborted(signal);
-
-    context = await getDefaultContext(browser);
-    const bootstrap = await loginBootstrapStateFor(user, requestedXUsername);
-    const restored = await safeContextCall(
-      context,
-      () => restoreStorageState(context, bootstrap?.state, { clearCookies: true }),
-      'Restoring the tenant browser profile',
-    );
-    if (!restored.ok) throw restored.error;
-
-    const page = await getOrCreatePage(context);
-    const navigation = await safeGoto(page, LOGIN_URL, {
-      waitUntil: 'commit',
-      timeout: 45_000,
-      referer: X_REFERER,
-    });
-    if (navigation.error) throw navigation.error;
-    if (navigation.response && navigation.response.status() >= 400) {
-      throw new CredentialLoginError(502, 'x_http_error', `X returned HTTP ${navigation.response.status()}`);
-    }
-
-    const login = await automateXCredentialLogin({
-      context,
-      page,
-      identifier,
-      password,
-      signal,
-      timeoutMs: CREDENTIAL_LOGIN_TIMEOUT_MS,
-    });
-    if (login.status === 'temporarily_limited') {
-      throw new CredentialLoginError(
-        429,
-        'temporarily_limited',
-        'X has temporarily limited this login. Stop retrying and wait for the X cooldown to expire.',
-      );
-    }
-    if (login.status === 'invalid_credentials') {
-      throw new CredentialLoginError(401, 'invalid_credentials', 'X rejected the username/email or password.');
-    }
-    if (login.status === 'challenge_required') {
-      throw new CredentialLoginError(
-        409,
-        'challenge_required',
-        'X requires verification, 2FA, or a captcha. Continue with the remote sign-in window.',
-      );
-    }
-    if (login.status !== 'authenticated') {
-      throw new CredentialLoginError(
-        408,
-        'login_timeout',
-        'X did not complete the login before the remote browser session timed out.',
-      );
-    }
-
-    return await persistSignedInBrowserSession({
-      context,
-      page,
-      user,
-      requestedXUsername,
-      signal,
-      generation,
-    });
-  } finally {
-    if (context && !signal?.aborted) {
-      const state = await safeContextCall(
-        context,
-        () => context.storageState(),
-        'Capturing the tenant trusted-browser profile',
-      ).catch(() => null);
-      if (state?.ok) await saveTrustedLoginProfile(user.id, state.value).catch(() => {});
-    }
     await closeBrowser(browser);
   }
 }
@@ -1840,14 +1658,12 @@ app.post('/auth/x', async (req, res) => {
   const controller = new AbortController();
   const generation = authGeneration;
   const completion = createCompletionSignal();
-  const loginControl = createLoginControl();
   let abortRequested = false;
   const handle = {
     type: 'x-auth',
     userId: auth.user.id,
     xUsername: requestedXUsername,
     done: completion.promise,
-    loginControl,
     browser: null,
     abort() {
       if (abortRequested) return;
@@ -1872,7 +1688,6 @@ app.post('/auth/x', async (req, res) => {
       generation,
       user: auth.user,
       requestedXUsername,
-      loginControl,
       onBrowserConnected: (connectedBrowser) => {
         handle.browser = connectedBrowser;
       },
@@ -1894,119 +1709,6 @@ app.post('/auth/x', async (req, res) => {
   }
 });
 
-app.post('/auth/x/credentials', async (req, res) => {
-  let auth;
-  let credentials;
-  let requestedXUsername = null;
-  try {
-    if (!isSecureRequest(req)) {
-      throw new HttpError(400, 'Credential sign-in requires HTTPS');
-    }
-    auth = await authenticatedUser(req);
-    normalizeUserAccounts(auth.user);
-    credentials = validateXCredentials(req.body ?? {});
-    requestedXUsername = xUsernameCandidateFromIdentifier(credentials.identifier);
-    if (
-      auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
-      (!requestedXUsername || !auth.user.xAccounts.includes(requestedXUsername))
-    ) {
-      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-    }
-  } catch (error) {
-    return res.status(error.status ?? 500).json({
-      error: error.status ? error.message : 'Could not start credential sign-in',
-      code: error.code ?? 'credential_login_failed',
-    });
-  } finally {
-    if (req.body && typeof req.body === 'object') {
-      delete req.body.password;
-      delete req.body.identifier;
-      delete req.body.username;
-    }
-  }
-
-  if (activeRun) {
-    credentials.password = '';
-    return res.status(409).json({ error: 'A run is already in progress', code: 'run_in_progress' });
-  }
-
-  const controller = new AbortController();
-  const generation = authGeneration;
-  const completion = createCompletionSignal();
-  let abortRequested = false;
-  const handle = {
-    type: 'x-credentials',
-    userId: auth.user.id,
-    xUsername: requestedXUsername,
-    done: completion.promise,
-    browser: null,
-    abort() {
-      if (abortRequested) return;
-      abortRequested = true;
-      authGeneration += 1;
-      controller.abort();
-      void closeBrowser(handle.browser);
-    },
-  };
-  activeRun = handle;
-  attachRunCleanup(res, handle);
-
-  const timer = setTimeout(() => handle.abort(), CREDENTIAL_RUN_TIMEOUT_MS);
-  timer.unref?.();
-
-  try {
-    const result = await runCredentialBrowserLogin({
-      user: auth.user,
-      identifier: credentials.identifier,
-      password: credentials.password,
-      requestedXUsername,
-      signal: controller.signal,
-      generation,
-      onBrowserConnected: (connectedBrowser) => {
-        handle.browser = connectedBrowser;
-      },
-    });
-    return res.json(result);
-  } catch (error) {
-    if (res.destroyed || res.writableEnded) return;
-    if (error?.name === 'AbortError') {
-      return res.status(408).json({
-        error: 'Credential sign-in was cancelled or timed out.',
-        code: 'credential_login_aborted',
-      });
-    }
-    return res.status(error.status ?? 500).json({
-      error: error.status ? error.message : 'X credential sign-in failed',
-      code: error.code ?? 'credential_login_failed',
-      useRemoteSignIn: error.code === 'challenge_required',
-    });
-  } finally {
-    clearTimeout(timer);
-    credentials.password = '';
-    if (activeRun === handle) activeRun = null;
-    completion.resolve();
-  }
-});
-
-app.post('/auth/x/complete', async (req, res) => {
-  let auth;
-  try {
-    auth = await authenticatedUser(req);
-  } catch (error) {
-    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not confirm X sign-in' });
-  }
-
-  if (!activeRun || activeRun.type !== 'x-auth' || !activeRun.loginControl) {
-    return res.status(409).json({ error: 'No X sign-in is currently in progress' });
-  }
-  if (activeRun.userId !== auth.user.id) {
-    return res.status(403).json({ error: 'This X sign-in belongs to another session' });
-  }
-
-  activeRun.loginControl.request();
-  return res.json({ ok: true });
-});
-
 app.post('/auth/x/cancel', async (req, res) => {
   let auth;
   try {
@@ -2016,7 +1718,7 @@ app.post('/auth/x/cancel', async (req, res) => {
   }
 
   const handle = activeRun;
-  if (!handle || !new Set(['x-auth', 'x-credentials']).has(handle.type)) {
+  if (!handle || handle.type !== 'x-auth') {
     return res.json({ ok: true, cancelled: false });
   }
   if (handle.userId !== auth.user.id) {
@@ -2378,8 +2080,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
   console.log(`  DELETE ${HOST}:${PORT}/api/history`);
-  console.log(`  POST ${HOST}:${PORT}/auth/x/credentials (direct X sign-in; password is never persisted)`);
-  console.log(`  POST ${HOST}:${PORT}/auth/x      (Browserbase sign-in -> per-user session file)`);
+  console.log(`  POST ${HOST}:${PORT}/auth/x      (interactive Browserbase sign-in -> per-user session file)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
 

@@ -295,22 +295,6 @@
       #auth-submit { width: 100%; padding: 11px 18px; }
       body.auth-open { overflow: hidden; }
 
-      #x-credentials-modal {
-        position: fixed;
-        inset: 0;
-        padding: 24px;
-        background: rgba(3, 5, 8, 0.9);
-        display: grid;
-        place-items: center;
-        z-index: 1100;
-        overflow-y: auto;
-        backdrop-filter: blur(8px);
-      }
-      .x-credentials-actions { display: grid; gap: 9px; }
-      #x-credentials-submit, #x-credentials-remote { width: 100%; }
-      .credential-security-note { margin: 12px 0 0; color: var(--muted); font-size: 11px; text-align: center; }
-      body.credentials-open { overflow: hidden; }
-
       /* --------------------------- remote X sign-in ----------------------- */
       #remote-login-modal {
         position: fixed;
@@ -480,45 +464,6 @@
       </div>
     </div>
 
-    <div id="x-credentials-modal" class="hidden" aria-hidden="true">
-      <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="x-credentials-title" aria-describedby="x-credentials-subtitle">
-        <button class="auth-close" id="x-credentials-close" type="button" aria-label="Close X credential sign-in dialog">&times;</button>
-        <div class="auth-header">
-          <div class="auth-mark" aria-hidden="true">X</div>
-          <h2 class="auth-title" id="x-credentials-title">Connect X account</h2>
-          <p class="auth-subtitle" id="x-credentials-subtitle">Sign in directly through the secure remote browser.</p>
-        </div>
-        <form id="x-credentials-form" autocomplete="off" novalidate>
-          <div class="auth-field">
-            <label class="control-label" for="x-credential-identifier">X username, email, or phone</label>
-            <input type="text" id="x-credential-identifier" name="identifier" placeholder="@username or email" autocomplete="username" maxlength="254" required />
-          </div>
-          <div class="auth-field">
-            <label class="control-label" for="x-credential-password">X password</label>
-            <div class="password-input-wrap">
-              <input type="password" id="x-credential-password" name="password" placeholder="Your X password" autocomplete="off" maxlength="256" required />
-              <button class="password-toggle" id="toggle-x-credential-password" type="button" aria-label="Show X password" aria-controls="x-credential-password" aria-pressed="false">
-                <svg class="eye-on" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path>
-                  <circle cx="12" cy="12" r="2.75"></circle>
-                </svg>
-                <svg class="eye-off" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M4.6 4.6 19.4 19.4"></path>
-                  <path d="M9.8 6.3A9.7 9.7 0 0 1 12 6c6 0 9.5 6 9.5 6a16 16 0 0 1-2.6 3.3M6.2 7.7C3.8 9.5 2.5 12 2.5 12s3.5 6 9.5 6c1 0 1.9-.2 2.7-.4M10.1 10.1a2.75 2.75 0 0 0 3.8 3.8"></path>
-                </svg>
-              </button>
-            </div>
-          </div>
-          <div class="auth-error" id="x-credentials-error" role="alert" aria-live="polite"></div>
-          <div class="x-credentials-actions">
-            <button type="submit" class="primary" id="x-credentials-submit">Connect account</button>
-            <button type="button" class="ghost" id="x-credentials-remote">Use remote window for 2FA or captcha</button>
-          </div>
-          <p class="credential-security-note">Your X password is processed in memory only long enough to enter it into X. This app never saves or logs it.</p>
-        </form>
-      </div>
-    </div>
-
     <div id="remote-login-modal" class="hidden" aria-hidden="true">
       <div class="remote-login" role="dialog" aria-modal="true" aria-labelledby="remote-login-title" aria-describedby="remote-login-status">
         <div class="remote-login-head">
@@ -535,11 +480,9 @@
         </div>
         <div class="remote-login-actions">
           <a id="remote-login-open" class="button ghost is-disabled" href="#" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" role="button" aria-disabled="true">Open Remote Sign-In Window</a>
-          <button id="remote-login-complete" class="primary" type="button" disabled>I’ve completed sign-in</button>
         </div>
         <p class="remote-login-hint">
-          Open the remote browser in a new tab, complete any 2FA or challenge, then click
-          <strong>I’ve completed sign-in</strong> to save the session and update your accounts.
+          Complete sign-in, 2FA, or any challenge in the remote browser. The dashboard saves the session automatically when X reaches the home timeline.
         </p>
       </div>
     </div>
@@ -570,7 +513,7 @@
               <div class="account-dropdown-add">
                 <button id="add-x-account" class="ghost" type="button" role="menuitem">
                   <span class="add-account-icon" aria-hidden="true">+</span>
-                  <span>Add X Account</span>
+                  <span>Connect X Account</span>
                 </button>
               </div>
               <div class="account-dropdown-footer">
@@ -704,8 +647,6 @@
       let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
       let remoteLoginUrl = null;
       let remoteCancelInFlight = false;
-      let credentialController = null;
-      let credentialLoginInFlight = false;
       const targetUrls = [];
 
       // Authentication is cookie-only; remove tokens left by older UI versions.
@@ -849,113 +790,6 @@
         document.body.classList.remove('auth-open');
       }
 
-      function setXCredentialPasswordVisible(visible) {
-        const passwordInput = $('#x-credential-password');
-        const toggle = $('#toggle-x-credential-password');
-        passwordInput.type = visible ? 'text' : 'password';
-        toggle.setAttribute('aria-pressed', String(visible));
-        toggle.setAttribute('aria-label', visible ? 'Hide X password' : 'Show X password');
-      }
-
-      function openXCredentialModal() {
-        closeAccountMenu();
-        const modal = $('#x-credentials-modal');
-        modal.classList.remove('hidden');
-        modal.setAttribute('aria-hidden', 'false');
-        document.body.classList.add('credentials-open');
-        $('#x-credential-identifier').value = '';
-        $('#x-credential-password').value = '';
-        $('#x-credentials-error').textContent = '';
-        $('#x-credentials-submit').disabled = false;
-        $('#x-credentials-remote').disabled = false;
-        setXCredentialPasswordVisible(false);
-        $('#x-credential-identifier').focus();
-      }
-
-      function closeXCredentialModal({ abort = true } = {}) {
-        if (abort && credentialLoginInFlight) {
-          credentialController?.abort();
-          void fetch('/auth/x/cancel', {
-            method: 'POST',
-            headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({}),
-            keepalive: true,
-          }).catch(() => {});
-        }
-        credentialController = null;
-        const modal = $('#x-credentials-modal');
-        modal.classList.add('hidden');
-        modal.setAttribute('aria-hidden', 'true');
-        document.body.classList.remove('credentials-open');
-        $('#x-credential-password').value = '';
-        setXCredentialPasswordVisible(false);
-      }
-
-      async function handleXCredentialLogin(event) {
-        event.preventDefault();
-        if (credentialLoginInFlight) return;
-
-        const identifier = $('#x-credential-identifier').value.trim();
-        const password = $('#x-credential-password').value;
-        if (!identifier || !password) {
-          $('#x-credentials-error').textContent = 'X username/email and password are required.';
-          return;
-        }
-
-        credentialLoginInFlight = true;
-        credentialController = new AbortController();
-        $('#x-credentials-submit').disabled = true;
-        $('#x-credentials-remote').disabled = true;
-        $('#x-credentials-error').textContent = 'Connecting securely to X…';
-        setStatus('Signing in to X', 'info', 'Using the secure Browserbase session…');
-
-        try {
-          const response = await fetch('/auth/x/credentials', {
-            method: 'POST',
-            headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({ identifier, password }),
-            signal: credentialController.signal,
-          });
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            const error = new Error(data.error ?? `HTTP ${response.status}`);
-            error.code = data.code;
-            error.useRemoteSignIn = Boolean(data.useRemoteSignIn);
-            throw error;
-          }
-
-          credentialController = null;
-          applyLinkedAccounts(data.accounts ?? linkedXAccounts, data.activeXAccount ?? data.username);
-          closeXCredentialModal({ abort: false });
-          closeAccountMenu();
-          setStatus('Signed in successfully', 'ok', `Linked @${data.username}.`);
-          setText('auth-msg', `Linked @${data.username} and saved the X session.`, 'ok');
-        } catch (error) {
-          if (error?.name === 'AbortError') return;
-          $('#x-credentials-error').textContent = error.message;
-          $('#x-credentials-remote').disabled = error.code === 'temporarily_limited';
-          if (error.useRemoteSignIn) {
-            $('#x-credentials-error').textContent += ' Use the remote window below to finish verification.';
-          }
-          setStatus('X sign-in failed', error.code === 'temporarily_limited' ? 'warn' : 'err', error.message);
-        } finally {
-          credentialLoginInFlight = false;
-          credentialController = null;
-          $('#x-credential-password').value = '';
-          $('#x-credentials-submit').disabled = false;
-          if (!$('#x-credentials-modal').classList.contains('hidden') && !$('#x-credentials-remote').disabled) {
-            $('#x-credentials-remote').disabled = false;
-          }
-          setXCredentialPasswordVisible(false);
-        }
-      }
-
-      async function useRemoteCredentialFallback() {
-        const preparedWindow = prepareRemoteLoginWindow();
-        closeXCredentialModal();
-        await connectX({ autoOpen: true, preparedWindow });
-      }
-
       /* ------------------------- remote X sign-in ------------------------- */
 
       function prepareRemoteLoginWindow() {
@@ -1025,8 +859,6 @@
 
         $('#remote-login-empty').textContent = 'Waiting for the Browserbase remote window…';
         setRemoteLoginOpenState(null);
-        $('#remote-login-complete').disabled = false;
-        $('#remote-login-complete').textContent = 'I’ve completed sign-in';
         $('#remote-login-cancel').disabled = false;
         setRemoteLoginStatus('Connecting to Browserbase…');
       }
@@ -1039,43 +871,19 @@
         document.body.classList.remove('remote-open');
         remoteLoginUrl = null;
         setRemoteLoginOpenState(null);
-        $('#remote-login-complete').disabled = true;
         $('#remote-login-cancel').disabled = false;
       }
 
       function setRemoteLoginUrl(url, expiresAt) {
         remoteLoginUrl = url;
         setRemoteLoginOpenState(url);
-        $('#remote-login-complete').disabled = false;
 
         const expiry = expiresAt ? new Date(expiresAt) : null;
         const expiryText = expiry && !Number.isNaN(expiry.getTime())
           ? ` Link expires at ${expiry.toLocaleTimeString()}.`
           : '';
         $('#remote-login-empty').textContent = 'Remote browser ready. Open it in a new tab to finish sign-in.';
-        setRemoteLoginStatus(`Remote window ready.${expiryText} Open it in a new tab, then click I’ve completed sign-in.`);
-      }
-
-      async function completeRemoteSignIn() {
-        const button = $('#remote-login-complete');
-        if (!button || button.disabled) return;
-
-        button.disabled = true;
-        setRemoteLoginStatus('Confirming the X session with Playwright…');
-
-        try {
-          const response = await fetch('/auth/x/complete', {
-            method: 'POST',
-            headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({}),
-          });
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-          setRemoteLoginStatus('Session confirmed. Saving cookies and updating your accounts…');
-        } catch (error) {
-          setRemoteLoginStatus(`Could not complete sign-in: ${error.message}`);
-          button.disabled = false;
-        }
+        setRemoteLoginStatus(`Remote window ready.${expiryText} Sign in there; saving is automatic.`);
       }
 
       async function cancelRemoteSignIn() {
@@ -1336,7 +1144,9 @@
 
       // Add new X account
       function addXAccount() {
-        openXCredentialModal();
+        closeAccountMenu();
+        const preparedWindow = prepareRemoteLoginWindow();
+        void connectX({ preparedWindow });
       }
 
       /* ------------------------------ auth state --------------------------- */
@@ -1345,10 +1155,6 @@
         authStateGeneration += 1;
         controller?.abort();
         controller = null;
-        credentialController?.abort();
-        credentialController = null;
-        credentialLoginInFlight = false;
-        closeXCredentialModal({ abort: false });
         closeRemoteLoginModal();
         stopElapsedTimer();
         batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
@@ -1420,15 +1226,9 @@
         const authForm = $('#auth-form');
         const passwordToggle = $('#toggle-auth-password');
         const addXAccountBtn = $('#add-x-account');
-        const xCredentialsModal = $('#x-credentials-modal');
-        const xCredentialsClose = $('#x-credentials-close');
-        const xCredentialsForm = $('#x-credentials-form');
-        const xCredentialsPasswordToggle = $('#toggle-x-credential-password');
-        const xCredentialsRemote = $('#x-credentials-remote');
         const saveGroqKeyBtn = $('#save-groq-key');
         const clearGroqKeyBtn = $('#clear-groq-key');
         const remoteLoginOpenBtn = $('#remote-login-open');
-        const remoteLoginCompleteBtn = $('#remote-login-complete');
         const remoteLoginCancelBtn = $('#remote-login-cancel');
 
         signinBtn.addEventListener('click', (event) => {
@@ -1447,16 +1247,6 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
-        xCredentialsClose.addEventListener('click', () => closeXCredentialModal());
-        xCredentialsModal.addEventListener('click', (event) => {
-          if (event.target === xCredentialsModal) closeXCredentialModal();
-        });
-        xCredentialsForm.addEventListener('submit', handleXCredentialLogin);
-        xCredentialsPasswordToggle.addEventListener('click', () => {
-          setXCredentialPasswordVisible($('#x-credential-password').type === 'password');
-          $('#x-credential-password').focus();
-        });
-        xCredentialsRemote.addEventListener('click', useRemoteCredentialFallback);
         remoteLoginOpenBtn.addEventListener('click', (event) => {
           event.preventDefault();
           if (!remoteLoginUrl) {
@@ -1464,7 +1254,6 @@
           }
           window.open(remoteLoginUrl, '_blank', 'noopener,noreferrer');
         });
-        remoteLoginCompleteBtn.addEventListener('click', completeRemoteSignIn);
         remoteLoginCancelBtn.addEventListener('click', cancelRemoteSignIn);
         if (saveGroqKeyBtn) {
           saveGroqKeyBtn.addEventListener('click', saveGroqApiKey);
@@ -1510,7 +1299,7 @@
 
       /* ------------------------------ sign-in ----------------------------- */
 
-      async function connectX({ autoOpen = false, preparedWindow = null } = {}) {
+      async function connectX({ preparedWindow = null } = {}) {
         let remoteWindowLaunched = false;
         controller = new AbortController();
         $('signin').disabled = true;
@@ -1552,30 +1341,25 @@
                 if (event.type === 'live') {
                   if (event.status === 'ready' && event.url) {
                     setRemoteLoginUrl(event.url, event.expiresAt);
-                    if (autoOpen) {
-                      remoteWindowLaunched = launchRemoteLoginWindow(event.url, preparedWindow);
-                      if (remoteWindowLaunched) {
-                        setRemoteLoginStatus('Remote sign-in opened in a new tab. Finish there, then confirm completion here.');
-                        setStatus('Running', 'info', 'Remote sign-in opened in a new tab.');
-                      } else {
-                        setRemoteLoginStatus('Your browser blocked the new tab. Click Open Remote Sign-In Window.');
-                        setStatus('Running', 'warn', 'Click Open Remote Sign-In Window to continue.');
-                      }
+                    remoteWindowLaunched = launchRemoteLoginWindow(event.url, preparedWindow);
+                    if (remoteWindowLaunched) {
+                      setRemoteLoginStatus('Remote sign-in opened in a new tab. Finish there; saving is automatic.');
+                      setStatus('Running', 'info', 'Remote sign-in opened in a new tab.');
                     } else {
-                      setStatus('Running', 'info', 'Remote sign-in window ready.');
+                      setRemoteLoginStatus('Your browser blocked the new tab. Click Open Remote Sign-In Window.');
+                      setStatus('Running', 'warn', 'Click Open Remote Sign-In Window to continue.');
                     }
                   } else if (event.status === 'error') {
                     closeUnusedRemoteWindow(preparedWindow, remoteWindowLaunched);
                     preparedWindow = null;
                     const message = event.message ?? 'The remote sign-in window is unavailable.';
-                    setRemoteLoginStatus(`${message} You can use the Browserbase dashboard, then confirm completion.`);
-                    $('#remote-login-empty').textContent = `${message} You can use the Browserbase dashboard, then confirm completion.`;
+                    setRemoteLoginStatus(`${message} You can use the Browserbase dashboard; saving remains automatic.`);
+                    $('#remote-login-empty').textContent = `${message} You can use the Browserbase dashboard; saving remains automatic.`;
                     setStatus('Running', 'warn', 'Remote sign-in window unavailable.');
                   }
                 } else if (event.type === 'status') {
                   setRemoteLoginStatus(event.data);
                   setStatus('Running', 'info', event.data);
-                  if (event.stage === 'complete-pending') $('#remote-login-complete').disabled = false;
                 } else if (event.type === 'stderr') {
                   setText('auth-msg', event.data, 'err');
                   setRemoteLoginStatus(event.data);
