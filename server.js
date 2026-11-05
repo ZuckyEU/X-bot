@@ -32,9 +32,9 @@ import { automateXCredentialLogin } from './lib/x-credentials.js';
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
  *   POST /auth/x/credentials -> direct memory-only credential sign-in
- *   POST /auth/x     -> Browserless Live URL sign-in -> sessions/<userId>/<xUsername>.json
+ *   POST /auth/x     -> Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
  *   POST /auth/x/complete -> confirm the remote sign-in and save the X session
- *   POST /auth/x/cancel   -> cancel the active remote sign-in and close Browserless
+ *   POST /auth/x/cancel   -> cancel the active remote sign-in and close Browserbase
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
@@ -100,7 +100,7 @@ const HOME_URL = 'https://x.com/home';
 const SESSION_COOKIE = 'auth_token';
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LIVE_VIEW_TIMEOUT_MS = (() => {
-  const configured = Number(process.env.BROWSERLESS_LIVE_TIMEOUT_MS);
+  const configured = Number(process.env.BROWSERBASE_LIVE_TIMEOUT_MS ?? process.env.BROWSERLESS_LIVE_TIMEOUT_MS);
   if (!Number.isFinite(configured) || configured < 30_000) return LOGIN_TIMEOUT_MS;
   return Math.min(configured, LOGIN_TIMEOUT_MS);
 })();
@@ -1520,7 +1520,7 @@ async function waitForManualSignIn(context, signal, loginControl, send) {
 }
 
 /**
- * Connects to Browserless, reuses its default context, waits for the user to
+ * Connects to Browserbase, reuses its default context, waits for the user to
  * finish logging in, then saves Playwright storage state for that user/X account.
  */
 async function runBrowserLogin({
@@ -1534,7 +1534,7 @@ async function runBrowserLogin({
 }) {
   send({
     type: 'start',
-    command: `browser sign-in -> ${LOGIN_URL} (Browserless remote Chromium)`,
+    command: `browser sign-in -> ${LOGIN_URL} (Browserbase remote Chromium)`,
   });
 
   let browser = null;
@@ -1645,7 +1645,7 @@ async function runBrowserLogin({
       send({ type: 'live', status: 'error', message: error.message });
       send({
         type: 'stderr',
-        data: `${error.message}. If you can open the Browserless dashboard, finish there and then confirm sign-in.`,
+        data: `${error.message}. If you can open the Browserbase dashboard, finish there and then confirm sign-in.`,
       });
     }
 
@@ -2379,7 +2379,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  GET ${HOST}:${PORT}/api/history`);
   console.log(`  DELETE ${HOST}:${PORT}/api/history`);
   console.log(`  POST ${HOST}:${PORT}/auth/x/credentials (direct X sign-in; password is never persisted)`);
-  console.log(`  POST ${HOST}:${PORT}/auth/x      (Browserless sign-in -> per-user session file)`);
+  console.log(`  POST ${HOST}:${PORT}/auth/x      (Browserbase sign-in -> per-user session file)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
 

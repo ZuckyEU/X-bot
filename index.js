@@ -29,7 +29,7 @@ async function scrapeTitle(url) {
 async function main() {
   const target = process.argv[2] ?? 'https://example.com';
 
-  console.log(`Connecting to Browserless Chromium and visiting ${target} ...`);
+  console.log(`Connecting to Browserbase Chromium and visiting ${target} ...`);
   const pageInfo = await scrapeTitle(target);
   console.log('Page:', pageInfo);
 

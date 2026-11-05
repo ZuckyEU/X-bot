@@ -82,6 +82,14 @@ if (sessionSecret.length < 32 || INSECURE_SESSION_SECRETS.has(sessionSecret.toLo
   );
 }
 
+const browserbaseApiKey = String(process.env.BROWSERBASE_API_KEY ?? '').trim();
+if (!browserbaseApiKey || browserbaseApiKey === 'YOUR_API_KEY') {
+  fail(
+    'BROWSERBASE_API_KEY must be set to a real Browserbase API key.\n' +
+      'Get it from https://www.browserbase.com/settings and keep it out of source control.',
+  );
+}
+
 console.log('[check:prod] Environment verified (NODE_ENV=production).');
 
 const files = (await javascriptFiles(ROOT))
@@ -96,7 +104,7 @@ for (const file of files) {
 }
 
 console.log('[check:prod] Running the test suite...');
-if (run(process.execPath, ['--test'], { env: { ...process.env, NODE_ENV: 'test' } }) !== 0) {
+if (run(process.execPath, ['--test', 'test/*.test.js'], { env: { ...process.env, NODE_ENV: 'test' } }) !== 0) {
   fail('The test suite failed; the server was not started.');
 }
 

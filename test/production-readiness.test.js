@@ -10,17 +10,21 @@ import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
 import {
-  buildBrowserlessEndpoint,
+  browserbaseSessionParams,
   CHROME_USER_AGENT,
+  closeBrowser,
+  connectBrowser,
+  createBrowserbaseClient,
   createTrustedLoginProfile,
   createLiveInspection,
+  getBrowserbaseSession,
   getDefaultContext,
   getOrCreatePage,
+  resolveBrowserbaseConfig,
+  resolveSessionTimeoutSeconds,
   restoreStorageState,
-  resolveBrowserlessToken,
   safeContextCall,
   safeGoto,
-  withSessionTimeout,
   X_LOGIN_URL,
   X_REFERER,
 } from '../lib/browser.js';
@@ -500,98 +504,208 @@ test('cookie operations are skipped on closed or disconnected contexts', async (
   assert.match(closingResult.error.message, /browser context was closed/);
 });
 
-function fakeLivePage(liveResponse = { liveURL: 'https://live.example.test/viewer', liveURLId: 'live-1', timeout: 120_000 }) {
-  const sent = [];
-  const listeners = new Map();
-  let detached = false;
-  const cdpSession = {
-    send: async (method, params) => {
-      sent.push({ method, params });
-      if (method === 'Browserless.liveURL') return liveResponse;
-      return {};
-    },
-    on: (event, handler) => listeners.set(event, handler),
-    off: (event, handler) => {
-      if (listeners.get(event) === handler) listeners.delete(event);
-    },
-    detach: async () => {
-      detached = true;
+function fakeBrowserbaseClient({
+  createResponse = { id: 'session-1', connectUrl: 'wss://connect.browserbase.test/session-1' },
+  debugResponse = {
+    debuggerFullscreenUrl: 'https://browserbase.test/live/fullscreen',
+    debuggerUrl: 'https://browserbase.test/live/debugger',
+    pages: [{ id: 'page-1', debuggerUrl: 'https://browserbase.test/live/page-1' }],
+  },
+} = {}) {
+  const calls = { create: [], update: [], debug: [] };
+  const client = {
+    sessions: {
+      create: async (params) => {
+        calls.create.push(params);
+        if (createResponse instanceof Error) throw createResponse;
+        return createResponse;
+      },
+      update: async (id, body) => {
+        calls.update.push({ id, body });
+        return {};
+      },
+      debug: async (id, query) => {
+        calls.debug.push({ id, query });
+        if (debugResponse instanceof Error) throw debugResponse;
+        return debugResponse;
+      },
     },
   };
-  const page = {
-    context: () => ({
-      newCDPSession: async () => cdpSession,
-    }),
-  };
-  return { page, sent, listeners, isDetached: () => detached };
+  return { client, calls };
 }
 
-test('Browserless live inspection URL is minted and closed cleanly', async () => {
-  const { page, sent, listeners, isDetached } = fakeLivePage();
-  const completions = [];
-  const viewers = [];
-  const inspection = await createLiveInspection(page, {
-    timeoutMs: 123_000,
-    onComplete: (event) => completions.push(event),
-    onViewerConnected: (event) => viewers.push(event),
+function fakePlaywrightBrowser() {
+  const context = {
+    pages: () => [],
+    addInitScript: async () => {},
+    on: () => {},
+  };
+  return {
+    contexts: () => [context],
+    newContext: () => context,
+    close: async () => {},
+    isConnected: () => true,
+  };
+}
+
+test('Browserbase credentials and stealth session parameters are resolved safely', () => {
+  assert.deepEqual(
+    resolveBrowserbaseConfig({
+      BROWSERBASE_API_KEY: '  api-key  ',
+      BROWSERBASE_PROJECT_ID: '  project-id  ',
+    }),
+    { apiKey: 'api-key', projectId: 'project-id' },
+  );
+  assert.deepEqual(resolveBrowserbaseConfig({}), { apiKey: '', projectId: '' });
+  assert.throws(() => createBrowserbaseClient({}), /BROWSERBASE_API_KEY is required/);
+  assert.equal(createBrowserbaseClient({ BROWSERBASE_API_KEY: 'key' }).projectId, '');
+  assert.ok(createBrowserbaseClient({ BROWSERBASE_API_KEY: 'key' }).client.sessions);
+
+  assert.equal(resolveSessionTimeoutSeconds({}), 900);
+  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_MS: 1_200_000 }), 1200);
+  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_SECONDS: '600' }), 600);
+  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_SECONDS: '1' }), 60);
+  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_SECONDS: '999999' }), 21_600);
+
+  const params = browserbaseSessionParams({
+    projectId: 'project-id',
+    timeoutSeconds: 900,
+    userMetadata: { tenant: 'one' },
+  });
+  assert.equal(params.projectId, 'project-id');
+  assert.equal(params.api_timeout, 900);
+  assert.equal(params.browserSettings.verified, true);
+  assert.equal(params.browserSettings.os, 'windows');
+  assert.equal(params.browserSettings.solveCaptchas, true);
+  assert.deepEqual(params.userMetadata, { tenant: 'one' });
+  assert.equal(Object.hasOwn(browserbaseSessionParams({}), 'projectId'), false);
+});
+
+test('connectBrowser creates a stealth Browserbase session and releases it on cleanup', async () => {
+  const { client, calls } = fakeBrowserbaseClient();
+  const browser = fakePlaywrightBrowser();
+  let connectArgs = null;
+
+  const connected = await connectBrowser({
+    client,
+    projectId: 'project-id',
+    timeoutSeconds: 1_200,
+    connectOverCDP: async (endpoint, options) => {
+      connectArgs = { endpoint, options };
+      return browser;
+    },
   });
 
-  assert.equal(inspection.liveURL, 'https://live.example.test/viewer');
-  assert.equal(inspection.liveURLId, 'live-1');
-  assert.ok(inspection.expiresAt > Date.now());
-  assert.equal(sent[0].method, 'Browserless.liveURL');
-  assert.equal(sent[0].params.timeout, 123_000);
-  assert.equal(sent[0].params.interactable, true);
-  assert.equal(sent[0].params.resizable, true);
-  assert.equal(sent[0].params.showBrowserInterface, true);
-  assert.equal(Object.hasOwn(sent[0].params, 'instructions'), false);
+  assert.equal(connected, browser);
+  assert.equal(connectArgs.endpoint, 'wss://connect.browserbase.test/session-1');
+  assert.equal(connectArgs.options.timeout, 60_000);
+  assert.equal(calls.create.length, 1);
+  assert.equal(calls.create[0].projectId, 'project-id');
+  assert.equal(calls.create[0].api_timeout, 1_200);
+  assert.equal(calls.create[0].browserSettings.verified, true);
+  assert.equal(getBrowserbaseSession(browser).session.id, 'session-1');
 
-  listeners.get('Browserless.liveViewerConnected')({ liveURLId: 'live-1' });
-  listeners.get('Browserless.liveComplete')({ liveURLId: 'live-1', reason: 'viewerDisconnected' });
-  assert.deepEqual(viewers, [{ liveURLId: 'live-1' }]);
-  assert.deepEqual(completions, [{ liveURLId: 'live-1', reason: 'viewerDisconnected' }]);
+  await closeBrowser(browser);
+  assert.deepEqual(calls.update, [{ id: 'session-1', body: { status: 'REQUEST_RELEASE' } }]);
+  assert.equal(getBrowserbaseSession(browser), null);
+
+  await closeBrowser(browser);
+  assert.equal(calls.update.length, 1, 'release is idempotent');
+});
+
+test('connectBrowser releases the Browserbase session when connection setup fails', async () => {
+  const { client, calls } = fakeBrowserbaseClient();
+  await assert.rejects(
+    connectBrowser({
+      client,
+      projectId: 'project-id',
+      connectOverCDP: async () => {
+        throw new Error('CDP refused');
+      },
+    }),
+    /Could not connect Playwright to Browserbase: CDP refused/,
+  );
+  assert.deepEqual(calls.update, [{ id: 'session-1', body: { status: 'REQUEST_RELEASE' } }]);
+
+  const missingUrl = fakeBrowserbaseClient({ createResponse: { id: 'session-2' } });
+  await assert.rejects(
+    connectBrowser({ client: missingUrl.client, projectId: 'project-id' }),
+    /did not return a session connect URL/,
+  );
+  assert.deepEqual(missingUrl.calls.update, [{ id: 'session-2', body: { status: 'REQUEST_RELEASE' } }]);
+});
+
+test('Browserbase live inspection exposes the SDK debugger URL', async () => {
+  const { client, calls } = fakeBrowserbaseClient();
+  const browser = fakePlaywrightBrowser();
+  await connectBrowser({
+    client,
+    projectId: 'project-id',
+    connectOverCDP: async () => browser,
+  });
+  const page = { context: () => ({ browser: () => browser }) };
+
+  const inspection = await createLiveInspection(page, { timeoutMs: 600_000 });
+  assert.equal(inspection.liveURL, 'https://browserbase.test/live/fullscreen');
+  assert.equal(inspection.liveURLId, 'page-1');
+  assert.ok(inspection.expiresAt > Date.now());
+  assert.deepEqual(calls.debug, [{ id: 'session-1', query: { expiresIn: 600 } }]);
 
   await inspection.close();
-  assert.equal(sent.at(-1).method, 'Browserless.closeLiveURL');
-  assert.deepEqual(sent.at(-1).params, { liveURLId: 'live-1' });
-  assert.equal(listeners.size, 0);
-  assert.equal(isDetached(), true);
+  await closeBrowser(browser);
 });
 
-test('optional Browserless session timeout is added without rewriting other params', () => {
-  const endpoint = 'wss://production-sfo.browserless.io?token=secret-token';
-  const extended = new URL(withSessionTimeout(endpoint, 600_000));
-  assert.equal(extended.searchParams.get('token'), 'secret-token');
-  assert.equal(extended.searchParams.get('timeout'), '600000');
+test('Browserbase live inspection falls back to the debugger URL and reports failures', async () => {
+  const fallback = fakeBrowserbaseClient({
+    debugResponse: { debuggerUrl: 'https://browserbase.test/live/debugger' },
+  });
+  const fallbackBrowser = fakePlaywrightBrowser();
+  await connectBrowser({
+    client: fallback.client,
+    projectId: 'project-id',
+    connectOverCDP: async () => fallbackBrowser,
+  });
+  const fallbackPage = { context: () => ({ browser: () => fallbackBrowser }) };
+  const inspection = await createLiveInspection(fallbackPage, { timeoutMs: 60_000 });
+  assert.equal(inspection.liveURL, 'https://browserbase.test/live/debugger');
+  assert.equal(inspection.liveURLId, 'session-1');
+  assert.deepEqual(fallback.calls.debug, [{ id: 'session-1', query: { expiresIn: 60 } }]);
+  await closeBrowser(fallbackBrowser);
 
-  const tooShort = 'wss://production-sfo.browserless.io?token=secret-token';
-  assert.equal(withSessionTimeout(tooShort, 5_000), tooShort);
-  assert.equal(withSessionTimeout(tooShort, 'not-a-number'), tooShort);
-  assert.equal(withSessionTimeout('not a url', 600_000), 'not a url');
+  await assert.rejects(
+    createLiveInspection({ context: () => ({ browser: () => null }) }),
+    /requires an active Browserbase session/,
+  );
+
+  const failing = fakeBrowserbaseClient({ debugResponse: new Error('debug unavailable') });
+  const failingBrowser = fakePlaywrightBrowser();
+  await connectBrowser({
+    client: failing.client,
+    projectId: 'project-id',
+    connectOverCDP: async () => failingBrowser,
+  });
+  await assert.rejects(
+    createLiveInspection({ context: () => ({ browser: () => failingBrowser }) }),
+    /Browserbase could not create a live inspection link: debug unavailable/,
+  );
+  await closeBrowser(failingBrowser);
 });
 
-test('Browserless endpoint always uses managed stealth with a US residential proxy', () => {
-  assert.equal(
-    buildBrowserlessEndpoint('secret-token'),
-    'wss://production-sfo.browserless.io/stealth?token=secret-token&proxy=residential&proxyCountry=us',
+test('Browserbase session creation clamps invalid timeouts and rejects missing debug URLs', async () => {
+  const { client, calls } = fakeBrowserbaseClient({ debugResponse: {} });
+  const browser = fakePlaywrightBrowser();
+  await connectBrowser({
+    client,
+    projectId: 'project-id',
+    timeoutSeconds: 30,
+    connectOverCDP: async () => browser,
+  });
+  assert.equal(calls.create[0].api_timeout, 60);
+  await assert.rejects(
+    createLiveInspection({ context: () => ({ browser: () => browser }) }),
+    /did not return a live inspection URL/,
   );
-
-  const encoded = new URL(buildBrowserlessEndpoint('secret token/+', 600_000));
-  assert.equal(encoded.protocol, 'wss:');
-  assert.equal(encoded.hostname, 'production-sfo.browserless.io');
-  assert.equal(encoded.pathname, '/stealth');
-  assert.equal(encoded.searchParams.get('token'), 'secret token/+');
-  assert.equal(encoded.searchParams.get('proxy'), 'residential');
-  assert.equal(encoded.searchParams.get('proxyCountry'), 'us');
-  assert.equal(encoded.searchParams.get('timeout'), '600000');
-
-  assert.equal(resolveBrowserlessToken({ BROWSERLESS_TOKEN: 'primary', BROWSERLESS_API_KEY: 'fallback' }), 'primary');
-  assert.equal(resolveBrowserlessToken({ BROWSERLESS_API_KEY: 'fallback' }), 'fallback');
-  assert.equal(
-    resolveBrowserlessToken({ BROWSERLESS_WS_ENDPOINT: 'wss://legacy.example?token=legacy-token' }),
-    'legacy-token',
-  );
-  assert.throws(() => buildBrowserlessEndpoint(''), /BROWSERLESS_TOKEN or BROWSERLESS_API_KEY is required/);
+  await closeBrowser(browser);
 });
 
 test('storage state restores cookies and localStorage while tenant profiles omit account auth', async () => {
@@ -694,7 +808,7 @@ test('credential automation stops immediately when X reports a temporary limit',
   assert.deepEqual(result, { status: 'temporarily_limited' });
 });
 
-test('Browserless contexts and pages use a realistic Chrome identity and stealth profile', async () => {
+test('Browserbase contexts and pages use a realistic Chrome identity and stealth profile', async () => {
   const page = { isClosed: () => false };
   const commands = [];
   const initScripts = [];
@@ -760,15 +874,6 @@ test('Browserless contexts and pages use a realistic Chrome identity and stealth
   assert.equal(commands[1].method, 'Network.setUserAgentOverride');
 });
 
-test('Browserless live inspection failures are reported and detached', async () => {
-  const { page, isDetached } = fakeLivePage({ error: 'Live URLs are unavailable for this plan' });
-  await assert.rejects(
-    createLiveInspection(page),
-    /Live URLs are unavailable for this plan/,
-  );
-  assert.equal(isDetached(), true);
-});
-
 test('remote sign-in completion requires an active sign-in run', async (t) => {
   const { baseUrl } = await startServer(t);
   const { cookie } = await register(baseUrl, 'remotecomplete');
@@ -789,7 +894,7 @@ test('remote sign-in completion requires an active sign-in run', async (t) => {
   assert.match((await noRun.json()).error, /No X sign-in/);
 });
 
-test('credential sign-in requires app authentication and validates secrets before Browserless', async (t) => {
+test('credential sign-in requires app authentication and validates secrets before Browserbase', async (t) => {
   const { baseUrl } = await startServer(t);
   const { cookie } = await register(baseUrl, 'credentials');
   const testPassword = 'X-Credential-Test-Password!';
@@ -856,7 +961,7 @@ test('container exposes the Render port and starts Node directly', async () => {
 
 test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain stable', async (t) => {
   const { baseUrl } = await startServer(t);
-  // Keep this browser local: Browserless cannot reach the ephemeral 127.0.0.1 test server.
+  // Keep this browser local: the remote browser cannot reach the ephemeral 127.0.0.1 test server.
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],

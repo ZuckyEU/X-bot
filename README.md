@@ -14,10 +14,11 @@ Add your keys to `.env` (created from `.env.example`):
 ```
 GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-3.6-flash
-BROWSERLESS_TOKEN=YOUR_API_TOKEN
+BROWSERBASE_API_KEY=YOUR_API_KEY
+BROWSERBASE_PROJECT_ID=YOUR_PROJECT_ID
 ```
 
-All application browser automation connects with `chromium.connectOverCDP()` to `wss://production-sfo.browserless.io/stealth` using `proxy=residential&proxyCountry=us`. The URL is built at runtime from `BROWSERLESS_TOKEN` (or `BROWSERLESS_API_KEY`); keep the token in `.env` or the deployment environment, never in source control. A token can still be extracted from the legacy `BROWSERLESS_WS_ENDPOINT` during migration, but that URL is no longer used as the connection target.
+All application browser automation creates a **Browserbase** session through the official `@browserbasehq/sdk` (`sessions.create()` with stealth enabled) and connects Playwright with `chromium.connectOverCDP(session.connectUrl)`. Keep `BROWSERBASE_API_KEY` and (recommended) `BROWSERBASE_PROJECT_ID` in `.env` or the deployment environment, never in source control. If the project ID is omitted, the SDK infers the project from the API key. Stealth uses Browserbase Verified mode (`browserSettings.verified`), so the plan must support it. Sessions are explicitly released with `REQUEST_RELEASE` when a run finishes, fails, or is cancelled.
 
 `gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
 
@@ -28,7 +29,7 @@ npm start
 npm start -- https://news.ycombinator.com   # custom URL
 ```
 
-`index.js` loads `.env`, opens the URL in a Browserless remote Chromium session, reads the title/heading, then asks Gemini to describe the page. If `GEMINI_API_KEY` is missing it still runs the Playwright part and prints a warning.
+`index.js` loads `.env`, opens the URL in a Browserbase remote Chromium session, reads the title/heading, then asks Gemini to describe the page. If `GEMINI_API_KEY` is missing it still runs the Playwright part and prints a warning.
 
 ## X login (saves session to auth.json)
 
@@ -36,8 +37,8 @@ npm start -- https://news.ycombinator.com   # custom URL
 npm run auth
 ```
 
-1. A Browserless remote Chromium session opens directly on `https://x.com/i/flow/login`.
-2. Open that session in the Browserless live view and log in yourself — password, 2FA, captcha, anything X asks for.
+1. A Browserbase remote Chromium session opens directly on `https://x.com/i/flow/login`.
+2. Open the printed Browserbase live view and log in yourself — password, 2FA, captcha, anything X asks for.
 3. Return to the terminal and press **ENTER**.
 4. The script checks for the `auth_token` cookie, then writes cookies and X localStorage to `auth.json`.
 
@@ -91,7 +92,7 @@ Crypto framing (tokens, price action, "alpha", on-chain, trading) is allowed onl
 |---|---|
 | `--dry-run` | Stop after printing the generated reply |
 | `--yes`, `-y` | Skip the confirmation prompt |
-| `--headless` | Accepted for compatibility; Browserless controls browser visibility |
+| `--headless` | Accepted for compatibility; Browserbase controls browser visibility |
 
 Output example:
 
@@ -114,7 +115,7 @@ Notes:
 
 ## X sign-in via the web UI (Add X Account)
 
-**Add X Account** opens a direct credential form by default. `POST /auth/x/credentials` accepts an X username/email/phone plus password over same-origin HTTPS, keeps the password in request memory only, and types it into a top-level **Browserless remote Chromium** page at `https://x.com/i/flow/login`. The password is deleted from the parsed request immediately, never logged, never written to disk, and never returned by the API.
+**Add X Account** opens a direct credential form by default. `POST /auth/x/credentials` accepts an X username/email/phone plus password over same-origin HTTPS, keeps the password in request memory only, and types it into a top-level **Browserbase remote Chromium** page at `https://x.com/i/flow/login`. The password is deleted from the parsed request immediately, never logged, never written to disk, and never returned by the API.
 
 After X sets `auth_token`, the server captures the complete Playwright storage state, atomically writes `sessions/<userId>/<xUsername>.json`, updates the linked-account list, and returns the refreshed accounts so the dropdown updates immediately. If X requests 2FA, email/phone verification, or a captcha, the API returns `challenge_required` and the modal offers the remote-window fallback. It does not attempt to bypass those checks. Production credential requests are rejected unless they arrive through HTTPS.
 
@@ -124,25 +125,25 @@ After X sets `auth_token`, the server captures the complete Playwright storage s
 
 Flow:
 
-1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
-2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserless Live URL, and immediately emits it to the authenticated NDJSON client. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
-3. The dashboard intentionally does **not** embed the live stream. The 2FA/captcha action pre-opens a native tab and routes it to the Live URL as soon as the event arrives; **Open Remote Sign-In Window** remains an explicit `window.open(liveUrl, '_blank')` fallback. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
+1. The server creates a **Browserbase** session with `sessions.create()` and stealth (`browserSettings.verified`), connects with `chromium.connectOverCDP(session.connectUrl)`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
+2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserbase debugger URL with `sessions.debug()`, and immediately emits it to the authenticated NDJSON client. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
+3. The dashboard intentionally does **not** embed the live stream. The 2FA/captcha action pre-opens a native tab and routes it to the debugger URL as soon as the event arrives; **Open Remote Sign-In Window** remains an explicit `window.open(liveUrl, '_blank')` fallback. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
 4. Sign in to X in the remote window, including 2FA or any challenge.
 5. Click **I’ve completed sign-in** in the dashboard. The server checks for the `auth_token` cookie, captures cookies and localStorage with `context.storageState()`, writes `sessions/<userId>/<xUsername>.json` under persistent `DATA_DIR`, updates the user's linked accounts, and refreshes the account list.
-6. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
-7. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and closes the Browserless browser so **Add X Account** can start a fresh session.
+6. The browser disconnects and the Browserbase session is released with `REQUEST_RELEASE`, invalidating the debugger URL. The live link is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
+7. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and releases the Browserbase session so **Add X Account** can start a fresh session.
 
 Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keeps X guest/device cookies and X localStorage while deliberately removing `auth_token`, `ct0`, `twid`, and other account-authentication cookies, so adding another account reuses a consistent browser identity without silently opening the previously linked account. A request that explicitly supplies an already linked `xUsername` restores that account's complete storage state. Login state is checkpointed during the live session and saved atomically.
 
-An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserless proxy region is still important.
+An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserbase session region is still important.
 
-If the live link cannot be minted, the dashboard still exposes **I’ve completed sign-in** so an operator who can reach the Browserless dashboard can finish there and confirm it.
+If the live link cannot be minted, the dashboard still exposes **I’ve completed sign-in** so an operator who can reach the Browserbase dashboard can finish there and confirm it.
 
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
 ```
-{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (Browserless remote Chromium)"}
-{"type":"live","status":"ready","url":"https://…/live/index.html?i=…","expiresAt":"…"}
+{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (Browserbase remote Chromium)"}
+{"type":"live","status":"ready","url":"https://browserbase.com/sessions/…","expiresAt":"…"}
 {"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
 {"type":"stdout","data":"Waiting for you to complete sign-in in the remote window …"}
 {"type":"status","stage":"signed-in","data":"X session detected. Click I’ve completed sign-in to save it."}
@@ -152,9 +153,9 @@ If the live link cannot be minted, the dashboard still exposes **I’ve complete
 
 `POST /auth/x/complete` requires the same authenticated session as the active sign-in, asks the running Playwright flow to save the X session, and returns `{"ok":true}`. It returns `409` when no X sign-in is in progress and `403` if the active run belongs to another app user.
 
-`POST /auth/x/cancel` is idempotent: it returns `{ "ok": true, "cancelled": false }` when nothing is running, and otherwise clears the active sign-in lock, aborts the Playwright run, and closes the Browserless browser before replying. It is scoped to the authenticated app user.
+`POST /auth/x/cancel` is idempotent: it returns `{ "ok": true, "cancelled": false }` when nothing is running, and otherwise clears the active sign-in lock, aborts the Playwright run, and releases the Browserbase session before replying. It is scoped to the authenticated app user.
 
-The optional `BROWSERLESS_LIVE_TIMEOUT_MS` environment variable controls how long the Live URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserless connection stays open until sign-in finishes or the run is cancelled. If the Browserless plan allows a longer session, set `BROWSERLESS_SESSION_TIMEOUT_MS` (for example `600000`) so the browser does not hit the provider's default session limit mid-login. Free Browserless sessions are only 2 minutes, and managed stealth/residential proxy access also depends on the Browserless plan.
+The optional `BROWSERBASE_LIVE_TIMEOUT_MS` environment variable controls how long the debugger URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserbase session stays open until sign-in finishes or the run is cancelled. Use `BROWSERBASE_SESSION_TIMEOUT_SECONDS` (default `900`) when the X login flow needs longer; Browserbase caps sessions at 21,600 seconds. A legacy `BROWSERLESS_LIVE_TIMEOUT_MS` value is still read for migration.
 
 The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, writes `auth.json`).
 
@@ -176,9 +177,9 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |
 | `POST /auth/x/credentials` | Direct X credential sign-in; password is memory-only, verifies `auth_token`, saves per-tenant storage state |
-| `POST /auth/x` | NDJSON: start → live → stdout/stderr/status → exit (Browserless browser sign-in) |
+| `POST /auth/x` | NDJSON: start → live → stdout/stderr/status → exit (Browserbase browser sign-in) |
 | `POST /auth/x/complete` | Confirm the active remote X sign-in; saves storage state and updates linked accounts |
-| `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and close the Browserless browser |
+| `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and release the Browserbase session |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:
@@ -245,4 +246,4 @@ The CLI (`npm run auth` and `npm run automate`) honors the same `DATA_DIR` for `
 ## Versions
 
 - Node.js >= 20 (project uses ESM: `"type": "module"`)
-- playwright 1.64, @google/genai 2.32, dotenv 18, express 5.3, body-parser 2.4, cors 2.8
+- playwright 1.64, @browserbasehq/sdk 2.25, @google/genai 2.32, dotenv 18, express 5.3, body-parser 2.4, cors 2.8

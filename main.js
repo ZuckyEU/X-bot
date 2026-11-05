@@ -35,7 +35,7 @@ Usage: node main.js <tweet-url> [options]
 Options:
   --dry-run     Generate the reply but do not post or like
   --yes, -y     Skip the confirmation prompt
-  --headless    Accepted for compatibility; Browserless controls visibility
+  --headless    Accepted for compatibility; Browserbase controls visibility
   --reply       Post the generated reply
   --like        Like the tweet after the reply is posted
   --repost      Repost the tweet after the reply is posted

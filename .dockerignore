@@ -8,4 +8,7 @@ user-data/
 user-db.json
 auth.json
 history.json
+x-auth-state.json
+test-browserbase.cjs
+test-error-screenshot.png
 *.log

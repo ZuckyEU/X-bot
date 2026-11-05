@@ -524,13 +524,13 @@
         <div class="remote-login-head">
           <div>
             <h2 id="remote-login-title">Remote X sign-in</h2>
-            <p id="remote-login-status" aria-live="polite">Connecting to Browserless…</p>
+            <p id="remote-login-status" aria-live="polite">Connecting to Browserbase…</p>
           </div>
           <button id="remote-login-cancel" class="ghost" type="button">Cancel</button>
         </div>
         <div class="remote-login-body">
           <div id="remote-login-empty" class="remote-login-empty">
-            Waiting for the Browserless remote window…
+            Waiting for the Browserbase remote window…
           </div>
         </div>
         <div class="remote-login-actions">
@@ -907,7 +907,7 @@
         $('#x-credentials-submit').disabled = true;
         $('#x-credentials-remote').disabled = true;
         $('#x-credentials-error').textContent = 'Connecting securely to X…';
-        setStatus('Signing in to X', 'info', 'Using the secure Browserless session…');
+        setStatus('Signing in to X', 'info', 'Using the secure Browserbase session…');
 
         try {
           const response = await fetch('/auth/x/credentials', {
@@ -964,7 +964,7 @@
         try {
           popup.opener = null;
           popup.document.title = 'Preparing remote X sign-in…';
-          popup.document.body.textContent = 'Preparing the secure Browserless sign-in window…';
+          popup.document.body.textContent = 'Preparing the secure Browserbase sign-in window…';
           popup.document.body.style.cssText = 'margin:0;padding:32px;background:#07090d;color:#cbd5e1;font:14px system-ui,sans-serif';
         } catch {
           // Navigation may have started before the placeholder was painted.
@@ -1023,12 +1023,12 @@
         document.body.classList.add('remote-open');
         remoteLoginUrl = null;
 
-        $('#remote-login-empty').textContent = 'Waiting for the Browserless remote window…';
+        $('#remote-login-empty').textContent = 'Waiting for the Browserbase remote window…';
         setRemoteLoginOpenState(null);
         $('#remote-login-complete').disabled = false;
         $('#remote-login-complete').textContent = 'I’ve completed sign-in';
         $('#remote-login-cancel').disabled = false;
-        setRemoteLoginStatus('Connecting to Browserless…');
+        setRemoteLoginStatus('Connecting to Browserbase…');
       }
 
       function closeRemoteLoginModal() {
@@ -1568,8 +1568,8 @@
                     closeUnusedRemoteWindow(preparedWindow, remoteWindowLaunched);
                     preparedWindow = null;
                     const message = event.message ?? 'The remote sign-in window is unavailable.';
-                    setRemoteLoginStatus(`${message} You can use the Browserless dashboard, then confirm completion.`);
-                    $('#remote-login-empty').textContent = `${message} You can use the Browserless dashboard, then confirm completion.`;
+                    setRemoteLoginStatus(`${message} You can use the Browserbase dashboard, then confirm completion.`);
+                    $('#remote-login-empty').textContent = `${message} You can use the Browserbase dashboard, then confirm completion.`;
                     setStatus('Running', 'warn', 'Remote sign-in window unavailable.');
                   }
                 } else if (event.type === 'status') {

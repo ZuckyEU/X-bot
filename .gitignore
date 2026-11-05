@@ -20,6 +20,11 @@ playwright-report/
 blob-report/
 .playwright/
 .playwright-cli/
+test-error-screenshot.png
+
+# Local manual Browserbase/X login scripts and captured sessions
+test-browserbase.cjs
+x-auth-state.json
 
 # Test, coverage, and temporary artifacts
 coverage/

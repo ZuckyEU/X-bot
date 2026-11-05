@@ -10,7 +10,7 @@
     "automate": "node main.js",
     "serve": "node server.js",
     "check:prod": "node scripts/check-prod.js",
-    "test": "node --test"
+    "test": "node --test \"test/*.test.js\""
   },
   "keywords": [
     "playwright",
@@ -24,6 +24,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@browserbasehq/sdk": "^2.25.0",
     "@google/genai": "^2.32.0",
     "bcrypt": "^6.0.0",
     "body-parser": "^2.4.0",
