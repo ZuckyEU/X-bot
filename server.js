@@ -1188,15 +1188,14 @@ async function waitForLogin(context, signal) {
 }
 
 /**
- * Launches headed Chrome with a fresh, empty browser context, waits for the user
+ * Launches headed Chromium with a fresh, empty browser context, waits for the user
  * to finish logging in, then saves Playwright storage state for that user/X account.
  */
 async function runBrowserLogin({ send, signal, generation, user, requestedXUsername = null }) {
-  send({ type: 'start', command: `browser sign-in -> ${LOGIN_URL} (fresh empty context, headed Chrome)` });
+  send({ type: 'start', command: `browser sign-in -> ${LOGIN_URL} (fresh empty context, headed Chromium)` });
 
   const browser = await chromium.launch({
     headless: false,
-    channel: 'chrome',
     args: ['--disable-blink-features=AutomationControlled', '--start-maximized'],
     ignoreDefaultArgs: ['--enable-automation'],
   });
