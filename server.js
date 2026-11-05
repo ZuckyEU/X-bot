@@ -34,7 +34,7 @@ const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
 const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MAX_BODY = '16kb';
 
@@ -1662,7 +1662,7 @@ app.use((error, req, res, next) => {
   return res.status(500).json({ error: 'Something went wrong' });
 });
 
-const server = app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`X automation admin UI: http://${HOST}:${PORT}`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/register   (create local user)`);
