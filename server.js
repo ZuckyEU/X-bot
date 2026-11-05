@@ -9,7 +9,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'crypto';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
+import {
+  closeBrowser,
+  connectBrowser,
+  getDefaultContext,
+  getOrCreatePage,
+  safeContextCall,
+  safeGoto,
+} from './lib/browser.js';
 
 /**
  * Local service for the X reply automation.
@@ -1178,13 +1185,16 @@ async function waitForLogin(context, signal) {
   while (Date.now() < deadline) {
     throwIfAborted(signal);
 
-    const cookies = await context.cookies();
-    if (cookies.some((cookie) => cookie.name === SESSION_COOKIE)) return true;
+    const cookieResult = await safeContextCall(context, () => context.cookies(), 'Reading login cookies');
+    if (!cookieResult.ok) return { loggedIn: false, error: cookieResult.error };
+    if (cookieResult.value.some((cookie) => cookie.name === SESSION_COOKIE)) {
+      return { loggedIn: true, error: null };
+    }
 
     await sleep(500);
   }
 
-  return false;
+  return { loggedIn: false, error: null };
 }
 
 /**
@@ -1208,7 +1218,11 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
     throwIfAborted(signal);
 
     const context = await getDefaultContext(browser);
-    await context.clearCookies();
+    const cleared = await safeContextCall(context, () => context.clearCookies(), 'Clearing browser cookies');
+    if (!cleared.ok) {
+      send({ type: 'stderr', data: `${cleared.error.message}. Aborting sign-in.` });
+      return { ok: false };
+    }
     const page = await getOrCreatePage(context);
 
     send({ type: 'stdout', data: `Opening ${LOGIN_URL} …` });
@@ -1227,8 +1241,15 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
 
     send({ type: 'stdout', data: 'Waiting for you to finish logging in to X …' });
 
-    const loggedIn = await waitForLogin(context, signal);
-    if (!loggedIn) {
+    const login = await waitForLogin(context, signal);
+    if (login.error) {
+      send({
+        type: 'stderr',
+        data: `${login.error.message}. The browser session closed before sign-in completed; nothing was saved.`,
+      });
+      return { ok: false };
+    }
+    if (!login.loggedIn) {
       send({ type: 'stderr', data: 'X sign-in was not verified — the session was not saved.' });
       return { ok: false };
     }
@@ -1244,7 +1265,16 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
     username ??= requestedXUsername;
     if (!username) throw new Error('Could not determine the signed-in X username');
 
-    const storageState = await context.storageState();
+    const storedState = await safeContextCall(
+      context,
+      () => context.storageState(),
+      'Capturing browser session state',
+    );
+    if (!storedState.ok) {
+      send({ type: 'stderr', data: `${storedState.error.message}. Nothing was saved.` });
+      return { ok: false };
+    }
+    const storageState = storedState.value;
     if (storageState.cookies.length === 0) {
       send({ type: 'stderr', data: 'No cookies were captured — nothing was saved.' });
       return { ok: false };
@@ -1275,7 +1305,7 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
       data: `Saved ${storageState.cookies.length} cookies for @${username} (session valid).` + `\n`,
     });
 
-    return { ok: loggedIn, cookieCount: storageState.cookies.length, username };
+    return { ok: login.loggedIn, cookieCount: storageState.cookies.length, username };
   } finally {
     signal?.removeEventListener('abort', closeBrowserOnAbort);
     await closeBrowser(browser);

@@ -4,7 +4,14 @@ import { stdin as input, stdout as output } from 'node:process';
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
+import {
+  closeBrowser,
+  connectBrowser,
+  getDefaultContext,
+  getOrCreatePage,
+  safeContextCall,
+  safeGoto,
+} from './lib/browser.js';
 
 /**
  * Manual X (Twitter) login helper.
@@ -43,11 +50,14 @@ function waitForEnter(promptText) {
 async function waitForSessionCookie(context, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const cookies = await context.cookies();
-    if (cookies.some((cookie) => cookie.name === SESSION_COOKIE)) return true;
+    const cookieResult = await safeContextCall(context, () => context.cookies(), 'Reading session cookies');
+    if (!cookieResult.ok) return { loggedIn: false, error: cookieResult.error };
+    if (cookieResult.value.some((cookie) => cookie.name === SESSION_COOKIE)) {
+      return { loggedIn: true, error: null };
+    }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  return false;
+  return { loggedIn: false, error: null };
 }
 
 async function main() {
@@ -57,7 +67,12 @@ async function main() {
   try {
     browser = await connectBrowser();
     const context = await getDefaultContext(browser);
-    await context.clearCookies();
+    const cleared = await safeContextCall(context, () => context.clearCookies(), 'Clearing browser cookies');
+    if (!cleared.ok) {
+      console.warn(`${cleared.error.message}. Aborting sign-in.`);
+      process.exitCode = 1;
+      return;
+    }
     const page = await getOrCreatePage(context);
 
     const navigation = await safeGoto(page, LOGIN_URL, { waitUntil: 'commit', timeout: 45_000 });
@@ -72,15 +87,26 @@ async function main() {
     await waitForEnter('Press ENTER after you have finished logging in… ');
 
     console.log('\nChecking the session…');
-    const loggedIn = await waitForSessionCookie(context, LOGIN_WAIT_MS);
-    if (!loggedIn) {
+    const session = await waitForSessionCookie(context, LOGIN_WAIT_MS);
+    if (session.error) {
+      console.warn(`${session.error.message}. No cookies were saved.`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!session.loggedIn) {
       console.warn(
         `Warning: no "${SESSION_COOKIE}" cookie found. You may not be fully logged in.\n` +
           'Saving the cookies anyway — re-run `npm run auth` if the session does not work.',
       );
     }
 
-    const cookies = await context.cookies();
+    const cookiesResult = await safeContextCall(context, () => context.cookies(), 'Reading browser cookies');
+    if (!cookiesResult.ok) {
+      console.warn(`${cookiesResult.error.message}. No cookies were saved.`);
+      process.exitCode = 1;
+      return;
+    }
+    const cookies = cookiesResult.value;
     if (cookies.length === 0) {
       console.error('No cookies to save. Nothing written.');
       process.exitCode = 1;
@@ -98,7 +124,7 @@ async function main() {
 
     console.log(
       `\nSaved ${cookies.length} cookies to auth.json` +
-        (loggedIn ? ' (session valid).' : ' (session unverified).') +
+        (session.loggedIn ? ' (session valid).' : ' (session unverified).') +
         `\n\nReuse them in another script with:\n` +
         `  import { readFile } from 'node:fs/promises';\n` +
         `  const { cookies } = JSON.parse(await readFile('auth.json', 'utf8'));\n` +

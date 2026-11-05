@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
-import { safeGoto } from '../lib/browser.js';
+import { safeContextCall, safeGoto } from '../lib/browser.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
@@ -343,6 +343,58 @@ test('navigation absorbs non-200 HTTP response failures', async () => {
   const result = await safeGoto(page, 'https://twitter.com/login', { waitUntil: 'commit' });
   assert.equal(result.response, null);
   assert.equal(result.error, failure);
+});
+
+test('cookie operations are skipped on closed or disconnected contexts', async () => {
+  const makeContext = ({ connected = true, tracked = true } = {}) => {
+    const context = {
+      cookies: async () => [{ name: 'auth_token', value: 'test' }],
+      browser: () => ({
+        isConnected: () => connected,
+        contexts: () => (tracked ? [context] : []),
+      }),
+    };
+    return context;
+  };
+
+  const openContext = makeContext();
+  const openResult = await safeContextCall(
+    openContext,
+    () => openContext.cookies(),
+    'Reading cookies',
+  );
+  assert.equal(openResult.ok, true);
+  assert.equal(openResult.value.length, 1);
+
+  for (const [name, context] of [
+    ['closed', makeContext({ tracked: false })],
+    ['disconnected', makeContext({ connected: false })],
+  ]) {
+    let operationRan = false;
+    const result = await safeContextCall(
+      context,
+      async () => {
+        operationRan = true;
+        return [];
+      },
+      'Reading cookies',
+    );
+    assert.equal(result.ok, false, `${name} context should fail`);
+    assert.match(result.error.message, /closed or disconnected/);
+    assert.equal(operationRan, false, `${name} context must not run the operation`);
+  }
+
+  const closingContext = makeContext();
+  closingContext.cookies = async () => {
+    throw new Error('Target page, context or browser has been closed');
+  };
+  const closingResult = await safeContextCall(
+    closingContext,
+    () => closingContext.cookies(),
+    'Reading cookies',
+  );
+  assert.equal(closingResult.ok, false);
+  assert.match(closingResult.error.message, /browser context was closed/);
 });
 
 test('container exposes the Render port and starts Node directly', async () => {

@@ -4,7 +4,14 @@ import { stdin as input, stdout as output } from 'node:process';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
+import {
+  closeBrowser,
+  connectBrowser,
+  getDefaultContext,
+  getOrCreatePage,
+  safeContextCall,
+  safeGoto,
+} from './lib/browser.js';
 import { generateReply, MAX_REPLY_LENGTH, DEFAULT_TONE } from './lib/reply.js';
 
 /**
@@ -365,7 +372,16 @@ async function main() {
   try {
     browser = await connectBrowser();
     const context = await getDefaultContext(browser);
-    await context.addCookies(authState.cookies);
+    const restored = await safeContextCall(
+      context,
+      () => context.addCookies(authState.cookies),
+      'Restoring X session cookies',
+    );
+    if (!restored.ok) {
+      console.warn(`[AUTH] ${restored.error.message}. Nothing was posted.`);
+      process.exitCode = 1;
+      return;
+    }
     const page = await getOrCreatePage(context);
 
     await ensureLoggedIn(page);
