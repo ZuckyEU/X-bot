@@ -881,16 +881,16 @@ test('remote sign-in cancellation is authenticated and idempotent', async (t) =>
   assert.deepEqual(await noRun.json(), { ok: true, cancelled: false });
 });
 
-test('container exposes the Render port and starts Node directly', async () => {
+test('container exposes the Fly.io port and starts Node directly', async () => {
   const [dockerfile, server] = await Promise.all([
     readFile(join(ROOT, 'Dockerfile'), 'utf8'),
     readFile(join(ROOT, 'server.js'), 'utf8'),
   ]);
 
-  assert.match(dockerfile, /^ENV PORT=10000$/m);
-  assert.match(dockerfile, /^EXPOSE 10000$/m);
+  assert.match(dockerfile, /^ENV PORT=3000$/m);
+  assert.match(dockerfile, /^EXPOSE 3000$/m);
   assert.match(dockerfile, /^CMD \["node", "server\.js"\]$/m);
-  assert.match(server, /process\.env\.PORT \|\| 10000/);
+  assert.match(server, /process\.env\.PORT \|\| 3000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
   assert.match(server, /Server listening on port/);
 
@@ -908,7 +908,14 @@ test('UI mobile dropdown, remote X handoff, Clear All, and sign-out remain stabl
   // Keep this browser local: the remote browser cannot reach the ephemeral 127.0.0.1 test server.
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--single-process',
+    ],
   });
   t.after(() => browser.close());
   const page = await browser.newPage();

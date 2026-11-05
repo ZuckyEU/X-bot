@@ -55,7 +55,7 @@ const DEFAULT_ADMIN_EMAIL = String(process.env.DEFAULT_ADMIN_EMAIL || '')
   .toLowerCase();
 const DEFAULT_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || '');
 const PUBLIC_DIR = join(ROOT, 'public');
-const PORT = Number(process.env.PORT || 10000);
+const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MAX_BODY = '16kb';
