@@ -9,6 +9,7 @@ import {
   connectBrowser,
   getDefaultContext,
   getOrCreatePage,
+  restoreStorageState,
   safeContextCall,
   safeGoto,
 } from './lib/browser.js';
@@ -140,6 +141,7 @@ async function loadAuthState() {
 
   return {
     cookies,
+    origins: Array.isArray(parsed) || !Array.isArray(parsed.origins) ? [] : parsed.origins,
     username: usernameMatch?.[1] ?? null,
   };
 }
@@ -375,8 +377,8 @@ async function main() {
     const context = await getDefaultContext(browser);
     const restored = await safeContextCall(
       context,
-      () => context.addCookies(authState.cookies),
-      'Restoring X session cookies',
+      () => restoreStorageState(context, authState, { clearCookies: true }),
+      'Restoring X session cookies and localStorage',
     );
     if (!restored.ok) {
       console.warn(`[AUTH] ${restored.error.message}. Nothing was posted.`);

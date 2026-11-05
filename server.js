@@ -12,12 +12,15 @@ import crypto from 'crypto';
 import {
   closeBrowser,
   connectBrowser,
+  createTrustedLoginProfile,
   createLiveInspection,
   getDefaultContext,
   getOrCreatePage,
+  restoreStorageState,
   safeContextCall,
   safeGoto,
   X_LOGIN_URL,
+  X_REFERER,
 } from './lib/browser.js';
 
 /**
@@ -101,6 +104,7 @@ const LIVE_VIEW_TIMEOUT_MS = (() => {
 })();
 const POST_LOGIN_TIMEOUT_MS = 60 * 1000;
 const AUTH_RUN_TIMEOUT_MS = LOGIN_TIMEOUT_MS + POST_LOGIN_TIMEOUT_MS + 5_000;
+const LOGIN_PROFILE_CHECKPOINT_MS = 15_000;
 const RESERVED_X_ROUTES = new Set(['home', 'explore', 'notifications', 'messages', 'search', 'compose', 'settings', 'i']);
 
 const HISTORY_FILE = join(DATA_DIR, 'history.json');
@@ -441,10 +445,18 @@ function normalizeUserAccounts(user) {
   return user;
 }
 
-function sessionFileFor(userId, xUsername) {
+function sessionDirectoryFor(userId) {
   const safeUserId = String(userId ?? '');
   if (!/^[a-f0-9-]{16,64}$/i.test(safeUserId)) throw new Error('Invalid user id in user database');
-  return join(SESSIONS_DIR, safeUserId, `${normalizeXUsername(xUsername)}.json`);
+  return join(SESSIONS_DIR, safeUserId);
+}
+
+function sessionFileFor(userId, xUsername) {
+  return join(sessionDirectoryFor(userId), `${normalizeXUsername(xUsername)}.json`);
+}
+
+function loginProfileFileFor(userId) {
+  return join(sessionDirectoryFor(userId), '_trusted-login-profile.json');
 }
 
 async function sessionFileExists(path) {
@@ -719,6 +731,53 @@ async function stageActiveSession(user) {
   return session;
 }
 
+function trustedLoginProfilePayload(storageState) {
+  const profile = createTrustedLoginProfile(storageState);
+  return {
+    ...profile,
+    savedAt: new Date().toISOString(),
+    cookieCount: profile.cookies.length,
+    profile: 'tenant-trusted-login',
+  };
+}
+
+async function saveTrustedLoginProfile(userId, storageState) {
+  const payload = trustedLoginProfilePayload(storageState);
+  await withWriteLock(() => writeAuthFile(payload, loginProfileFileFor(userId)));
+  return payload;
+}
+
+async function loginBootstrapStateFor(user, requestedXUsername = null) {
+  normalizeUserAccounts(user);
+
+  if (requestedXUsername && user.xAccounts.includes(requestedXUsername)) {
+    const accountPath = sessionFileFor(user.id, requestedXUsername);
+    if (await sessionFileExists(accountPath)) {
+      return {
+        state: await readAuthFile(accountPath),
+        source: `saved session for @${requestedXUsername}`,
+      };
+    }
+  }
+
+  const profilePath = loginProfileFileFor(user.id);
+  if (await sessionFileExists(profilePath)) {
+    return {
+      state: await readAuthFile(profilePath),
+      source: 'tenant trusted-browser profile',
+    };
+  }
+
+  const activeSession = await activeSessionFor(user);
+  if (!activeSession) return null;
+  const activeState = await readAuthFile(activeSession.path);
+  if (!activeState) return null;
+  return {
+    state: createTrustedLoginProfile(activeState),
+    source: `trusted device state from @${activeSession.xUsername}`,
+  };
+}
+
 async function addAccountToUser(userId, xUsername) {
   return withWriteLock(async () => {
     const users = await loadUserDb();
@@ -945,8 +1004,10 @@ app.post('/api/auth/x-accounts', async (req, res, next) => {
       }
 
       const destination = sessionFileFor(current.id, xUsername);
-      if (storageState) await writeAuthFile({ ...storageState, username: xUsername }, destination);
-      else if (!(await sessionFileExists(destination))) {
+      if (storageState) {
+        await writeAuthFile({ ...storageState, username: xUsername }, destination);
+        await writeAuthFile(trustedLoginProfilePayload(storageState), loginProfileFileFor(current.id));
+      } else if (!(await sessionFileExists(destination))) {
         throw new ValidationError('storageState is required when linking a new X account');
       }
 
@@ -1049,6 +1110,24 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
         } else {
           await deleteAuthFile(AUTH_FILE);
         }
+      }
+
+      const trustedProfilePath = loginProfileFileFor(current.id);
+      const profileAccount = current.preferences.defaultXAccount ?? current.xAccounts[0] ?? null;
+      if (profileAccount) {
+        try {
+          const profileState = await readAuthFile(sessionFileFor(current.id, profileAccount));
+          if (profileState) {
+            await writeAuthFile(trustedLoginProfilePayload(profileState), trustedProfilePath);
+          } else {
+            await deleteAuthFile(trustedProfilePath);
+          }
+        } catch (error) {
+          console.warn(`Could not refresh the trusted login profile after unlinking @${xUsername}: ${error.message}`);
+          await deleteAuthFile(trustedProfilePath);
+        }
+      } else {
+        await deleteAuthFile(trustedProfilePath);
       }
 
       return { user: current, wasActive, sessionDeleted, activeSessionStaged };
@@ -1354,7 +1433,33 @@ async function runBrowserLogin({
   });
 
   let browser = null;
+  let context = null;
   let liveInspection = null;
+  let profileCheckpointTimer = null;
+  let profileCheckpointPromise = null;
+  const checkpointTrustedProfile = () => {
+    if (!context || signal?.aborted) return Promise.resolve(false);
+    if (profileCheckpointPromise) return profileCheckpointPromise;
+
+    profileCheckpointPromise = (async () => {
+      const state = await safeContextCall(
+        context,
+        () => context.storageState(),
+        'Capturing the tenant trusted-browser profile',
+      );
+      if (!state.ok) return false;
+      await saveTrustedLoginProfile(user.id, state.value);
+      return true;
+    })()
+      .catch((error) => {
+        console.warn(`[browser] Could not checkpoint the trusted login profile: ${error.message}`);
+        return false;
+      })
+      .finally(() => {
+        profileCheckpointPromise = null;
+      });
+    return profileCheckpointPromise;
+  };
   const closeBrowserOnAbort = () => {
     loginControl.wake();
     void closeBrowser(browser);
@@ -1366,16 +1471,32 @@ async function runBrowserLogin({
     onBrowserConnected?.(browser);
     throwIfAborted(signal);
 
-    const context = await getDefaultContext(browser);
-    const cleared = await safeContextCall(context, () => context.clearCookies(), 'Clearing browser cookies');
-    if (!cleared.ok) {
-      send({ type: 'stderr', data: `${cleared.error.message}. Aborting sign-in.` });
+    context = await getDefaultContext(browser);
+    const bootstrap = await loginBootstrapStateFor(user, requestedXUsername);
+    const restored = await safeContextCall(
+      context,
+      () => restoreStorageState(context, bootstrap?.state, { clearCookies: true }),
+      'Restoring the tenant browser profile',
+    );
+    if (!restored.ok) {
+      send({ type: 'stderr', data: `${restored.error.message}. Aborting sign-in.` });
       return { ok: false };
+    }
+    if (bootstrap) {
+      send({
+        type: 'status',
+        stage: 'profile-restored',
+        data: `Reused ${bootstrap.source} (${restored.value.cookieCount} cookies, ${restored.value.localStorageCount} local-storage entries).`,
+      });
     }
     const page = await getOrCreatePage(context);
 
     send({ type: 'stdout', data: `Opening ${LOGIN_URL} …` });
-    const navigation = await safeGoto(page, LOGIN_URL, { waitUntil: 'commit', timeout: 45_000 });
+    const navigation = await safeGoto(page, LOGIN_URL, {
+      waitUntil: 'commit',
+      timeout: 45_000,
+      referer: X_REFERER,
+    });
     if (navigation.error) {
       send({
         type: 'stderr',
@@ -1387,6 +1508,10 @@ async function runBrowserLogin({
         data: `X returned HTTP ${navigation.response.status()} on the login page; continuing to wait for sign-in …`,
       });
     }
+
+    void checkpointTrustedProfile();
+    profileCheckpointTimer = setInterval(() => void checkpointTrustedProfile(), LOGIN_PROFILE_CHECKPOINT_MS);
+    profileCheckpointTimer.unref?.();
 
     send({ type: 'stdout', data: 'Waiting for you to complete sign-in in the remote window …' });
 
@@ -1495,6 +1620,7 @@ async function runBrowserLogin({
       username,
     };
     const destination = sessionFileFor(user.id, username);
+    const trustedProfile = trustedLoginProfilePayload(storageState);
 
     await withWriteLock(async () => {
       if (signal?.aborted || generation !== authGeneration) {
@@ -1503,6 +1629,7 @@ async function runBrowserLogin({
         throw error;
       }
       await writeAuthFile(payload, destination);
+      await writeAuthFile(trustedProfile, loginProfileFileFor(user.id));
     });
     const updatedUser = await addAccountToUser(user.id, username);
     if (updatedUser.preferences.defaultXAccount === username) await stageActiveSession(updatedUser);
@@ -1514,6 +1641,8 @@ async function runBrowserLogin({
 
     return { ok: login.loggedIn, cookieCount: storageState.cookies.length, username };
   } finally {
+    clearInterval(profileCheckpointTimer);
+    if (!signal?.aborted) await checkpointTrustedProfile();
     signal?.removeEventListener('abort', closeBrowserOnAbort);
     await liveInspection?.close();
     await closeBrowser(browser);

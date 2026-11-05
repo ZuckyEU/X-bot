@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -9,9 +9,11 @@ import {
   connectBrowser,
   getDefaultContext,
   getOrCreatePage,
+  restoreStorageState,
   safeContextCall,
   safeGoto,
   X_LOGIN_URL,
+  X_REFERER,
 } from './lib/browser.js';
 
 /**
@@ -19,7 +21,7 @@ import {
  *
  * Opens a Browserless remote Chromium session on the X login page, lets you
  * complete sign-in through the Browserless session viewer, then saves the
- * session cookies to auth.json.
+ * complete storage state (cookies and localStorage) to auth.json.
  */
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +30,17 @@ const LOGIN_URL = X_LOGIN_URL;
 const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const SESSION_COOKIE = 'auth_token'; // set by X once you are actually logged in
 const LOGIN_WAIT_MS = 15_000;
+
+async function loadSavedState() {
+  try {
+    const parsed = JSON.parse((await readFile(AUTH_FILE, 'utf8')).replace(/^\uFEFF/, ''));
+    const state = Array.isArray(parsed) ? { cookies: parsed, origins: [] } : parsed;
+    return state && Array.isArray(state.cookies) ? state : null;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
 
 const banner = `
 ────────────────────────────────────────────────────────────
@@ -70,15 +83,29 @@ async function main() {
   try {
     browser = await connectBrowser();
     const context = await getDefaultContext(browser);
-    const cleared = await safeContextCall(context, () => context.clearCookies(), 'Clearing browser cookies');
-    if (!cleared.ok) {
-      console.warn(`${cleared.error.message}. Aborting sign-in.`);
+    const savedState = await loadSavedState();
+    const restored = await safeContextCall(
+      context,
+      () => restoreStorageState(context, savedState, { clearCookies: true }),
+      'Restoring saved browser state',
+    );
+    if (!restored.ok) {
+      console.warn(`${restored.error.message}. Aborting sign-in.`);
       process.exitCode = 1;
       return;
     }
+    if (savedState) {
+      console.log(
+        `Restored ${restored.value.cookieCount} cookies and ${restored.value.localStorageCount} localStorage entries from ${AUTH_FILE}.`,
+      );
+    }
     const page = await getOrCreatePage(context);
 
-    const navigation = await safeGoto(page, LOGIN_URL, { waitUntil: 'commit', timeout: 45_000 });
+    const navigation = await safeGoto(page, LOGIN_URL, {
+      waitUntil: 'commit',
+      timeout: 45_000,
+      referer: X_REFERER,
+    });
     if (navigation.error) {
       console.warn(`Navigation warning: ${navigation.error.message}. Continuing to wait for sign-in…`);
     } else if (navigation.response && navigation.response.status() >= 400) {
@@ -103,13 +130,18 @@ async function main() {
       );
     }
 
-    const cookiesResult = await safeContextCall(context, () => context.cookies(), 'Reading browser cookies');
-    if (!cookiesResult.ok) {
-      console.warn(`${cookiesResult.error.message}. No cookies were saved.`);
+    const storageResult = await safeContextCall(
+      context,
+      () => context.storageState(),
+      'Capturing browser storage state',
+    );
+    if (!storageResult.ok) {
+      console.warn(`${storageResult.error.message}. No browser state was saved.`);
       process.exitCode = 1;
       return;
     }
-    const cookies = cookiesResult.value;
+    const storageState = storageResult.value;
+    const cookies = storageState.cookies;
     if (cookies.length === 0) {
       console.error('No cookies to save. Nothing written.');
       process.exitCode = 1;
@@ -117,10 +149,10 @@ async function main() {
     }
 
     const payload = {
+      ...storageState,
       savedAt: new Date().toISOString(),
       loginUrl: LOGIN_URL,
       cookieCount: cookies.length,
-      cookies,
     };
 
     await mkdir(DATA_DIR, { recursive: true });
@@ -128,12 +160,14 @@ async function main() {
 
     console.log(
       `\nSaved ${cookies.length} cookies to ${AUTH_FILE}` +
+        ` with localStorage from ${storageState.origins.length} origin(s)` +
         (session.loggedIn ? ' (session valid).' : ' (session unverified).') +
         `\n\nReuse them in another script with:\n` +
         `  import { readFile } from 'node:fs/promises';\n` +
-        `  const { cookies } = JSON.parse(await readFile('auth.json', 'utf8'));\n` +
-        `  const context = await browser.newContext();\n` +
-        `  await context.addCookies(cookies);\n\n` +
+        `  import { getDefaultContext, restoreStorageState } from './lib/browser.js';\n` +
+        `  const state = JSON.parse(await readFile('auth.json', 'utf8'));\n` +
+        `  const context = await getDefaultContext(browser);\n` +
+        `  await restoreStorageState(context, state, { clearCookies: true });\n\n` +
         'auth.json grants full access to your X account — keep it private and never commit it.\n',
     );
   } finally {

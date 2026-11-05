@@ -11,13 +11,16 @@ import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
 import {
   CHROME_USER_AGENT,
+  createTrustedLoginProfile,
   createLiveInspection,
   getDefaultContext,
   getOrCreatePage,
+  restoreStorageState,
   safeContextCall,
   safeGoto,
   withSessionTimeout,
   X_LOGIN_URL,
+  X_REFERER,
 } from '../lib/browser.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -120,8 +123,14 @@ function xStorageState(username) {
     cookies: [
       { name: 'auth_token', value: `${username}_auth_token_value`, domain: '.x.com', path: '/', secure: true, httpOnly: true },
       { name: 'ct0', value: `${username}_csrf_token_value`, domain: '.x.com', path: '/', secure: true, httpOnly: false },
+      { name: 'guest_id', value: `${username}_trusted_guest_value`, domain: '.x.com', path: '/', secure: true, httpOnly: false },
     ],
-    origins: [],
+    origins: [
+      {
+        origin: 'https://x.com',
+        localStorage: [{ name: 'trusted-device', value: `${username}-device-state` }],
+      },
+    ],
   };
 }
 
@@ -285,6 +294,23 @@ test('X account deletion rejects traversal and restages the next active account'
   await assert.rejects(stat(join(dataDir, 'sessions', user.id, 'alpha.json')), { code: 'ENOENT' });
   const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
   assert.equal(staged.username, 'beta');
+  assert.deepEqual(staged.origins, xStorageState('beta').origins);
+
+  const trustedProfile = JSON.parse(
+    await readFile(join(dataDir, 'sessions', user.id, '_trusted-login-profile.json'), 'utf8'),
+  );
+  assert.deepEqual(trustedProfile.cookies.map((cookie) => cookie.name), ['guest_id']);
+  assert.deepEqual(trustedProfile.origins, xStorageState('beta').origins);
+
+  const deletedLast = await fetch(`${baseUrl}/api/auth/x-accounts/beta`, {
+    method: 'DELETE',
+    headers: { cookie },
+  });
+  assert.equal(deletedLast.status, 200, await deletedLast.text());
+  await assert.rejects(
+    stat(join(dataDir, 'sessions', user.id, '_trusted-login-profile.json')),
+    { code: 'ENOENT' },
+  );
 });
 
 test('Groq status is masked and explicit deletion purges persisted state', async (t) => {
@@ -533,18 +559,56 @@ test('optional Browserless session timeout is added without rewriting other para
   assert.equal(withSessionTimeout('not a url', 600_000), 'not a url');
 });
 
+test('storage state restores cookies and localStorage while tenant profiles omit account auth', async () => {
+  const operations = [];
+  const initScripts = [];
+  const state = {
+    cookies: [
+      { name: 'auth_token', value: 'account-secret', domain: '.x.com', path: '/' },
+      { name: 'ct0', value: 'csrf-secret', domain: '.x.com', path: '/' },
+      { name: 'guest_id', value: 'trusted-guest', domain: '.x.com', path: '/' },
+      { name: 'kdt', value: 'known-device', domain: '.twitter.com', path: '/' },
+      { name: 'external', value: 'ignore-me', domain: '.example.com', path: '/' },
+    ],
+    origins: [
+      { origin: 'https://x.com', localStorage: [{ name: 'device', value: 'trusted' }] },
+      { origin: 'https://example.com', localStorage: [{ name: 'external', value: 'ignore-me' }] },
+    ],
+  };
+  const context = {
+    clearCookies: async () => operations.push('clearCookies'),
+    addCookies: async (cookies) => operations.push({ addCookies: cookies }),
+    addInitScript: async (script, argument) => initScripts.push({ script, argument }),
+  };
+
+  const restored = await restoreStorageState(context, state, { clearCookies: true });
+  assert.deepEqual(operations, ['clearCookies', { addCookies: state.cookies }]);
+  assert.deepEqual(restored, { cookieCount: 5, originCount: 2, localStorageCount: 2 });
+  assert.equal(initScripts.length, 1);
+  assert.match(String(initScripts[0].script), /localStorage\.getItem/);
+  assert.match(String(initScripts[0].script), /localStorage\.setItem/);
+  assert.deepEqual(initScripts[0].argument, state.origins);
+
+  const trustedProfile = createTrustedLoginProfile(state);
+  assert.deepEqual(trustedProfile.cookies.map((cookie) => cookie.name), ['guest_id', 'kdt']);
+  assert.deepEqual(trustedProfile.origins, [state.origins[0]]);
+});
+
 test('Browserless contexts and pages use a realistic Chrome identity and stealth profile', async () => {
   const page = { isClosed: () => false };
   const commands = [];
   const initScripts = [];
+  const pageHandlers = [];
   const context = {
     pages: () => [page],
     newPage: async () => page,
     addInitScript: async (script) => initScripts.push(script),
+    on: (event, handler) => {
+      if (event === 'page') pageHandlers.push(handler);
+    },
     newCDPSession: async (target) => {
-      assert.equal(target, page);
       return {
-        send: async (method, params) => commands.push({ method, params }),
+        send: async (method, params) => commands.push({ target, method, params }),
         detach: async () => {},
       };
     },
@@ -552,11 +616,17 @@ test('Browserless contexts and pages use a realistic Chrome identity and stealth
   const browser = { contexts: () => [context], newContext: () => context };
 
   assert.equal(X_LOGIN_URL, 'https://x.com/i/flow/login');
+  assert.equal(X_REFERER, 'https://x.com/');
   assert.equal(await getDefaultContext(browser), context);
   assert.equal(await getOrCreatePage(context), page);
   assert.equal(initScripts.length, 1);
+  assert.equal(pageHandlers.length, 1);
   const stealthSource = String(initScripts[0]);
   assert.match(stealthSource, /webdriver/);
+  assert.match(stealthSource, /permissions/);
+  assert.match(stealthSource, /Notification/);
+  assert.match(stealthSource, /chrome/);
+  assert.match(stealthSource, /runtime/);
   assert.match(stealthSource, /WebGLRenderingContext/);
   assert.match(stealthSource, /getParameter/);
   assert.match(stealthSource, /toDataURL/);
@@ -582,6 +652,12 @@ test('Browserless contexts and pages use a realistic Chrome identity and stealth
   await getOrCreatePage(context);
   assert.equal(initScripts.length, 1);
   assert.equal(commands.length, 1);
+
+  const popup = { isClosed: () => false };
+  await pageHandlers[0](popup);
+  assert.equal(commands.length, 2);
+  assert.equal(commands[1].target, popup);
+  assert.equal(commands[1].method, 'Network.setUserAgentOverride');
 });
 
 test('Browserless live inspection failures are reported and detached', async () => {

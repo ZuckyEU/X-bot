@@ -39,7 +39,7 @@ npm run auth
 1. A Browserless remote Chromium session opens directly on `https://x.com/i/flow/login`.
 2. Open that session in the Browserless live view and log in yourself — password, 2FA, captcha, anything X asks for.
 3. Return to the terminal and press **ENTER**.
-4. The script checks for the `auth_token` cookie, then writes all cookies to `auth.json`.
+4. The script checks for the `auth_token` cookie, then writes cookies and X localStorage to `auth.json`.
 
 If you press ENTER too early, the script warns that the session is unverified and saves anyway — just re-run `npm run auth`.
 
@@ -47,13 +47,14 @@ Reuse the session in another script:
 
 ```js
 import { readFile } from 'node:fs/promises';
+import { getDefaultContext, restoreStorageState } from './lib/browser.js';
 
-const { cookies } = JSON.parse(await readFile('auth.json', 'utf8'));
-const context = await browser.newContext();
-await context.addCookies(cookies);   // you are now logged in
+const state = JSON.parse(await readFile('auth.json', 'utf8'));
+const context = await getDefaultContext(browser);
+await restoreStorageState(context, state, { clearCookies: true });
 ```
 
-`auth.json` contains live session tokens with full account access. It is in `.gitignore` — keep it out of version control and never share it.
+`auth.json` contains live session tokens and localStorage with full account access. It is in `.gitignore` — keep it out of version control and never share it.
 
 It uses Playwright's `storageState` shape, so you can also write it by hand (or copy cookies from DevTools):
 
@@ -73,7 +74,7 @@ npm run automate -- https://x.com/user/status/1234567890            # asks for c
 npm run automate -- https://x.com/user/status/1234567890 --yes      # no prompt
 ```
 
-Flow: loads `auth.json` → verifies the session on `x.com/home` → opens the tweet → extracts the text (expanding "Show more") → asks Gemini (`GEMINI_MODEL`, default 3.6 Flash) to classify the tweet and write a reply in that domain (≤ 240 chars) → types it into the reply composer → posts it → likes the tweet.
+Flow: restores cookies and localStorage from `auth.json` → verifies the session on `x.com/home` → opens the tweet → extracts the text (expanding "Show more") → asks Gemini (`GEMINI_MODEL`, default 3.6 Flash) to classify the tweet and write a reply in that domain (≤ 240 chars) → types it into the reply composer → posts it → likes the tweet.
 
 **Dynamic tone, not a crypto bot.** The system prompt makes Gemini identify the tweet's domain first — `crypto`, `web-development`, `software-engineering`, `ui-ux-design`, `ai-ml`, `product-startup` or `other` — and reply in that domain's vocabulary:
 
@@ -117,12 +118,17 @@ Notes:
 
 Flow:
 
-1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies stealth init scripts (`navigator.webdriver`, WebGL, canvas), a desktop Chrome 122 User-Agent with native `sec-ch-ua` client hints, and CORS-safe request headers, clears cookies, navigates to `https://x.com/i/flow/login`, and mints an interactive **Browserless Live URL** with `Browserless.liveURL` over CDP.
-2. The dashboard opens the live URL in an embedded iframe and provides **Open Remote Sign-In Window**, a real `target="_blank"` link that opens the same stream in a fresh tab when iframe cookie restrictions get in the way.
-3. Sign in to X in the remote window, including 2FA or any challenge.
-4. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
-5. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
-6. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and closes the Browserless browser so **Add X Account** can start a fresh session.
+1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
+2. Before navigation, it restores that app tenant's trusted X cookies and localStorage, then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
+3. The dashboard opens the live URL in an embedded iframe and provides **Open Remote Sign-In Window**, a real `target="_blank"` link that opens the same stream in a fresh tab when iframe cookie restrictions get in the way.
+4. Sign in to X in the remote window, including 2FA or any challenge.
+5. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures cookies and localStorage with `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
+6. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
+7. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and closes the Browserless browser so **Add X Account** can start a fresh session.
+
+Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keeps X guest/device cookies and X localStorage while deliberately removing `auth_token`, `ct0`, `twid`, and other account-authentication cookies, so adding another account reuses a consistent browser identity without silently opening the previously linked account. A request that explicitly supplies an already linked `xUsername` restores that account's complete storage state. Login state is checkpointed during the live session and saved atomically.
+
+An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserless proxy region is still important.
 
 If the live link cannot be minted, the dashboard still exposes **Complete Sign-In** so an operator who can reach the Browserless dashboard can finish there and confirm it.
 
