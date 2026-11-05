@@ -22,6 +22,7 @@ import {
   getOrCreatePage,
   resolveBrowserbaseConfig,
   resolveSessionTimeoutSeconds,
+  resolveVerifiedModeEnabled,
   restoreStorageState,
   safeContextCall,
   safeGoto,
@@ -574,11 +575,21 @@ test('Browserbase credentials and stealth session parameters are resolved safely
   });
   assert.equal(params.projectId, 'project-id');
   assert.equal(params.api_timeout, 900);
-  assert.equal(params.browserSettings.verified, true);
-  assert.equal(params.browserSettings.os, 'windows');
+  assert.equal(params.browserSettings.verified, undefined, 'Verified mode is opt-in');
+  assert.equal(params.browserSettings.os, undefined, 'stealth-only OS is omitted on Free tier');
   assert.equal(params.browserSettings.solveCaptchas, true);
   assert.deepEqual(params.userMetadata, { tenant: 'one' });
   assert.equal(Object.hasOwn(browserbaseSessionParams({}), 'projectId'), false);
+
+  const verified = browserbaseSessionParams({ verifiedMode: true });
+  assert.equal(verified.browserSettings.verified, true);
+  assert.equal(verified.browserSettings.os, 'windows');
+
+  assert.equal(resolveVerifiedModeEnabled({}), false);
+  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: 'false' }), false);
+  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: 'true' }), true);
+  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: '1' }), true);
+  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: 'on' }), true);
 });
 
 test('connectBrowser creates a stealth Browserbase session and releases it on cleanup', async () => {
@@ -602,7 +613,8 @@ test('connectBrowser creates a stealth Browserbase session and releases it on cl
   assert.equal(calls.create.length, 1);
   assert.equal(calls.create[0].projectId, 'project-id');
   assert.equal(calls.create[0].api_timeout, 1_200);
-  assert.equal(calls.create[0].browserSettings.verified, true);
+  assert.equal(calls.create[0].browserSettings.verified, undefined);
+  assert.equal(calls.create[0].browserSettings.os, undefined);
   assert.equal(getBrowserbaseSession(browser).session.id, 'session-1');
 
   await closeBrowser(browser);
