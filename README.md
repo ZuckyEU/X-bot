@@ -112,15 +112,21 @@ Notes:
 - Automated posting/liking may violate X's automation rules and can get an account limited. This script handles one reply per run, on your own account — don't turn it into a mass-reply loop.
 - Gemini runs with thinking disabled (`thinkingBudget: 0`) so the whole token budget goes to the reply. Overload 503s are retried 3× with backoff before failing.
 
-## Browser sign-in via the web UI (Add X Account)
+## X sign-in via the web UI (Add X Account)
 
-`server.js` opens a **Browserless remote Chromium** session directly on `https://x.com/i/flow/login` when you press **Add X Account** in the account dropdown (`POST /auth/x`).
+**Add X Account** opens a direct credential form by default. `POST /auth/x/credentials` accepts an X username/email/phone plus password over same-origin HTTPS, keeps the password in request memory only, and types it into a top-level **Browserless remote Chromium** page at `https://x.com/i/flow/login`. The password is deleted from the parsed request immediately, never logged, never written to disk, and never returned by the API.
+
+After X sets `auth_token`, the server captures the complete Playwright storage state, atomically writes `sessions/<userId>/<xUsername>.json`, updates the linked-account list, and returns the refreshed accounts so the dropdown updates immediately. If X requests 2FA, email/phone verification, or a captcha, the API returns `challenge_required` and the modal offers the remote-window fallback. It does not attempt to bypass those checks. Production credential requests are rejected unless they arrive through HTTPS.
+
+### Remote challenge fallback
+
+`POST /auth/x` starts the interactive fallback on the same direct X login URL.
 
 Flow:
 
 1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
 2. Before navigation, it restores that app tenant's trusted X cookies and localStorage, then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
-3. The dashboard opens the live URL in an embedded iframe and provides **Open Remote Sign-In Window**, a real `target="_blank"` link that opens the same stream in a fresh tab when iframe cookie restrictions get in the way.
+3. The dashboard intentionally does **not** embed the live stream. **Open Remote Sign-In Window** is a real `target="_blank"` link so the Browserless viewer runs in a dedicated tab without inline canvas/input latency.
 4. Sign in to X in the remote window, including 2FA or any challenge.
 5. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures cookies and localStorage with `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
 6. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
@@ -169,6 +175,7 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `POST /api/auth/logout` | Clear `auth.json` |
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |
+| `POST /auth/x/credentials` | Direct X credential sign-in; password is memory-only, verifies `auth_token`, saves per-tenant storage state |
 | `POST /auth/x` | NDJSON: start → live → stdout/stderr/status → exit (Browserless browser sign-in) |
 | `POST /auth/x/complete` | Confirm the active remote X sign-in; saves storage state and updates linked accounts |
 | `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and close the Browserless browser |

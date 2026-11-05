@@ -42,6 +42,8 @@
         text-rendering: optimizeLegibility;
       }
       main {
+        position: relative;
+        z-index: 1;
         width: 100%;
         max-width: 1240px;
         display: grid;
@@ -160,7 +162,7 @@
       .auth-actions { display: flex; gap: 12px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
 
       /* ------------------------------ top bar ------------------------------ */
-      .topbar { width: 100%; max-width: 1240px; min-height: 62px; margin: 0 auto 16px; padding: 10px 12px 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid var(--border); border-radius: 8px; background: rgba(12, 16, 22, 0.9); box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28); backdrop-filter: blur(14px); }
+      .topbar { position: relative; z-index: 100; overflow: visible; width: 100%; max-width: 1240px; min-height: 62px; margin: 0 auto 16px; padding: 10px 12px 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid var(--border); border-radius: 8px; background: rgba(12, 16, 22, 0.9); box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28); backdrop-filter: blur(14px); }
       .brand { display: flex; align-items: center; gap: 11px; }
       .brand-mark { width: 34px; height: 34px; border-radius: 6px; display: grid; place-items: center; background: #131b27; border: 1px solid var(--border-strong); color: var(--accent-hover); font-weight: 800; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05); }
       .brand-name { font-size: 15px; font-weight: 750; letter-spacing: -0.015em; }
@@ -176,8 +178,8 @@
       .account-chip .profile-line { color: var(--muted); font-size: 12px; margin-top: 2px; }
       .account-chip .chevron { color: var(--muted); font-size: 11px; transition: transform 0.15s ease; }
       .account-chip[aria-expanded="true"] .chevron { transform: rotate(180deg); }
-      .account-wrap { position: relative; display: inline-block; }
-      .account-dropdown { position: absolute; right: 0; top: calc(100% + 8px); width: 324px; max-width: calc(100vw - 32px); border: 1px solid var(--border-strong); border-radius: 8px; background: #0e131a; padding: 8px; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.64), inset 0 1px 0 rgba(255, 255, 255, 0.035); z-index: 30; }
+      .account-wrap { position: relative; z-index: 101; display: inline-block; }
+      .account-dropdown { position: absolute; isolation: isolate; overflow: hidden; right: 0; top: calc(100% + 8px); width: 324px; max-width: calc(100vw - 32px); border: 1px solid var(--border-strong); border-radius: 8px; background: #111827; background-color: #111827; padding: 8px; box-shadow: 0 28px 72px rgba(0, 0, 0, 0.78), 0 0 0 1px rgba(255, 255, 255, 0.025); z-index: 9999; }
       .account-dropdown-head { padding: 6px 7px 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.11em; color: var(--muted); }
       .account-dropdown-row { font-size: 12px; color: #cdd3e1; padding: 10px 8px; }
       .menu-user { padding: 6px 7px 11px; border-bottom: 1px solid var(--border); margin-bottom: 6px; }
@@ -293,6 +295,22 @@
       #auth-submit { width: 100%; padding: 11px 18px; }
       body.auth-open { overflow: hidden; }
 
+      #x-credentials-modal {
+        position: fixed;
+        inset: 0;
+        padding: 24px;
+        background: rgba(3, 5, 8, 0.9);
+        display: grid;
+        place-items: center;
+        z-index: 1100;
+        overflow-y: auto;
+        backdrop-filter: blur(8px);
+      }
+      .x-credentials-actions { display: grid; gap: 9px; }
+      #x-credentials-submit, #x-credentials-remote { width: 100%; }
+      .credential-security-note { margin: 12px 0 0; color: var(--muted); font-size: 11px; text-align: center; }
+      body.credentials-open { overflow: hidden; }
+
       /* --------------------------- remote X sign-in ----------------------- */
       #remote-login-modal {
         position: fixed;
@@ -306,7 +324,7 @@
         backdrop-filter: blur(8px);
       }
       .remote-login {
-        width: min(1120px, 100%);
+        width: min(560px, 100%);
         max-height: calc(100vh - 48px);
         display: flex;
         flex-direction: column;
@@ -328,21 +346,14 @@
       .remote-login-body {
         position: relative;
         flex: 1 1 auto;
-        min-height: 360px;
+        min-height: 160px;
         overflow: hidden;
         border: 1px solid var(--border);
         border-radius: 7px;
         background: #05070a;
       }
-      #remote-login-iframe {
-        display: block;
-        width: 100%;
-        height: min(66vh, 720px);
-        border: 0;
-        background: #05070a;
-      }
       .remote-login-empty {
-        min-height: 360px;
+        min-height: 160px;
         display: grid;
         place-items: center;
         padding: 32px;
@@ -417,7 +428,6 @@
         .actions button { flex: 1 1 140px; }
         #remote-login-modal { padding: 8px; }
         .remote-login { max-height: calc(100vh - 16px); padding: 12px; }
-        #remote-login-iframe { height: 58vh; min-height: 300px; }
         .remote-login-actions button, .remote-login-actions a.button { flex: 1 1 150px; }
       }
 
@@ -470,6 +480,45 @@
       </div>
     </div>
 
+    <div id="x-credentials-modal" class="hidden" aria-hidden="true">
+      <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="x-credentials-title" aria-describedby="x-credentials-subtitle">
+        <button class="auth-close" id="x-credentials-close" type="button" aria-label="Close X credential sign-in dialog">&times;</button>
+        <div class="auth-header">
+          <div class="auth-mark" aria-hidden="true">X</div>
+          <h2 class="auth-title" id="x-credentials-title">Connect X account</h2>
+          <p class="auth-subtitle" id="x-credentials-subtitle">Sign in directly through the secure remote browser.</p>
+        </div>
+        <form id="x-credentials-form" autocomplete="off" novalidate>
+          <div class="auth-field">
+            <label class="control-label" for="x-credential-identifier">X username, email, or phone</label>
+            <input type="text" id="x-credential-identifier" name="identifier" placeholder="@username or email" autocomplete="username" maxlength="254" required />
+          </div>
+          <div class="auth-field">
+            <label class="control-label" for="x-credential-password">X password</label>
+            <div class="password-input-wrap">
+              <input type="password" id="x-credential-password" name="password" placeholder="Your X password" autocomplete="off" maxlength="256" required />
+              <button class="password-toggle" id="toggle-x-credential-password" type="button" aria-label="Show X password" aria-controls="x-credential-password" aria-pressed="false">
+                <svg class="eye-on" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path>
+                  <circle cx="12" cy="12" r="2.75"></circle>
+                </svg>
+                <svg class="eye-off" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4.6 4.6 19.4 19.4"></path>
+                  <path d="M9.8 6.3A9.7 9.7 0 0 1 12 6c6 0 9.5 6 9.5 6a16 16 0 0 1-2.6 3.3M6.2 7.7C3.8 9.5 2.5 12 2.5 12s3.5 6 9.5 6c1 0 1.9-.2 2.7-.4M10.1 10.1a2.75 2.75 0 0 0 3.8 3.8"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="auth-error" id="x-credentials-error" role="alert" aria-live="polite"></div>
+          <div class="x-credentials-actions">
+            <button type="submit" class="primary" id="x-credentials-submit">Connect account</button>
+            <button type="button" class="ghost" id="x-credentials-remote">Use remote window for 2FA or captcha</button>
+          </div>
+          <p class="credential-security-note">Your X password is processed in memory only long enough to enter it into X. This app never saves or logs it.</p>
+        </form>
+      </div>
+    </div>
+
     <div id="remote-login-modal" class="hidden" aria-hidden="true">
       <div class="remote-login" role="dialog" aria-modal="true" aria-labelledby="remote-login-title" aria-describedby="remote-login-status">
         <div class="remote-login-head">
@@ -480,14 +529,6 @@
           <button id="remote-login-cancel" class="ghost" type="button">Cancel</button>
         </div>
         <div class="remote-login-body">
-          <iframe
-            id="remote-login-iframe"
-            class="hidden"
-            title="Browserless remote X sign-in"
-            sandbox="allow-same-origin allow-scripts"
-            allow="clipboard-read; clipboard-write"
-            referrerpolicy="no-referrer"
-          ></iframe>
           <div id="remote-login-empty" class="remote-login-empty">
             Waiting for the Browserless remote window…
           </div>
@@ -497,7 +538,7 @@
           <button id="remote-login-complete" class="primary" type="button" disabled>Complete Sign-In</button>
         </div>
         <p class="remote-login-hint">
-          Sign in to X in the remote window, including any 2FA or challenge. Then click
+          Open the remote browser in a new tab, complete any 2FA or challenge, then click
           <strong>Complete Sign-In</strong> to save the session and update your accounts.
         </p>
       </div>
@@ -663,6 +704,8 @@
       let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
       let remoteLoginUrl = null;
       let remoteCancelInFlight = false;
+      let credentialController = null;
+      let credentialLoginInFlight = false;
       const targetUrls = [];
 
       // Authentication is cookie-only; remove tokens left by older UI versions.
@@ -806,6 +849,112 @@
         document.body.classList.remove('auth-open');
       }
 
+      function setXCredentialPasswordVisible(visible) {
+        const passwordInput = $('#x-credential-password');
+        const toggle = $('#toggle-x-credential-password');
+        passwordInput.type = visible ? 'text' : 'password';
+        toggle.setAttribute('aria-pressed', String(visible));
+        toggle.setAttribute('aria-label', visible ? 'Hide X password' : 'Show X password');
+      }
+
+      function openXCredentialModal() {
+        closeAccountMenu();
+        const modal = $('#x-credentials-modal');
+        modal.classList.remove('hidden');
+        modal.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('credentials-open');
+        $('#x-credential-identifier').value = '';
+        $('#x-credential-password').value = '';
+        $('#x-credentials-error').textContent = '';
+        $('#x-credentials-submit').disabled = false;
+        $('#x-credentials-remote').disabled = false;
+        setXCredentialPasswordVisible(false);
+        $('#x-credential-identifier').focus();
+      }
+
+      function closeXCredentialModal({ abort = true } = {}) {
+        if (abort && credentialLoginInFlight) {
+          credentialController?.abort();
+          void fetch('/auth/x/cancel', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({}),
+            keepalive: true,
+          }).catch(() => {});
+        }
+        credentialController = null;
+        const modal = $('#x-credentials-modal');
+        modal.classList.add('hidden');
+        modal.setAttribute('aria-hidden', 'true');
+        document.body.classList.remove('credentials-open');
+        $('#x-credential-password').value = '';
+        setXCredentialPasswordVisible(false);
+      }
+
+      async function handleXCredentialLogin(event) {
+        event.preventDefault();
+        if (credentialLoginInFlight) return;
+
+        const identifier = $('#x-credential-identifier').value.trim();
+        const password = $('#x-credential-password').value;
+        if (!identifier || !password) {
+          $('#x-credentials-error').textContent = 'X username/email and password are required.';
+          return;
+        }
+
+        credentialLoginInFlight = true;
+        credentialController = new AbortController();
+        $('#x-credentials-submit').disabled = true;
+        $('#x-credentials-remote').disabled = true;
+        $('#x-credentials-error').textContent = 'Connecting securely to X…';
+        setStatus('Signing in to X', 'info', 'Using the secure Browserless session…');
+
+        try {
+          const response = await fetch('/auth/x/credentials', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({ identifier, password }),
+            signal: credentialController.signal,
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const error = new Error(data.error ?? `HTTP ${response.status}`);
+            error.code = data.code;
+            error.useRemoteSignIn = Boolean(data.useRemoteSignIn);
+            throw error;
+          }
+
+          credentialController = null;
+          applyLinkedAccounts(data.accounts ?? linkedXAccounts, data.activeXAccount ?? data.username);
+          closeXCredentialModal({ abort: false });
+          closeAccountMenu();
+          setStatus('Signed in successfully', 'ok', `Linked @${data.username}.`);
+          setText('auth-msg', `Linked @${data.username} and saved the X session.`, 'ok');
+        } catch (error) {
+          if (error?.name === 'AbortError') return;
+          $('#x-credentials-error').textContent = error.message;
+          $('#x-credentials-remote').disabled = error.code === 'temporarily_limited';
+          if (error.useRemoteSignIn) {
+            $('#x-credentials-error').textContent += ' Use the remote window below to finish verification.';
+          }
+          setStatus('X sign-in failed', error.code === 'temporarily_limited' ? 'warn' : 'err', error.message);
+        } finally {
+          credentialLoginInFlight = false;
+          credentialController = null;
+          $('#x-credential-password').value = '';
+          $('#x-credentials-submit').disabled = false;
+          if (!$('#x-credentials-modal').classList.contains('hidden') && !$('#x-credentials-remote').disabled) {
+            $('#x-credentials-remote').disabled = false;
+          }
+          setXCredentialPasswordVisible(false);
+        }
+      }
+
+      async function useRemoteCredentialFallback() {
+        closeXCredentialModal();
+        await connectX();
+      }
+
       /* ------------------------- remote X sign-in ------------------------- */
 
       function setRemoteLoginStatus(message) {
@@ -837,10 +986,6 @@
         document.body.classList.add('remote-open');
         remoteLoginUrl = null;
 
-        const frame = $('#remote-login-iframe');
-        frame.classList.add('hidden');
-        frame.removeAttribute('src');
-        $('#remote-login-empty').classList.remove('hidden');
         $('#remote-login-empty').textContent = 'Waiting for the Browserless remote window…';
         setRemoteLoginOpenState(null);
         $('#remote-login-complete').disabled = false;
@@ -856,9 +1001,6 @@
         modal.setAttribute('aria-hidden', 'true');
         document.body.classList.remove('remote-open');
         remoteLoginUrl = null;
-        const frame = $('#remote-login-iframe');
-        frame.classList.add('hidden');
-        frame.removeAttribute('src');
         setRemoteLoginOpenState(null);
         $('#remote-login-complete').disabled = true;
         $('#remote-login-cancel').disabled = false;
@@ -866,10 +1008,6 @@
 
       function setRemoteLoginUrl(url, expiresAt) {
         remoteLoginUrl = url;
-        const frame = $('#remote-login-iframe');
-        frame.src = url;
-        frame.classList.remove('hidden');
-        $('#remote-login-empty').classList.add('hidden');
         setRemoteLoginOpenState(url);
         $('#remote-login-complete').disabled = false;
 
@@ -877,7 +1015,8 @@
         const expiryText = expiry && !Number.isNaN(expiry.getTime())
           ? ` Link expires at ${expiry.toLocaleTimeString()}.`
           : '';
-        setRemoteLoginStatus(`Remote window ready.${expiryText} Sign in, then click Complete Sign-In.`);
+        $('#remote-login-empty').textContent = 'Remote browser ready. Open it in a new tab to finish sign-in.';
+        setRemoteLoginStatus(`Remote window ready.${expiryText} Open it in a new tab, then click Complete Sign-In.`);
       }
 
       async function completeRemoteSignIn() {
@@ -1159,10 +1298,8 @@
       }
 
       // Add new X account
-      async function addXAccount() {
-        // For now, this will open the auth/x endpoint in a new window
-        // In a real implementation, this would handle the OAuth flow
-        return connectX();
+      function addXAccount() {
+        openXCredentialModal();
       }
 
       /* ------------------------------ auth state --------------------------- */
@@ -1171,6 +1308,10 @@
         authStateGeneration += 1;
         controller?.abort();
         controller = null;
+        credentialController?.abort();
+        credentialController = null;
+        credentialLoginInFlight = false;
+        closeXCredentialModal({ abort: false });
         closeRemoteLoginModal();
         stopElapsedTimer();
         batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
@@ -1242,6 +1383,11 @@
         const authForm = $('#auth-form');
         const passwordToggle = $('#toggle-auth-password');
         const addXAccountBtn = $('#add-x-account');
+        const xCredentialsModal = $('#x-credentials-modal');
+        const xCredentialsClose = $('#x-credentials-close');
+        const xCredentialsForm = $('#x-credentials-form');
+        const xCredentialsPasswordToggle = $('#toggle-x-credential-password');
+        const xCredentialsRemote = $('#x-credentials-remote');
         const saveGroqKeyBtn = $('#save-groq-key');
         const clearGroqKeyBtn = $('#clear-groq-key');
         const remoteLoginOpenBtn = $('#remote-login-open');
@@ -1264,6 +1410,16 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
+        xCredentialsClose.addEventListener('click', () => closeXCredentialModal());
+        xCredentialsModal.addEventListener('click', (event) => {
+          if (event.target === xCredentialsModal) closeXCredentialModal();
+        });
+        xCredentialsForm.addEventListener('submit', handleXCredentialLogin);
+        xCredentialsPasswordToggle.addEventListener('click', () => {
+          setXCredentialPasswordVisible($('#x-credential-password').type === 'password');
+          $('#x-credential-password').focus();
+        });
+        xCredentialsRemote.addEventListener('click', useRemoteCredentialFallback);
         remoteLoginOpenBtn.addEventListener('click', (event) => {
           if (!remoteLoginUrl) {
             event.preventDefault();

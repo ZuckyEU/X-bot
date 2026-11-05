@@ -22,6 +22,7 @@ import {
   X_LOGIN_URL,
   X_REFERER,
 } from './lib/browser.js';
+import { automateXCredentialLogin } from './lib/x-credentials.js';
 
 /**
  * Local service for the X reply automation.
@@ -30,6 +31,7 @@ import {
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
+ *   POST /auth/x/credentials -> direct memory-only credential sign-in
  *   POST /auth/x     -> Browserless Live URL sign-in -> sessions/<userId>/<xUsername>.json
  *   POST /auth/x/complete -> confirm the remote sign-in and save the X session
  *   POST /auth/x/cancel   -> cancel the active remote sign-in and close Browserless
@@ -104,6 +106,8 @@ const LIVE_VIEW_TIMEOUT_MS = (() => {
 })();
 const POST_LOGIN_TIMEOUT_MS = 60 * 1000;
 const AUTH_RUN_TIMEOUT_MS = LOGIN_TIMEOUT_MS + POST_LOGIN_TIMEOUT_MS + 5_000;
+const CREDENTIAL_LOGIN_TIMEOUT_MS = 60_000;
+const CREDENTIAL_RUN_TIMEOUT_MS = 110_000;
 const LOGIN_PROFILE_CHECKPOINT_MS = 15_000;
 const RESERVED_X_ROUTES = new Set(['home', 'explore', 'notifications', 'messages', 'search', 'compose', 'settings', 'i']);
 
@@ -357,6 +361,12 @@ function getClientIP(req) {
     'unknown';
 }
 
+function isSecureRequest(req) {
+  if (!IS_PRODUCTION) return true;
+  const forwardedProtocol = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase();
+  return req.secure || forwardedProtocol === 'https';
+}
+
 function publicUser(user) {
   return {
     id: user.id,
@@ -541,6 +551,39 @@ class ValidationError extends HttpError {
   constructor(message) {
     super(400, message);
   }
+}
+
+class CredentialLoginError extends HttpError {
+  constructor(status, code, message) {
+    super(status, message);
+    this.code = code;
+  }
+}
+
+function validateXCredentials(body) {
+  const rawIdentifier = String(body?.identifier ?? body?.username ?? '').trim();
+  const identifier = /^\+?[\d\s().-]+$/.test(rawIdentifier)
+    ? rawIdentifier.replace(/[\s().-]/g, '')
+    : rawIdentifier;
+  const password = body?.password;
+  if (!identifier || identifier.length > 254 || /[\s\u0000-\u001f]/.test(identifier)) {
+    throw new ValidationError('Enter a valid X username, email address, or phone number');
+  }
+  if (typeof password !== 'string' || password.length < 1 || password.length > 256 || password.includes('\0')) {
+    throw new ValidationError('X password is required and must be at most 256 characters');
+  }
+  return { identifier, password };
+}
+
+function xUsernameCandidateFromIdentifier(identifier) {
+  const value = String(identifier ?? '').trim();
+  if (/^\+?\d{7,15}$/.test(value)) return null;
+  if (value.startsWith('@')) {
+    const candidate = value.slice(1).toLowerCase();
+    return /^[a-z0-9_]{1,15}$/.test(candidate) ? candidate : null;
+  }
+  const candidate = value.toLowerCase();
+  return /^[a-z0-9_]{1,15}$/.test(candidate) ? candidate : null;
 }
 
 function getGroqConfiguration(user) {
@@ -1369,6 +1412,68 @@ async function readSignedInUsername(page, signal) {
   return null;
 }
 
+async function persistSignedInBrowserSession({
+  context,
+  page,
+  user,
+  requestedXUsername = null,
+  signal,
+  generation,
+  onStatus = () => {},
+}) {
+  onStatus('Waiting for X home and account identity …');
+  const identity = await readSignedInUsername(page, signal);
+  let username = identity?.username ?? null;
+  if (identity) onStatus(`Detected @${username} from the ${identity.source}.`);
+
+  if (requestedXUsername && username && requestedXUsername !== username) {
+    throw new Error(`Signed in as @${username}, but @${requestedXUsername} was requested`);
+  }
+  username ??= requestedXUsername;
+  if (!username) throw new Error('Could not determine the signed-in X username');
+
+  const storedState = await safeContextCall(
+    context,
+    () => context.storageState(),
+    'Capturing browser session state',
+  );
+  if (!storedState.ok) throw storedState.error;
+  const storageState = storedState.value;
+  if (!storageState.cookies.some((cookie) => cookie.name === SESSION_COOKIE)) {
+    throw new Error('X authentication cookie was not present in the saved browser state');
+  }
+
+  const payload = {
+    ...storageState,
+    savedAt: new Date().toISOString(),
+    loginUrl: LOGIN_URL,
+    cookieCount: storageState.cookies.length,
+    username,
+  };
+  const destination = sessionFileFor(user.id, username);
+  const trustedProfile = trustedLoginProfilePayload(storageState);
+
+  await withWriteLock(async () => {
+    if (signal?.aborted || generation !== authGeneration) {
+      const error = new Error('Aborted');
+      error.name = 'AbortError';
+      throw error;
+    }
+    await writeAuthFile(payload, destination);
+    await writeAuthFile(trustedProfile, loginProfileFileFor(user.id));
+  });
+  const updatedUser = await addAccountToUser(user.id, username);
+  if (updatedUser.preferences.defaultXAccount === username) await stageActiveSession(updatedUser);
+
+  return {
+    ok: true,
+    cookieCount: storageState.cookies.length,
+    username,
+    activeXAccount: updatedUser.preferences.defaultXAccount,
+    accounts: await accountSummaries(updatedUser),
+  };
+}
+
 /**
  * Waits for the person to finish signing in in the remote window and click
  * Complete Sign-In. A missing session cookie keeps the run open for a retry.
@@ -1586,65 +1691,117 @@ async function runBrowserLogin({
 
     await liveInspection?.close();
     liveInspection = null;
-    send({ type: 'stdout', data: 'Login confirmed. Waiting for X home and account identity …' });
-    const identity = await readSignedInUsername(page, signal);
-    let username = identity?.username ?? null;
-    if (identity) send({ type: 'stdout', data: `Detected @${username} from the ${identity.source}.` });
-
-    if (requestedXUsername && username && requestedXUsername !== username) {
-      throw new Error(`Signed in as @${username}, but @${requestedXUsername} was requested`);
-    }
-    username ??= requestedXUsername;
-    if (!username) throw new Error('Could not determine the signed-in X username');
-
-    const storedState = await safeContextCall(
+    const result = await persistSignedInBrowserSession({
       context,
-      () => context.storageState(),
-      'Capturing browser session state',
-    );
-    if (!storedState.ok) {
-      send({ type: 'stderr', data: `${storedState.error.message}. Nothing was saved.` });
-      return { ok: false };
-    }
-    const storageState = storedState.value;
-    if (storageState.cookies.length === 0) {
-      send({ type: 'stderr', data: 'No cookies were captured — nothing was saved.' });
-      return { ok: false };
-    }
-
-    const payload = {
-      ...storageState,
-      savedAt: new Date().toISOString(),
-      loginUrl: LOGIN_URL,
-      cookieCount: storageState.cookies.length,
-      username,
-    };
-    const destination = sessionFileFor(user.id, username);
-    const trustedProfile = trustedLoginProfilePayload(storageState);
-
-    await withWriteLock(async () => {
-      if (signal?.aborted || generation !== authGeneration) {
-        const error = new Error('Aborted');
-        error.name = 'AbortError';
-        throw error;
-      }
-      await writeAuthFile(payload, destination);
-      await writeAuthFile(trustedProfile, loginProfileFileFor(user.id));
+      page,
+      user,
+      requestedXUsername,
+      signal,
+      generation,
+      onStatus: (message) => send({ type: 'stdout', data: message }),
     });
-    const updatedUser = await addAccountToUser(user.id, username);
-    if (updatedUser.preferences.defaultXAccount === username) await stageActiveSession(updatedUser);
 
     send({
       type: 'stdout',
-      data: `Saved ${storageState.cookies.length} cookies for @${username} (session valid).` + `\n`,
+      data: `Saved ${result.cookieCount} cookies for @${result.username} (session valid).\n`,
     });
 
-    return { ok: login.loggedIn, cookieCount: storageState.cookies.length, username };
+    return result;
   } finally {
     clearInterval(profileCheckpointTimer);
     if (!signal?.aborted) await checkpointTrustedProfile();
     signal?.removeEventListener('abort', closeBrowserOnAbort);
     await liveInspection?.close();
+    await closeBrowser(browser);
+  }
+}
+
+async function runCredentialBrowserLogin({
+  user,
+  identifier,
+  password,
+  requestedXUsername = null,
+  signal,
+  generation,
+  onBrowserConnected = null,
+}) {
+  let browser = null;
+  let context = null;
+  try {
+    browser = await connectBrowser();
+    onBrowserConnected?.(browser);
+    throwIfAborted(signal);
+
+    context = await getDefaultContext(browser);
+    const bootstrap = await loginBootstrapStateFor(user, requestedXUsername);
+    const restored = await safeContextCall(
+      context,
+      () => restoreStorageState(context, bootstrap?.state, { clearCookies: true }),
+      'Restoring the tenant browser profile',
+    );
+    if (!restored.ok) throw restored.error;
+
+    const page = await getOrCreatePage(context);
+    const navigation = await safeGoto(page, LOGIN_URL, {
+      waitUntil: 'commit',
+      timeout: 45_000,
+      referer: X_REFERER,
+    });
+    if (navigation.error) throw navigation.error;
+    if (navigation.response && navigation.response.status() >= 400) {
+      throw new CredentialLoginError(502, 'x_http_error', `X returned HTTP ${navigation.response.status()}`);
+    }
+
+    const login = await automateXCredentialLogin({
+      context,
+      page,
+      identifier,
+      password,
+      signal,
+      timeoutMs: CREDENTIAL_LOGIN_TIMEOUT_MS,
+    });
+    if (login.status === 'temporarily_limited') {
+      throw new CredentialLoginError(
+        429,
+        'temporarily_limited',
+        'X has temporarily limited this login. Stop retrying and wait for the X cooldown to expire.',
+      );
+    }
+    if (login.status === 'invalid_credentials') {
+      throw new CredentialLoginError(401, 'invalid_credentials', 'X rejected the username/email or password.');
+    }
+    if (login.status === 'challenge_required') {
+      throw new CredentialLoginError(
+        409,
+        'challenge_required',
+        'X requires verification, 2FA, or a captcha. Continue with the remote sign-in window.',
+      );
+    }
+    if (login.status !== 'authenticated') {
+      throw new CredentialLoginError(
+        408,
+        'login_timeout',
+        'X did not complete the login before the remote browser session timed out.',
+      );
+    }
+
+    return await persistSignedInBrowserSession({
+      context,
+      page,
+      user,
+      requestedXUsername,
+      signal,
+      generation,
+    });
+  } finally {
+    if (context && !signal?.aborted) {
+      const state = await safeContextCall(
+        context,
+        () => context.storageState(),
+        'Capturing the tenant trusted-browser profile',
+      ).catch(() => null);
+      if (state?.ok) await saveTrustedLoginProfile(user.id, state.value).catch(() => {});
+    }
     await closeBrowser(browser);
   }
 }
@@ -1735,6 +1892,100 @@ app.post('/auth/x', async (req, res) => {
   }
 });
 
+app.post('/auth/x/credentials', async (req, res) => {
+  let auth;
+  let credentials;
+  let requestedXUsername = null;
+  try {
+    if (!isSecureRequest(req)) {
+      throw new HttpError(400, 'Credential sign-in requires HTTPS');
+    }
+    auth = await authenticatedUser(req);
+    normalizeUserAccounts(auth.user);
+    credentials = validateXCredentials(req.body ?? {});
+    requestedXUsername = xUsernameCandidateFromIdentifier(credentials.identifier);
+    if (
+      auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
+      (!requestedXUsername || !auth.user.xAccounts.includes(requestedXUsername))
+    ) {
+      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+    }
+  } catch (error) {
+    return res.status(error.status ?? 500).json({
+      error: error.status ? error.message : 'Could not start credential sign-in',
+      code: error.code ?? 'credential_login_failed',
+    });
+  } finally {
+    if (req.body && typeof req.body === 'object') {
+      delete req.body.password;
+      delete req.body.identifier;
+      delete req.body.username;
+    }
+  }
+
+  if (activeRun) {
+    credentials.password = '';
+    return res.status(409).json({ error: 'A run is already in progress', code: 'run_in_progress' });
+  }
+
+  const controller = new AbortController();
+  const generation = authGeneration;
+  const completion = createCompletionSignal();
+  let abortRequested = false;
+  const handle = {
+    type: 'x-credentials',
+    userId: auth.user.id,
+    xUsername: requestedXUsername,
+    done: completion.promise,
+    browser: null,
+    abort() {
+      if (abortRequested) return;
+      abortRequested = true;
+      authGeneration += 1;
+      controller.abort();
+      void closeBrowser(handle.browser);
+    },
+  };
+  activeRun = handle;
+  attachRunCleanup(res, handle);
+
+  const timer = setTimeout(() => handle.abort(), CREDENTIAL_RUN_TIMEOUT_MS);
+  timer.unref?.();
+
+  try {
+    const result = await runCredentialBrowserLogin({
+      user: auth.user,
+      identifier: credentials.identifier,
+      password: credentials.password,
+      requestedXUsername,
+      signal: controller.signal,
+      generation,
+      onBrowserConnected: (connectedBrowser) => {
+        handle.browser = connectedBrowser;
+      },
+    });
+    return res.json(result);
+  } catch (error) {
+    if (res.destroyed || res.writableEnded) return;
+    if (error?.name === 'AbortError') {
+      return res.status(408).json({
+        error: 'Credential sign-in was cancelled or timed out.',
+        code: 'credential_login_aborted',
+      });
+    }
+    return res.status(error.status ?? 500).json({
+      error: error.status ? error.message : 'X credential sign-in failed',
+      code: error.code ?? 'credential_login_failed',
+      useRemoteSignIn: error.code === 'challenge_required',
+    });
+  } finally {
+    clearTimeout(timer);
+    credentials.password = '';
+    if (activeRun === handle) activeRun = null;
+    completion.resolve();
+  }
+});
+
 app.post('/auth/x/complete', async (req, res) => {
   let auth;
   try {
@@ -1763,7 +2014,7 @@ app.post('/auth/x/cancel', async (req, res) => {
   }
 
   const handle = activeRun;
-  if (!handle || handle.type !== 'x-auth') {
+  if (!handle || !new Set(['x-auth', 'x-credentials']).has(handle.type)) {
     return res.json({ ok: true, cancelled: false });
   }
   if (handle.userId !== auth.user.id) {
@@ -2125,6 +2376,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
   console.log(`  DELETE ${HOST}:${PORT}/api/history`);
+  console.log(`  POST ${HOST}:${PORT}/auth/x/credentials (direct X sign-in; password is never persisted)`);
   console.log(`  POST ${HOST}:${PORT}/auth/x      (Browserless sign-in -> per-user session file)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
