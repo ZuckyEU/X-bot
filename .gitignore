@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Environment files — keep the template, never commit real values
+.env
+.env.*
+!.env.example
+
+# Local runtime data (contains credentials and full account access)
+auth.json
+tokens.json
+user-db.json
+history.json
+sessions/
+user-data/
+
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+.playwright-cli/
+
+# Test, coverage, and temporary artifacts
+coverage/
+.nyc_output/
+*.tmp
+*.temp
+.tmp/
+tmp/
+test-results.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS noise
+.DS_Store
+Thumbs.db

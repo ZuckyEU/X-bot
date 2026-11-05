@@ -1,0 +1,1552 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>X automation console</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #07090d;
+        --surface: #0c1016;
+        --surface-raised: #111720;
+        --surface-hover: #171e29;
+        --border: #252d39;
+        --border-strong: #354052;
+        --text: #f1f5f9;
+        --text-soft: #cbd5e1;
+        --muted: #8c98aa;
+        --accent: #4d8dff;
+        --accent-hover: #6aa0ff;
+        --accent-glow: rgba(77, 141, 255, 0.24);
+        --ok: #41d6a3;
+        --warn: #f5bd4f;
+        --err: #ff747e;
+        --info: #78aaff;
+        --term: #080b10;
+      }
+      * { box-sizing: border-box; }
+      html { background: var(--bg); }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 24px 28px 72px;
+        background:
+          linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+          radial-gradient(900px 520px at 50% -120px, #172033 0%, var(--bg) 66%);
+        background-size: 32px 32px, 32px 32px, auto;
+        color: var(--text);
+        font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      main {
+        width: 100%;
+        max-width: 1240px;
+        display: grid;
+        grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+        gap: 16px;
+        align-items: start;
+        margin: 0 auto;
+      }
+      h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: -0.025em; }
+      h2 { margin: 28px 0 4px; font-size: 12px; font-weight: 750; text-transform: uppercase; letter-spacing: 0.11em; color: var(--text-soft); }
+      p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+
+      .account {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto auto;
+        gap: 14px;
+        align-items: center;
+        padding: 15px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--surface-raised);
+      }
+      .avatar {
+        width: 44px;
+        height: 44px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #29364d, #111722);
+        display: grid;
+        place-items: center;
+        color: var(--accent);
+        font-weight: 700;
+        font-size: 18px;
+      }
+      .account-body { min-width: 0; }
+      .who { font-weight: 650; overflow: hidden; text-overflow: ellipsis; }
+      .state { color: var(--muted); font-size: 12px; }
+      .state.ok { color: var(--ok); }
+      .state.warn { color: var(--warn); }
+      .profile-line { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+      .controls { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 14px; }
+      .controls input, .controls textarea { grid-column: auto; width: 100%; }
+      .options { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin-top: 16px; font-size: 12px; color: var(--text-soft); }
+      .options label { display: inline-flex; gap: 8px; align-items: center; cursor: pointer; }
+      .options input { accent-color: var(--accent); }
+
+      button, a.button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-height: 38px;
+        padding: 9px 16px;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: var(--accent);
+        color: #fff;
+        font-family: inherit;
+        font-weight: 650;
+        font-size: 13px;
+        letter-spacing: 0.005em;
+        cursor: pointer;
+        transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+      }
+      button:hover:not(:disabled), a.button:hover { transform: translateY(-1px); }
+      button:focus-visible, a.button:focus-visible { outline: 2px solid var(--accent-hover); outline-offset: 2px; }
+      button.ghost { background: #151b24; color: var(--text-soft); font-weight: 600; border-color: var(--border); }
+      button.ghost:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
+      button.primary { background: var(--accent); border-color: #639bff; box-shadow: 0 8px 24px rgba(24, 91, 214, 0.22); }
+      button.primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 10px 28px rgba(24, 91, 214, 0.3); }
+      button:disabled { opacity: 0.5; cursor: default; }
+
+      #msg { font-size: 13px; color: var(--muted); }
+      #msg.ok { color: var(--ok); }
+      #msg.err { color: var(--err); }
+      .hint { margin-top: 16px; color: var(--muted); font-size: 12px; }
+      .warn { color: var(--warn); }
+      code { background: var(--surface-raised); padding: 1px 5px; border: 1px solid var(--border); border-radius: 4px; }
+
+      #status-card {
+        margin-top: 18px;
+        padding: 14px 15px;
+        border-radius: 7px;
+        border: 1px solid var(--border);
+        background: var(--term);
+      }
+      #status { font-size: 15px; font-weight: 650; }
+      #status.info { color: var(--info); }
+      #status.ok { color: var(--ok); }
+      #status.err { color: var(--err); }
+      #status.warn { color: var(--warn); }
+      #status-detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+      #history-list { margin-top: 10px; display: grid; gap: 8px; }
+      .history-empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+      .history-item {
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--surface-raised);
+        font-size: 12px;
+        color: var(--text-soft);
+      }
+      .history-item .when { color: var(--muted); font-size: 11px; }
+      .history-item .actions { color: var(--info); font-weight: 600; margin-top: 3px; }
+      .history-item .reply { margin-top: 4px; color: var(--text-soft); white-space: pre-wrap; word-break: break-word; }
+      .history-item .account { color: var(--muted); font-size: 11px; margin-top: 3px; }
+      .history-item .target { color: var(--text-soft); font-size: 12px; margin-top: 3px; word-break: break-word; }
+      .history-item .topic { color: var(--info); font-size: 11px; margin-top: 3px; text-transform: uppercase; letter-spacing: 0.06em; }
+      .history-item .status-line { margin-top: 6px; }
+      .status-badge { display: inline-block; padding: 2px 9px; border-radius: 4px; font-size: 10px; font-weight: 750; letter-spacing: 0.05em; }
+      .status-badge.ok { background: rgba(52, 211, 153, 0.12); color: var(--ok); border: 1px solid rgba(52, 211, 153, 0.35); }
+      .status-badge.err { background: rgba(248, 113, 113, 0.12); color: var(--err); border: 1px solid rgba(248, 113, 113, 0.35); }
+
+      .auth-actions { display: flex; gap: 12px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+
+      /* ------------------------------ top bar ------------------------------ */
+      .topbar { width: 100%; max-width: 1240px; min-height: 62px; margin: 0 auto 16px; padding: 10px 12px 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid var(--border); border-radius: 8px; background: rgba(12, 16, 22, 0.9); box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28); backdrop-filter: blur(14px); }
+      .brand { display: flex; align-items: center; gap: 11px; }
+      .brand-mark { width: 34px; height: 34px; border-radius: 6px; display: grid; place-items: center; background: #131b27; border: 1px solid var(--border-strong); color: var(--accent-hover); font-weight: 800; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05); }
+      .brand-name { font-size: 15px; font-weight: 750; letter-spacing: -0.015em; }
+      .topbar-right, .user-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .account-chip { display: flex; align-items: center; gap: 10px; min-width: 208px; min-height: 40px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-raised); color: var(--text); text-align: left; box-shadow: none; }
+      .account-chip:hover, .account-chip[aria-expanded="true"] { transform: none; border-color: var(--border-strong); background: var(--surface-hover); }
+      .account-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .account-chip .avatar { width: 32px; height: 32px; font-size: 13px; border-radius: 5px; background: linear-gradient(135deg, #26344b, #111722); display: grid; place-items: center; color: var(--accent-hover); font-weight: 750; border: 1px solid var(--border-strong); }
+      .account-chip .account-body { min-width: 0; display: grid; gap: 1px; flex: 1; }
+      .account-chip .who { font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
+      .account-chip .state { color: var(--muted); font-size: 11px; }
+      .account-chip .state.ok { color: var(--ok); }
+      .account-chip .profile-line { color: var(--muted); font-size: 12px; margin-top: 2px; }
+      .account-chip .chevron { color: var(--muted); font-size: 11px; transition: transform 0.15s ease; }
+      .account-chip[aria-expanded="true"] .chevron { transform: rotate(180deg); }
+      .account-wrap { position: relative; display: inline-block; }
+      .account-dropdown { position: absolute; right: 0; top: calc(100% + 8px); width: 324px; max-width: calc(100vw - 32px); border: 1px solid var(--border-strong); border-radius: 8px; background: #0e131a; padding: 8px; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.64), inset 0 1px 0 rgba(255, 255, 255, 0.035); z-index: 30; }
+      .account-dropdown-head { padding: 6px 7px 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.11em; color: var(--muted); }
+      .account-dropdown-row { font-size: 12px; color: #cdd3e1; padding: 10px 8px; }
+      .menu-user { padding: 6px 7px 11px; border-bottom: 1px solid var(--border); margin-bottom: 6px; }
+      .menu-user strong, .menu-user span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .menu-user span { color: var(--muted); font-size: 12px; margin-top: 1px; }
+      #linked-accounts-list { display: grid; gap: 4px; }
+      #linked-accounts-list:empty::after { content: "No linked X accounts"; padding: 10px 8px; color: var(--muted); font-size: 12px; }
+      .linked-account-item { width: 100%; display: flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text); }
+      .linked-account-item:hover { background: rgba(77, 141, 255, 0.07); border-color: #2e3b56; }
+      .linked-account-item.active { background: rgba(77, 141, 255, 0.11); border-color: rgba(77, 141, 255, 0.38); }
+      .linked-account-select { min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px; padding: 5px; border: 0; background: transparent; color: var(--text); text-align: left; box-shadow: none; }
+      .linked-account-select:hover { transform: none; background: transparent; }
+      .linked-account-avatar { width: 32px; height: 32px; flex: 0 0 32px; border-radius: 5px; border: 1px solid var(--border); background: linear-gradient(135deg, #26344b, #111722); display: grid; place-items: center; color: var(--accent-hover); font-weight: 750; }
+      .linked-account-copy { min-width: 0; flex: 1; display: grid; }
+      .linked-account-copy strong { overflow: hidden; text-overflow: ellipsis; }
+      .linked-account-copy span { color: var(--muted); font-size: 11px; }
+      .account-check { color: var(--accent); font-size: 15px; }
+      .unlink-x-account { flex: 0 0 auto; padding: 6px 8px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 11px; box-shadow: none; }
+      .unlink-x-account:hover { border-color: rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.1); color: var(--err); }
+      .account-dropdown-add { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border); }
+      .account-dropdown-add .ghost { width: 100%; justify-content: flex-start; background: transparent; border-color: transparent; color: var(--text); }
+      .account-dropdown-add .ghost:hover { background: var(--surface-hover); border-color: var(--border); }
+      .add-account-icon { width: 22px; height: 22px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 4px; color: var(--accent-hover); font-size: 16px; line-height: 1; }
+      .account-dropdown-footer { border-top: 1px solid var(--border); margin-top: 7px; padding-top: 7px; }
+      .account-dropdown-footer .ghost { width: 100%; }
+      #add-x-account { white-space: nowrap; }
+      .inspector-value { font-size: 13px; color: var(--text-soft); white-space: pre-wrap; word-break: break-word; }
+      .hidden { display: none !important; }
+
+      /* --------------------------- app authentication --------------------- */
+      #auth-modal {
+        position: fixed;
+        inset: 0;
+        padding: 24px;
+        background: rgba(3, 5, 8, 0.86);
+        display: grid;
+        place-items: center;
+        z-index: 1000;
+        overflow-y: auto;
+        backdrop-filter: blur(8px);
+      }
+      .auth-modal {
+        position: relative;
+        width: min(430px, 100%);
+        padding: 30px;
+        background: linear-gradient(180deg, #121821 0%, #0b0f15 100%);
+        border: 1px solid var(--border-strong);
+        border-radius: 9px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.68), 0 0 0 1px rgba(77, 141, 255, 0.06);
+      }
+      .auth-close {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        width: 34px;
+        height: 34px;
+        padding: 0;
+        border: 1px solid transparent;
+        border-radius: 5px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 22px;
+        line-height: 1;
+      }
+      .auth-close:hover { color: var(--text); background: #1a1f2b; border-color: var(--border); }
+      .auth-header {
+        text-align: center;
+        margin-bottom: 22px;
+      }
+      .auth-mark { width: 44px; height: 44px; margin: 0 auto 14px; border-radius: 7px; display: grid; place-items: center; background: var(--accent); color: #fff; font-size: 19px; font-weight: 800; box-shadow: 0 12px 30px var(--accent-glow); }
+      .auth-title { margin: 0; color: var(--text); font-size: 22px; font-weight: 700; text-transform: none; letter-spacing: -0.02em; }
+      .auth-subtitle { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+      .auth-tabs {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 22px;
+        padding: 4px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--term);
+      }
+      .auth-tabs button {
+        flex: 1;
+        padding: 9px 12px;
+        border-radius: 5px;
+        background: transparent;
+        color: var(--muted);
+        box-shadow: none;
+      }
+      .auth-tabs button.active {
+        background: var(--surface-hover);
+        color: var(--text);
+      }
+      .auth-field { margin-bottom: 15px; }
+      .auth-field input { width: 100%; padding: 11px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--term); color: var(--text); font: inherit; }
+      .password-input-wrap { position: relative; }
+      .auth-field .password-input-wrap input { padding-right: 48px; }
+      .password-toggle { position: absolute; top: 50%; right: 5px; width: 36px; min-height: 34px; padding: 0; border-color: transparent; border-radius: 4px; background: transparent; color: var(--muted); box-shadow: none; transform: translateY(-50%); }
+      .password-toggle:hover:not(:disabled) { border-color: var(--border); background: var(--surface-hover); color: var(--text); transform: translateY(-50%); }
+      .password-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+      .password-toggle .eye-off { display: none; }
+      .password-toggle[aria-pressed="true"] .eye-on { display: none; }
+      .password-toggle[aria-pressed="true"] .eye-off { display: block; }
+      .auth-field input::placeholder { color: #60697c; }
+      .auth-field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.17); }
+      .auth-error {
+        min-height: 18px;
+        margin: 2px 0 12px;
+        color: var(--err);
+        font-size: 12px;
+      }
+      .auth-error:empty { visibility: hidden; }
+      #auth-submit { width: 100%; padding: 11px 18px; }
+      body.auth-open { overflow: hidden; }
+
+      .panel { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(17, 23, 32, 0.98), rgba(11, 15, 21, 0.98)); padding: 20px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.025); }
+      .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+      .panel-head h2 { margin: 0; }
+      .panel-tag { font-size: 10px; font-weight: 650; letter-spacing: 0.04em; color: var(--muted); border: 1px solid var(--border); padding: 3px 7px; border-radius: 4px; background: var(--term); }
+      .panel-sub { margin: 3px 0 8px; color: var(--muted); font-size: 12px; }
+
+      .field { margin-top: 18px; }
+      .control-label { display: block; font-size: 10px; font-weight: 750; color: var(--muted); margin-bottom: 7px; text-transform: uppercase; letter-spacing: 0.1em; }
+      .target-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; margin-top: 8px; }
+      textarea#run-url { width: 100%; resize: vertical; min-height: 78px; background: var(--term); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 11px 12px; font: inherit; font-size: 12px; line-height: 1.55; }
+      #clear-urls { min-width: 88px; }
+      textarea#run-url:focus, select#tone:focus, #groq-api-key:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.18); }
+      select#tone { width: 100%; background: var(--term); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 9px 12px; font: inherit; font-size: 13px; }
+      select#tone option { background: var(--term); }
+      .file-row, .api-key-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .file-row input[type="file"] { flex: 1 1 240px; min-width: 0; color: var(--muted); font-size: 12px; }
+      .file-name { flex: 1 1 150px; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .api-key-row input { flex: 1 1 280px; min-width: 0; background: var(--term); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 9px 12px; font: inherit; font-size: 13px; }
+      .api-key-status { margin-top: 6px; color: var(--muted); font-size: 12px; }
+      .api-key-status.ok { color: var(--ok); }
+      .api-key-status.warn { color: var(--warn); }
+      #inspector-elapsed { font-variant-numeric: tabular-nums; }
+
+      .draft { margin-top: 18px; border: 1px dashed var(--border-strong); background: var(--term); border-radius: 6px; padding: 13px; min-height: 68px; }
+      .draft-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 6px; }
+      .draft-body { font-size: 13px; color: var(--text-soft); white-space: pre-wrap; word-break: break-word; }
+
+      .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+
+      .term { border: 1px solid var(--border); border-radius: 7px; background: var(--term); overflow: hidden; }
+      .term-bar { display: flex; align-items: center; gap: 6px; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+      .dot { width: 10px; height: 10px; border-radius: 50%; }
+      .dot.red { background: #ff5f57; }
+      .dot.yellow { background: #febc2e; }
+      .dot.green { background: #28c840; }
+      .term-title { margin-left: 8px; font-size: 11px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .term-body { padding: 12px; height: 260px; overflow: auto; font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: #9fb4d8; white-space: pre-wrap; word-break: break-word; }
+      .term-body .err { color: var(--err); }
+
+      .history-panel { width: 100%; max-width: 1240px; margin: 16px auto 0; }
+
+      @media (max-width: 900px) {
+        main { grid-template-columns: 1fr; }
+      }
+
+      @media (max-width: 640px) {
+        body { padding: 12px 12px 48px; }
+        .topbar { min-height: 56px; margin-bottom: 12px; padding: 8px 9px 8px 11px; }
+        .brand-name { display: none; }
+        .account-chip { min-width: min(208px, calc(100vw - 88px)); }
+        .account-dropdown { right: -1px; max-width: calc(100vw - 24px); }
+        .panel { padding: 16px; }
+        .panel-head { align-items: flex-start; }
+        .file-row, .api-key-row { align-items: stretch; }
+        .file-row button, .api-key-row button { flex: 1 1 auto; }
+        .actions button { flex: 1 1 140px; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="auth-modal" aria-hidden="false">
+      <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title" aria-describedby="auth-subtitle">
+        <button class="auth-close" id="auth-close" type="button" aria-label="Close authentication dialog">&times;</button>
+        <div class="auth-header">
+          <div class="auth-mark" aria-hidden="true">X</div>
+          <h2 class="auth-title" id="auth-title">Welcome back</h2>
+          <p class="auth-subtitle" id="auth-subtitle">Sign in to manage your X accounts.</p>
+        </div>
+        <div class="auth-tabs" role="tablist" aria-label="Authentication options">
+          <button id="signin-tab" class="active" type="button" role="tab" aria-selected="true">Sign In</button>
+          <button id="signup-tab" type="button" role="tab" aria-selected="false">Sign Up</button>
+        </div>
+        <form id="auth-form" novalidate>
+          <div class="auth-field">
+            <label class="control-label" for="auth-username">Username</label>
+            <input type="text" id="auth-username" name="username" placeholder="your_username" autocomplete="username" minlength="3" maxlength="30" required />
+          </div>
+          <div class="auth-field hidden" id="auth-email-field">
+            <label class="control-label" for="auth-email">Email</label>
+            <input type="email" id="auth-email" name="email" placeholder="you@example.com" autocomplete="email" />
+          </div>
+          <div class="auth-field">
+            <label class="control-label" for="auth-password">Password</label>
+            <div class="password-input-wrap">
+              <input type="password" id="auth-password" name="password" placeholder="At least 8 characters" autocomplete="current-password" minlength="8" required />
+              <button class="password-toggle" id="toggle-auth-password" type="button" aria-label="Show password" aria-controls="auth-password" aria-pressed="false">
+                <svg class="eye-on" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path>
+                  <circle cx="12" cy="12" r="2.75"></circle>
+                </svg>
+                <svg class="eye-off" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4.6 4.6 19.4 19.4"></path>
+                  <path d="M9.8 6.3A9.7 9.7 0 0 1 12 6c6 0 9.5 6 9.5 6a16 16 0 0 1-2.6 3.3M6.2 7.7C3.8 9.5 2.5 12 2.5 12s3.5 6 9.5 6c1 0 1.9-.2 2.7-.4M10.1 10.1a2.75 2.75 0 0 0 3.8 3.8"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="auth-error" id="auth-error" role="alert" aria-live="polite"></div>
+          <button type="submit" class="primary" id="auth-submit">Sign In</button>
+        </form>
+      </div>
+    </div>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">X</span>
+        <span class="brand-name">X-Engine</span>
+      </div>
+      <nav class="topbar-right" aria-label="Account navigation">
+        <section class="user-actions" id="user-actions" aria-label="X account controls">
+          <div class="account-wrap account-switcher" id="account-wrap">
+            <button class="account-chip" id="account-chip" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="account-dropdown">
+              <span class="avatar" id="avatar">?</span>
+              <span class="account-body">
+                <span class="who" id="who">Account</span>
+                <span class="state" id="active-account-label">No X account selected</span>
+              </span>
+              <span class="chevron" aria-hidden="true">▼</span>
+            </button>
+            <div class="account-dropdown hidden" id="account-dropdown" role="menu" aria-label="User and linked X accounts">
+              <div class="menu-user">
+                <strong id="menu-username">Account</strong>
+                <span id="menu-user-email"></span>
+              </div>
+              <div class="account-dropdown-head">Switch X account</div>
+              <div id="linked-accounts-list"></div>
+              <div class="account-dropdown-add">
+                <button id="add-x-account" class="ghost" type="button" role="menuitem">
+                  <span class="add-account-icon" aria-hidden="true">+</span>
+                  <span>Add X Account</span>
+                </button>
+              </div>
+              <div class="account-dropdown-footer">
+                <button id="signout" class="ghost" type="button">Sign out of app</button>
+              </div>
+            </div>
+          </div>
+        </section>
+        <button id="signin" class="ghost hidden" type="button">Sign In</button>
+      </nav>
+    </header>
+
+    <main>
+      <section class="panel" id="panel-ai">
+        <div class="panel-head">
+          <h2>Target &amp; AI Studio</h2>
+          <span class="panel-tag">Groq · Dynamic</span>
+        </div>
+        <p class="panel-sub">Paste target tweet URLs — one per line — then draft and publish replies.</p>
+
+        <div class="field">
+          <label class="control-label" for="run-url">Target Tweet URLs</label>
+          <div class="file-row">
+            <input type="file" id="file-upload" accept=".txt" />
+            <span id="file-name" class="file-name">No file selected</span>
+            <button id="clear-file" class="ghost" type="button" disabled>Clear File</button>
+          </div>
+          <div class="target-input-row">
+            <textarea id="run-url" rows="3" placeholder="https://x.com/user/status/1234567890" spellcheck="false"></textarea>
+            <button id="clear-urls" class="ghost" type="button" aria-label="Clear all target tweet URLs" disabled>Clear All</button>
+          </div>
+        </div>
+
+        <div class="options">
+          <label><input id="act-reply" type="checkbox" checked /> Generate &amp; Reply</label>
+          <label><input id="act-like" type="checkbox" checked /> Like Post</label>
+          <label><input id="audit-mode" type="checkbox" /> Audit Mode (Filter Unengaged)</label>
+          <label><input id="headless" type="checkbox" checked /> Headless browser</label>
+        </div>
+
+        <div class="field">
+          <label class="control-label" for="groq-api-key">Groq API Key</label>
+          <div class="api-key-row">
+            <input id="groq-api-key" type="password" placeholder="Paste a Groq API key" autocomplete="off" spellcheck="false" />
+            <button id="save-groq-key" class="ghost" type="button">Save Key</button>
+            <button id="clear-groq-key" class="ghost" type="button" disabled>Clear Session Key</button>
+          </div>
+          <div id="groq-key-status" class="api-key-status">Checking configuration…</div>
+        </div>
+
+        <div class="field">
+          <label class="control-label" for="tone">Tone</label>
+          <select id="tone">
+            <option value="analytical">Analytical</option>
+            <option value="casual-hype">Casual/Hype</option>
+            <option value="brief-direct">Brief &amp; Direct</option>
+            <option value="technical-web3">Technical/Web3</option>
+          </select>
+        </div>
+
+        <div class="draft">
+          <div class="draft-head">Draft preview</div>
+          <div id="draft-preview" class="draft-body">No draft yet — run a Dry-Run Test.</div>
+        </div>
+
+        <div class="actions">
+          <button id="dry-run-btn" class="ghost" type="button">Dry-Run Test</button>
+          <button id="run" class="primary" type="button">Publish Live Action</button>
+          <button id="stop" class="ghost" type="button" disabled>Stop</button>
+        </div>
+
+        <p class="hint" id="config-hint"></p>
+        <p id="auth-msg"></p>
+
+        <div id="status-card">
+          <div id="status">Idle</div>
+          <div id="status-detail"></div>
+        </div>
+
+        <div class="auth-actions">
+          <span id="run-msg"></span>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-inspector">
+        <div class="panel-head">
+          <h2>Live Engagement Tracker</h2>
+          <span class="panel-tag">Real-Time</span>
+        </div>
+        <p class="panel-sub">Active execution metrics, target tweet, live reply, and progress.</p>
+        <div class="field">
+          <div class="control-label">Current target</div>
+          <div id="inspector-target" class="inspector-value">Idle</div>
+        </div>
+        <div class="field">
+          <div class="control-label">Live generated reply</div>
+          <div id="inspector-reply" class="draft-body">Idle</div>
+        </div>
+        <div class="field">
+          <div class="control-label">Progress</div>
+          <div id="inspector-stats" class="inspector-value">Idle</div>
+        </div>
+        <div class="field">
+          <div class="control-label">Elapsed time</div>
+          <div id="inspector-elapsed" class="inspector-value">Elapsed: 00:00</div>
+        </div>
+      </section>
+    </main>
+
+    <section class="panel history-panel">
+      <div class="panel-head">
+        <h2>Execution History</h2>
+        <button id="clear-history" class="ghost" type="button">Clear History</button>
+      </div>
+      <div id="history-list"><div class="history-empty">No runs yet.</div></div>
+    </section>
+
+    <script>
+      const $ = (id) => document.getElementById(String(id).replace(/^#/, ''));
+      let controller = null;
+      let currentUser = null;
+      let currentAppUsername = null;
+      let currentUserEmail = '';
+      let linkedXAccounts = [];
+      let activeXAccount = null;
+      let groqConfigured = false;
+      let authStateGeneration = 0;
+      let elapsedInterval = null;
+      let elapsedStartedAt = null;
+      let elapsedMilliseconds = 0;
+      let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
+      const targetUrls = [];
+
+      // Authentication is cookie-only; remove tokens left by older UI versions.
+      localStorage.removeItem('x-engine-session-token');
+
+      function appSessionHeaders(headers = {}) {
+        return { ...headers };
+      }
+
+      function setText(id, text, kind = '') {
+        const el = $(id);
+        el.textContent = text;
+        el.className = kind;
+      }
+
+      /* ------------------------------ status ------------------------------ */
+
+      function setStatus(text, kind = 'info', detail = '') {
+        const el = $('status');
+        el.textContent = text;
+        el.className = `status ${kind}`;
+        $('status-detail').textContent = detail;
+      }
+
+      /* --------------------------- Groq configuration ---------------------- */
+
+      function applyGroqConfiguration(data) {
+        groqConfigured = Boolean(data?.configured);
+        const preview = groqConfigured && data?.preview ? ` — ${data.preview}` : '';
+        $('groq-key-status').textContent = groqConfigured ? `Key active${preview}` : 'API key required';
+        $('groq-key-status').className = `api-key-status ${groqConfigured ? 'ok' : 'warn'}`;
+        $('groq-api-key').placeholder = groqConfigured
+          ? 'Saved key on file — enter a new key to replace'
+          : 'Paste a Groq API key';
+        $('clear-groq-key').disabled = !groqConfigured;
+      }
+
+      async function loadGroqConfiguration() {
+        const generation = authStateGeneration;
+        try {
+          const response = await fetch('/api/config/groq', { headers: appSessionHeaders() });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return null;
+          if (response.status === 401) {
+            applyGroqConfiguration({ configured: false, source: 'none' });
+            $('groq-key-status').textContent = 'Sign in to configure an API key.';
+            return data;
+          }
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          applyGroqConfiguration(data);
+          return data;
+        } catch (error) {
+          if (generation !== authStateGeneration) return null;
+          groqConfigured = false;
+          applyGroqConfiguration({ configured: false, source: 'none' });
+          $('groq-key-status').textContent = `Could not read Groq configuration: ${error.message}`;
+          return null;
+        }
+      }
+
+      async function saveGroqApiKey() {
+        const generation = authStateGeneration;
+        const apiKey = $('groq-api-key').value.trim();
+        if (!apiKey) {
+          $('groq-key-status').textContent = 'Enter a Groq API key first.';
+          $('groq-key-status').className = 'api-key-status warn';
+          return;
+        }
+
+        $('save-groq-key').disabled = true;
+        try {
+          const response = await fetch('/api/config/groq', {
+            method: 'PUT',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({ apiKey }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          $('groq-api-key').value = '';
+          applyGroqConfiguration(data);
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          $('groq-key-status').textContent = `Could not save key: ${error.message}`;
+          $('groq-key-status').className = 'api-key-status warn';
+        } finally {
+          if (generation === authStateGeneration) $('save-groq-key').disabled = false;
+        }
+      }
+
+      async function clearGroqApiKey() {
+        $('clear-groq-key').disabled = true;
+        try {
+          const response = await fetch('/api/config/groq', { method: 'DELETE', headers: appSessionHeaders() });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          $('groq-api-key').value = '';
+          applyGroqConfiguration(data);
+          $('groq-key-status').textContent = 'API key required';
+          $('groq-key-status').className = 'api-key-status warn';
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          $('groq-key-status').textContent = `Could not clear key: ${error.message}`;
+          $('groq-key-status').className = 'api-key-status warn';
+        } finally {
+          if (generation === authStateGeneration) $('clear-groq-key').disabled = !groqConfigured;
+        }
+      }
+
+      /* --------------------------- Authentication --------------------------- */
+
+      function setAuthPasswordVisible(visible) {
+        const passwordInput = $('#auth-password');
+        const toggle = $('#toggle-auth-password');
+        passwordInput.type = visible ? 'text' : 'password';
+        toggle.setAttribute('aria-pressed', String(visible));
+        toggle.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+      }
+
+      // Show auth overlay
+      function showAuthOverlay() {
+        const modal = $('#auth-modal');
+        modal.classList.remove('hidden');
+        modal.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('auth-open');
+        $('#auth-username').value = '';
+        $('#auth-email').value = '';
+        $('#auth-password').value = '';
+        setAuthPasswordVisible(false);
+        $('#auth-error').textContent = '';
+        toggleAuthMode(false);
+        $('#auth-username').focus();
+      }
+
+      // Hide auth overlay
+      function hideAuthOverlay() {
+        const modal = $('#auth-modal');
+        modal.classList.add('hidden');
+        modal.setAttribute('aria-hidden', 'true');
+        document.body.classList.remove('auth-open');
+      }
+
+      // Toggle between sign in and sign up
+      function toggleAuthMode(isSignUp) {
+        $('#signin-tab').classList.toggle('active', !isSignUp);
+        $('#signin-tab').setAttribute('aria-selected', String(!isSignUp));
+        $('#signup-tab').classList.toggle('active', isSignUp);
+        $('#signup-tab').setAttribute('aria-selected', String(isSignUp));
+        $('#auth-title').textContent = isSignUp ? 'Create your account' : 'Welcome back';
+        $('#auth-subtitle').textContent = isSignUp
+          ? 'Sign up to manage your X accounts.'
+          : 'Sign in to manage your X accounts.';
+        $('#auth-email-field').classList.toggle('hidden', !isSignUp);
+        $('#auth-email').required = isSignUp;
+        $('#auth-password').autocomplete = isSignUp ? 'new-password' : 'current-password';
+        setAuthPasswordVisible(false);
+        $('#auth-submit').textContent = isSignUp ? 'Sign Up' : 'Sign In';
+        $('#auth-error').textContent = '';
+      }
+
+      // Handle authentication
+      async function handleAuth(event) {
+        event.preventDefault();
+        const username = $('#auth-username').value.trim();
+        const email = $('#auth-email').value.trim();
+        const password = $('#auth-password').value;
+        const isSignUp = $('#signup-tab').classList.contains('active');
+
+        if (!username || !password || (isSignUp && !email)) {
+          $('#auth-error').textContent = isSignUp
+            ? 'Email, username, and password are required.'
+            : 'Username and password are required.';
+          return;
+        }
+
+        const submit = $('#auth-submit');
+        submit.disabled = true;
+        $('#auth-error').textContent = '';
+
+        try {
+          const response = await fetch(isSignUp ? '/api/auth/register' : '/api/auth/login', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(isSignUp ? { email, username, password } : { username, password }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+          authStateGeneration += 1;
+          if (data.user) {
+            if (data.user.groq) applyGroqConfiguration(data.user.groq);
+            const usernameLabel = String(data.user.username ?? username).replace(/^@/, '');
+            currentAppUsername = usernameLabel;
+            currentUserEmail = data.user.email ?? '';
+            $('menu-username').textContent = currentAppUsername;
+            $('menu-user-email').textContent = currentUserEmail;
+            $('signin').classList.add('hidden');
+            displayActiveXAccount(data.user.activeXAccount ?? null);
+            await loadLinkedAccounts();
+          }
+          await loadGroqConfiguration();
+          await loadHistory();
+          hideAuthOverlay();
+        } catch (error) {
+          $('#auth-error').textContent = `${isSignUp ? 'Sign up' : 'Sign in'} failed: ${error.message}`;
+        } finally {
+          submit.disabled = false;
+        }
+      }
+
+      function closeAccountMenu() {
+        $('account-dropdown').classList.add('hidden');
+        $('account-chip').setAttribute('aria-expanded', 'false');
+      }
+
+      function displayActiveXAccount(xUsername) {
+        const username = xUsername ? String(xUsername).replace(/^@/, '') : null;
+        activeXAccount = username;
+        currentUser = username ? `@${username}` : null;
+        $('who').textContent = username ? `@${username}` : currentAppUsername || 'Not connected';
+        $('avatar').textContent = username
+          ? username.charAt(0).toUpperCase()
+          : currentAppUsername?.charAt(0).toUpperCase() || '?';
+        $('active-account-label').textContent = username ? 'Active X account' : 'No X account selected';
+      }
+
+      function normalizeLinkedAccount(account) {
+        const xUsername = String(account?.xUsername ?? account?.username ?? account ?? '').replace(/^@/, '');
+        if (!xUsername) return null;
+        return {
+          xUsername,
+          active: Boolean(account?.active),
+          status: String(account?.status ?? 'Linked'),
+        };
+      }
+
+      function renderLinkedAccounts() {
+        const accountsList = $('linked-accounts-list');
+        accountsList.replaceChildren();
+
+        for (const account of linkedXAccounts) {
+          const username = account.xUsername;
+          const accountItem = document.createElement('div');
+          accountItem.className = `account-dropdown-row linked-account-item${account.active ? ' active' : ''}`;
+          accountItem.dataset.xUsername = username;
+
+          const selectButton = document.createElement('button');
+          selectButton.type = 'button';
+          selectButton.className = 'linked-account-select';
+          selectButton.setAttribute('role', 'menuitem');
+          selectButton.setAttribute('aria-label', `Switch to @${username}`);
+
+          const avatar = document.createElement('span');
+          avatar.className = 'linked-account-avatar';
+          avatar.textContent = username.charAt(0).toUpperCase() || '?';
+          const copy = document.createElement('span');
+          copy.className = 'linked-account-copy';
+          const handle = document.createElement('strong');
+          handle.textContent = `@${username}`;
+          const status = document.createElement('span');
+          status.textContent = account.active ? 'Active' : account.status;
+          copy.append(handle, status);
+          selectButton.append(avatar, copy);
+
+          if (account.active) {
+            const check = document.createElement('span');
+            check.className = 'account-check';
+            check.setAttribute('aria-hidden', 'true');
+            check.textContent = '✓';
+            selectButton.appendChild(check);
+          }
+
+          const unlinkButton = document.createElement('button');
+          unlinkButton.type = 'button';
+          unlinkButton.className = 'unlink-x-account';
+          unlinkButton.textContent = 'Unlink';
+          unlinkButton.setAttribute('aria-label', `Unlink @${username}`);
+
+          selectButton.addEventListener('click', () => switchXAccount(username));
+          unlinkButton.addEventListener('click', (event) => {
+            event.stopPropagation();
+            unlinkXAccount(username);
+          });
+          accountItem.append(selectButton, unlinkButton);
+          accountsList.appendChild(accountItem);
+        }
+      }
+
+      function applyLinkedAccounts(accounts, selectedUsername) {
+        const normalized = (Array.isArray(accounts) ? accounts : []).map(normalizeLinkedAccount).filter(Boolean);
+        const selected = selectedUsername !== undefined
+          ? selectedUsername && String(selectedUsername).replace(/^@/, '')
+          : normalized.find((account) => account.active)?.xUsername ??
+            (normalized.some((account) => account.xUsername === activeXAccount) ? activeXAccount : null);
+
+        linkedXAccounts = normalized.map((account) => ({
+          ...account,
+          active: Boolean(selected && account.xUsername === selected),
+        }));
+        displayActiveXAccount(selected || null);
+        renderLinkedAccounts();
+      }
+
+      async function loadLinkedAccounts() {
+        const generation = authStateGeneration;
+        try {
+          const response = await fetch('/api/auth/x-accounts', {
+            headers: appSessionHeaders(),
+          });
+          const accounts = await response.json().catch(() => []);
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(accounts.error ?? `HTTP ${response.status}`);
+          applyLinkedAccounts(accounts);
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          $('linked-accounts-list').innerHTML = '<div class="account-dropdown-row">Unable to load X accounts</div>';
+        }
+      }
+
+      async function switchXAccount(xUsername) {
+        const generation = authStateGeneration;
+        try {
+          const response = await fetch('/api/auth/switch-account', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({ xUsername }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(data.error ?? 'Failed to switch account');
+
+          applyLinkedAccounts(data.accounts ?? linkedXAccounts, data.activeXAccount ?? xUsername);
+          closeAccountMenu();
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          setText('auth-msg', `Could not switch X account: ${error.message}`, 'err');
+        }
+      }
+
+      async function unlinkXAccount(xUsername) {
+        const generation = authStateGeneration;
+        const previousAccounts = linkedXAccounts.map((account) => ({ ...account }));
+        const previousActive = activeXAccount;
+        const remainingAccounts = linkedXAccounts.filter((account) => account.xUsername !== xUsername);
+        const nextActive = previousActive === xUsername ? remainingAccounts[0]?.xUsername ?? null : previousActive;
+
+        // Optimistic removal keeps the account menu feeling immediate; failures roll back below.
+        applyLinkedAccounts(remainingAccounts, nextActive);
+
+        try {
+          const response = await fetch(`/api/auth/x-accounts/${encodeURIComponent(xUsername)}`, {
+            method: 'DELETE',
+            headers: appSessionHeaders(),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+          const serverActive = Object.prototype.hasOwnProperty.call(data, 'activeXAccount')
+            ? data.activeXAccount
+            : nextActive;
+          applyLinkedAccounts(data.accounts ?? remainingAccounts, serverActive);
+          setText('auth-msg', `Unlinked @${xUsername}.`, 'ok');
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          applyLinkedAccounts(previousAccounts, previousActive);
+          setText('auth-msg', `Could not unlink @${xUsername}: ${error.message}`, 'err');
+        }
+      }
+
+      // Add new X account
+      async function addXAccount() {
+        // For now, this will open the auth/x endpoint in a new window
+        // In a real implementation, this would handle the OAuth flow
+        return connectX();
+      }
+
+      /* ------------------------------ auth state --------------------------- */
+
+      function resetSignedOutState() {
+        authStateGeneration += 1;
+        controller?.abort();
+        controller = null;
+        stopElapsedTimer();
+        batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
+        targetUrls.length = 0;
+        linkedXAccounts.length = 0;
+        currentUser = null;
+        currentAppUsername = null;
+        currentUserEmail = '';
+        activeXAccount = null;
+
+        localStorage.removeItem('x-engine-session-token');
+        clearTargetUrls({ clearFile: true, focus: false });
+        $('auth-username').value = '';
+        $('auth-email').value = '';
+        $('auth-password').value = '';
+        setAuthPasswordVisible(false);
+        $('groq-api-key').value = '';
+        $('who').textContent = 'Not connected';
+        $('avatar').textContent = '?';
+        $('active-account-label').textContent = 'No X account selected';
+        $('menu-username').textContent = 'Not connected';
+        $('menu-user-email').textContent = '';
+        $('linked-accounts-list').replaceChildren();
+        $('history-list').innerHTML = '<div class="history-empty">Sign in to view execution history.</div>';
+        $('signin').classList.remove('hidden');
+        $('account-chip').classList.remove('hidden');
+        applyGroqConfiguration({ configured: false, source: 'none' });
+        $('groq-key-status').textContent = 'Sign in to configure an API key.';
+        setDraft('No draft yet - run a Dry-Run Test.');
+        setInspectorTarget('Idle');
+        setInspectorStats('Idle', '');
+        $('run-msg').textContent = '';
+        $('config-hint').textContent = '';
+        closeAccountMenu();
+      }
+
+      function applyAuthState(data) {
+        const appAuthenticated = Boolean(data?.userAuthenticated);
+        const handle = data?.authenticated && data?.username
+          ? String(data.username).replace(/^@/, '')
+          : null;
+
+        if (!appAuthenticated) {
+          resetSignedOutState();
+          return;
+        }
+
+        if (data?.user) {
+          currentAppUsername = String(data.user.username ?? '').replace(/^@/, '') || null;
+          currentUserEmail = data.user.email ?? '';
+          $('menu-username').textContent = currentAppUsername || 'Account';
+          $('menu-user-email').textContent = currentUserEmail;
+          applyGroqConfiguration(data.user.groq ?? data.groq ?? { configured: false });
+        }
+        displayActiveXAccount(handle ?? data?.activeXAccount ?? null);
+        $('signin').classList.add('hidden');
+        $('account-chip').classList.remove('hidden');
+        closeAccountMenu();
+        loadLinkedAccounts();
+      }
+
+      // Auth event listeners
+      document.addEventListener('DOMContentLoaded', () => {
+        const authOverlay = $('#auth-modal');
+        const authClose = $('#auth-close');
+        const signinBtn = $('#signin');
+        const signinTab = $('#signin-tab');
+        const signupTab = $('#signup-tab');
+        const authForm = $('#auth-form');
+        const passwordToggle = $('#toggle-auth-password');
+        const addXAccountBtn = $('#add-x-account');
+        const saveGroqKeyBtn = $('#save-groq-key');
+        const clearGroqKeyBtn = $('#clear-groq-key');
+
+        signinBtn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          showAuthOverlay();
+        });
+        authClose.addEventListener('click', hideAuthOverlay);
+        authOverlay.addEventListener('click', (event) => {
+          if (event.target === authOverlay) hideAuthOverlay();
+        });
+        signinTab.addEventListener('click', () => toggleAuthMode(false));
+        signupTab.addEventListener('click', () => toggleAuthMode(true));
+        authForm.addEventListener('submit', handleAuth);
+        passwordToggle.addEventListener('click', () => {
+          setAuthPasswordVisible($('#auth-password').type === 'password');
+          $('#auth-password').focus();
+        });
+        addXAccountBtn.addEventListener('click', addXAccount);
+        if (saveGroqKeyBtn) {
+          saveGroqKeyBtn.addEventListener('click', saveGroqApiKey);
+        }
+        if (clearGroqKeyBtn) {
+          clearGroqKeyBtn.addEventListener('click', clearGroqApiKey);
+        }
+
+        initialAuth();
+        loadGroqConfiguration();
+        loadHistory();
+      });
+
+      async function loadAuth() {
+        const request = new AbortController();
+        const timer = setTimeout(() => request.abort(), 10_000);
+        try {
+          const response = await fetch('/api/auth', { signal: request.signal });
+          clearTimeout(timer);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = await response.json();
+
+          applyAuthState(data);
+          return data;
+        } catch (error) {
+          clearTimeout(timer);
+          if (error?.name === 'AbortError') return null;
+          setText('auth-msg', `Could not read auth.json: ${error.message}`, 'err');
+          return null;
+        }
+      }
+
+      async function initialAuth() {
+        const data = await loadAuth();
+        const params = new URLSearchParams(window.location.search);
+        const auth = params.get('auth');
+        const reason = params.get('reason');
+
+        if (auth === 'ok') setText('auth-msg', 'Signed in — cookies saved to auth.json.', 'ok');
+        else if (auth === 'error') setText('auth-msg', `Sign-in failed: ${reason ?? 'unknown error'}`, 'err');
+        if (auth) window.history.replaceState(null, '', window.location.pathname);
+      }
+
+      /* ------------------------------ sign-in ----------------------------- */
+
+      async function connectX() {
+        controller = new AbortController();
+        $('signin').disabled = true;
+        $('add-x-account').disabled = true;
+        setStatus('Running', 'info', 'Waiting for the browser sign-in window…');
+        setText('auth-msg', 'Waiting for the browser sign-in window…');
+        setText('config-hint', '');
+        $('run-msg').textContent = '';
+
+        try {
+          const response = await fetch('/auth/x', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+            signal: controller.signal,
+          });
+
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error ?? `HTTP ${response.status}`);
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let newline;
+            while ((newline = buffer.indexOf('\n')) >= 0) {
+              const raw = buffer.slice(0, newline).trim();
+              buffer = buffer.slice(newline + 1);
+              if (!raw) continue;
+              try {
+                const event = JSON.parse(raw);
+                if (event.type === 'stderr') setText('auth-msg', event.data, 'err');
+                else if (event.type === 'exit') {
+                  const ok = event.code === 0;
+                  setStatus(ok ? 'Signed in successfully' : 'Sign-in failed', ok ? 'ok' : 'err', ok ? `Saved ${event.result?.cookieCount ?? 0} cookies.` : `Exit ${event.code ?? ''}`);
+                  if (ok) {
+                    setText('auth-msg', 'Signed in — cookies saved to auth.json.', 'ok');
+                    await loadAuth();
+                  }
+                }
+              } catch {
+                /* raw log lines are no longer rendered */
+              }
+            }
+          }
+        } catch (error) {
+          if (error.name === 'AbortError') setStatus('Sign-in stopped', 'warn', 'Stopped by user.');
+          else setStatus('Sign-in failed', 'err', error.message);
+        } finally {
+          controller = null;
+          $('signin').disabled = false;
+          $('add-x-account').disabled = false;
+        }
+      }
+
+      $('account-chip').addEventListener('click', (event) => {
+        event.stopPropagation();
+        const dd = $('account-dropdown');
+        if (dd) {
+          const isOpen = dd.classList.toggle('hidden') === false;
+          $('account-chip').setAttribute('aria-expanded', String(isOpen));
+        }
+      });
+
+      document.addEventListener('click', (event) => {
+        const dd = $('account-dropdown');
+        const chip = $('account-chip');
+        const target = event.target;
+        const insideDropdown = dd ? dd.contains(target) : false;
+        const insideChip = chip ? chip.contains(target) : false;
+        if (!insideDropdown && !insideChip && dd) {
+          dd.classList.add('hidden');
+          chip?.setAttribute('aria-expanded', 'false');
+        }
+      });
+
+      $('signout').addEventListener('click', async () => {
+        $('signout').disabled = true;
+        try {
+          controller?.abort();
+          const response = await fetch('/api/auth/logout', {
+            method: 'POST',
+            headers: appSessionHeaders(),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+          localStorage.removeItem('x-engine-session-token');
+          resetSignedOutState();
+          setText('auth-msg', 'Signed out of the app.', 'ok');
+          setStatus('Idle', 'info', 'Signed out.');
+        } catch (error) {
+          setText('auth-msg', `Sign out failed: ${error.message}`, 'err');
+          setStatus('Sign out failed', 'err', error.message);
+        } finally {
+          $('signout').disabled = false;
+        }
+      });
+
+      /* ------------------------------ run -------------------------------- */
+
+      function formatElapsed(milliseconds) {
+        const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        const mm = String(minutes).padStart(2, '0');
+        const ss = String(seconds).padStart(2, '0');
+        return hours > 0 ? `${String(hours).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`;
+      }
+
+      function renderElapsed() {
+        const runningMilliseconds = elapsedStartedAt ? Date.now() - elapsedStartedAt : elapsedMilliseconds;
+        $('inspector-elapsed').textContent = `Elapsed: ${formatElapsed(runningMilliseconds)}`;
+      }
+
+      function resetElapsedTimer() {
+        if (elapsedInterval) clearInterval(elapsedInterval);
+        elapsedInterval = null;
+        elapsedStartedAt = null;
+        elapsedMilliseconds = 0;
+        renderElapsed();
+      }
+
+      function startElapsedTimer() {
+        resetElapsedTimer();
+        elapsedStartedAt = Date.now();
+        renderElapsed();
+        elapsedInterval = setInterval(renderElapsed, 1_000);
+      }
+
+      function stopElapsedTimer() {
+        if (elapsedStartedAt) elapsedMilliseconds = Date.now() - elapsedStartedAt;
+        elapsedStartedAt = null;
+        if (elapsedInterval) clearInterval(elapsedInterval);
+        elapsedInterval = null;
+        renderElapsed();
+      }
+
+      function setRunning(running) {
+        $('run').disabled = running;
+        $('dry-run-btn').disabled = running;
+        $('run-url').disabled = running;
+        $('file-upload').disabled = running;
+        $('clear-file').disabled = running || !$('file-upload').value;
+        $('clear-urls').disabled = running || !$('run-url').value.trim();
+        $('act-reply').disabled = running;
+        $('act-like').disabled = running;
+        $('audit-mode').disabled = running;
+        $('headless').disabled = running;
+        $('tone').disabled = running;
+        $('groq-api-key').disabled = running;
+        $('save-groq-key').disabled = running;
+        $('clear-groq-key').disabled = running || !groqConfigured;
+        $('stop').disabled = !running;
+      }
+
+      function setDraft(data) {
+        const el = $('draft-preview');
+        el.textContent = String(data ?? '');
+        const replyEl = $('inspector-reply');
+        if (replyEl) replyEl.textContent = String(data ?? '');
+      }
+
+      function setInspectorTarget(target) {
+        const el = $('inspector-target');
+        if (el) el.textContent = String(target ?? 'Idle');
+      }
+
+      function setInspectorStats(status, detail) {
+        const el = $('inspector-stats');
+        if (el) el.textContent = detail ? `${status} — ${detail}` : status;
+      }
+
+      function handleRunEvent(event) {
+        if (event.type === 'batch-start') {
+          batchProgress = { index: 0, completed: 0, total: event.total, percent: 0 };
+          setStatus('Running', 'info', `Queued ${event.total} target${event.total === 1 ? '' : 's'}.`);
+          setInspectorStats(`Processing [0/${event.total}] — 0%`, 'Starting batch…');
+        } else if (event.type === 'start') {
+          const parts = String(event.command ?? '').split(/\s+/);
+          const target = event.url ?? (parts[1] ? decodeURIComponent(parts[1]) : 'unknown');
+          setInspectorTarget(target);
+        } else if (event.type === 'reply') {
+          setDraft(event.data);
+        } else if (event.type === 'progress') {
+          batchProgress = {
+            index: event.index,
+            completed: event.completed,
+            total: event.total,
+            percent: event.percent,
+          };
+          setInspectorTarget(event.url ?? 'unknown');
+          setStatus('Running', 'info', `Processing [${event.index}/${event.total}] — ${event.percent}%`);
+          setInspectorStats(`Processing [${event.index}/${event.total}] — ${event.percent}%`, String(event.url ?? ''));
+        } else if (event.type === 'audit') {
+          setInspectorTarget(event.url ?? 'unknown');
+          if (event.status === 'engaged') {
+            const reasons = [event.liked && 'already liked', event.replied && 'already replied'].filter(Boolean).join(' and ');
+            setStatus('Running', 'warn', `Audit will skip target: ${reasons || 'prior engagement detected'}.`);
+            setInspectorStats(
+              `Processing [${batchProgress.index}/${batchProgress.total}] — ${batchProgress.percent}%`,
+              `Audit: ${reasons || 'prior engagement detected'}`,
+            );
+          } else {
+            setStatus('Running', 'info', 'Audit found no prior engagement; processing selected actions.');
+            setInspectorStats(
+              `Processing [${batchProgress.index}/${batchProgress.total}] — ${batchProgress.percent}%`,
+              'Audit: unengaged target',
+            );
+          }
+        } else if (event.type === 'failed') {
+          setInspectorStats(
+            `Processing [${batchProgress.index}/${batchProgress.total}] — ${batchProgress.percent}%`,
+            `Failed #${event.index}: ${event.error ?? event.url}`,
+          );
+        } else if (event.type === 'item-complete') {
+          batchProgress = {
+            index: event.index,
+            completed: event.completed,
+            total: event.total,
+            percent: event.percent,
+          };
+          const label = event.status === 'failed' ? 'failed' : event.status === 'skipped' ? 'skipped' : 'processed';
+          const detail = event.index === event.total ? 'Finalizing batch…' : `${label}: ${event.url}`;
+          setStatus('Running', event.status === 'failed' ? 'warn' : 'info', `Processed [${event.completed}/${event.total}] — ${event.percent}%`);
+          setInspectorStats(`Processed [${event.completed}/${event.total}] — ${event.percent}%`, detail);
+          loadHistory();
+        } else if (event.type === 'cooldown') {
+          batchProgress = {
+            index: event.completed,
+            completed: event.completed,
+            total: event.total,
+            percent: event.percent,
+          };
+          setStatus('Running', 'info', `Processed [${event.completed}/${event.total}] — waiting ${event.seconds}s.`);
+          setInspectorStats(`Waiting [${event.completed}/${event.total}] — ${event.percent}%`, `${event.seconds}s cooldown before next target`);
+        } else if (event.type === 'batch-complete') {
+          batchProgress = {
+            index: event.total,
+            completed: event.completed,
+            total: event.total,
+            percent: 100,
+          };
+          stopElapsedTimer();
+          const summary = `${event.succeeded} succeeded · ${event.skipped} skipped · ${event.failed} failed`;
+          setStatus(event.failed > 0 ? 'Batch completed with failures' : 'Batch completed', event.failed > 0 ? 'warn' : 'ok', summary);
+          setInspectorStats(`Completed [${event.completed}/${event.total}] — 100%`, summary);
+          loadHistory();
+        } else if (event.type === 'batch-error') {
+          stopElapsedTimer();
+          setStatus('Batch failed', 'err', String(event.error ?? 'Unknown batch error'));
+          setInspectorStats('Batch failed', String(event.error ?? 'Unknown batch error'));
+        }
+      }
+
+      async function startRun(dryRun) {
+        syncTargetUrlsFromInput();
+        const urls = [...targetUrls];
+        const url = urls[0] ?? '';
+        const tweetUrlPattern = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
+        if (urls.length === 0 || !urls.every((target) => tweetUrlPattern.test(target))) {
+          setStatus('Invalid input', 'err', 'Enter tweet URLs in the form https://x.com/<user>/status/<id>');
+          return;
+        }
+
+        if (dryRun) resetElapsedTimer();
+        else startElapsedTimer();
+
+        const groqConfiguration = await loadGroqConfiguration();
+        if (!groqConfiguration?.configured) {
+          stopElapsedTimer();
+          setStatus('Groq key required', 'err', 'Save a session API key in the dashboard.');
+          return;
+        }
+
+        controller = new AbortController();
+        setRunning(true);
+        setInspectorTarget(url);
+        setInspectorStats(`Processing [0/${urls.length}] — 0%`, 'Starting batch…');
+        setStatus('Running', 'info', `Starting ${urls.length} target${urls.length === 1 ? '' : 's'}…`);
+        let receivedBatchTerminalEvent = false;
+
+        try {
+          const response = await fetch('/api/run', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({
+              ...(urls.length > 1 ? { urls } : { url: url }),
+              dryRun,
+              headless: $('headless').checked,
+              reply: $('act-reply').checked,
+              like: $('act-like').checked,
+              audit: $('audit-mode').checked,
+              tone: $('tone').value,
+            }),
+            signal: controller.signal,
+          });
+
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error ?? `HTTP ${response.status}`);
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let newline;
+            while ((newline = buffer.indexOf('\n')) >= 0) {
+              const raw = buffer.slice(0, newline).trim();
+              buffer = buffer.slice(newline + 1);
+              if (!raw) continue;
+              try {
+                const event = JSON.parse(raw);
+                if (event.type === 'batch-complete' || event.type === 'batch-error') receivedBatchTerminalEvent = true;
+                handleRunEvent(event);
+              } catch {
+                /* status-only consumption */
+              }
+            }
+          }
+          if (!receivedBatchTerminalEvent) {
+            setStatus('Batch stopped', 'warn', 'The queue ended before reporting full completion.');
+            setInspectorStats('Stopped', 'Batch stream ended before 100%.');
+          }
+        } catch (error) {
+          if (error.name === 'AbortError') {
+            setStatus('Stopped', 'warn', 'Stopped by user.');
+            setInspectorStats('Stopped', 'Stopped by user.');
+          } else {
+            setStatus('Run failed', 'err', error.message);
+            setInspectorStats('Run failed', error.message);
+          }
+        } finally {
+          stopElapsedTimer();
+          controller = null;
+          setRunning(false);
+        }
+      }
+
+      $('run').addEventListener('click', () => startRun(false));
+      $('dry-run-btn').addEventListener('click', () => startRun(true));
+
+      function replaceTargetUrls(values) {
+        targetUrls.splice(0, targetUrls.length, ...values);
+        $('run-url').value = targetUrls.join('\n');
+        $('clear-urls').disabled = targetUrls.length === 0;
+      }
+
+      function syncTargetUrlsFromInput() {
+        const values = ($('run-url').value || '')
+          .split(/\r?\n/)
+          .map((value) => value.trim())
+          .filter(Boolean);
+        targetUrls.splice(0, targetUrls.length, ...values);
+        $('clear-urls').disabled = targetUrls.length === 0;
+      }
+
+      function clearTargetUrls({ clearFile = true, focus = true } = {}) {
+        targetUrls.splice(0, targetUrls.length);
+        $('run-url').value = '';
+        $('clear-urls').disabled = true;
+        if (clearFile) {
+          $('file-upload').value = '';
+          $('file-name').textContent = 'No file selected';
+          $('clear-file').disabled = true;
+        }
+        if (focus && !$('run-url').disabled) $('run-url').focus();
+      }
+
+      function clearUploadedFile() {
+        clearTargetUrls({ clearFile: true, focus: false });
+      }
+
+      $('run-url').addEventListener('input', syncTargetUrlsFromInput);
+
+      $('file-upload').addEventListener('change', async (event) => {
+        const file = event.target.files?.[0];
+        if (!file) {
+          clearUploadedFile();
+          return;
+        }
+        $('file-name').textContent = file.name;
+        $('clear-file').disabled = false;
+        const text = await file.text();
+        const urls = text
+          .split(/\s+/)
+          .map((u) => u.trim())
+          .filter((u) => u.length > 0)
+          .filter((u) => /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i.test(u));
+        if (urls.length === 0) {
+          replaceTargetUrls([]);
+          setStatus('No links found', 'err', `No tweet URLs found in ${file.name}.`);
+          return;
+        }
+        replaceTargetUrls(urls);
+      });
+
+      $('clear-file').addEventListener('click', clearUploadedFile);
+      $('clear-urls').addEventListener('click', () => clearTargetUrls());
+      $('stop').addEventListener('click', () => {
+        stopElapsedTimer();
+        controller?.abort();
+      });
+
+      /* ------------------------------ history ----------------------------- */
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      async function loadHistory() {
+        const generation = authStateGeneration;
+        try {
+          const response = await fetch('/api/history', { headers: appSessionHeaders() });
+          const data = await response.json();
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          const list = $('history-list');
+
+          if (!Array.isArray(data.history) || data.history.length === 0) {
+            list.innerHTML = '<div class="history-empty">No runs yet.</div>';
+            return;
+          }
+
+          const items = data.history
+            .map((entry) => {
+              const actions = Array.isArray(entry.actions) ? entry.actions.join(', ') : '';
+              const reply = entry.reply ? `<div class="reply">${escapeHtml(entry.reply)}</div>` : '';
+              const status = entry.ok === false ? 'FAIL' : 'OK';
+              const statusClass = entry.ok === false ? 'err' : 'ok';
+              const topic = entry.topic ? escapeHtml(entry.topic) : 'n/a';
+              return `
+                <div class="history-item">
+                  <div class="when">${new Date(entry.at).toLocaleString()}</div>
+                  <div class="account">@${escapeHtml(String(currentUser || '').replace(/^@/, ''))}</div>
+                  <div class="target">${escapeHtml(entry.url)}</div>
+                  <div class="topic">Topic: ${topic}</div>
+                  <div class="actions">${escapeHtml(actions || 'none')}</div>
+                  <div class="status-line"><span class="status-badge ${statusClass}">${status}</span></div>
+                  ${reply}
+                </div>
+              `;
+            })
+            .join('');
+
+          list.innerHTML = items;
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          // History is best effort; authentication failures are reflected by signed-out state.
+        }
+      }
+
+      $('clear-history').addEventListener('click', async () => {
+        const response = await fetch('/api/history', { method: 'DELETE', headers: appSessionHeaders() });
+        if (!response.ok) return;
+        await loadHistory();
+      });
+
+    </script>
+  </body>
+</html>
