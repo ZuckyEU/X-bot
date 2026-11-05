@@ -33,7 +33,7 @@ const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
 const PUBLIC_DIR = join(ROOT, 'public');
-const PORT = Number(process.env.PORT ?? 3000);
+const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MAX_BODY = '16kb';
@@ -1663,6 +1663,7 @@ app.use((error, req, res, next) => {
 });
 
 const server = app.listen(PORT, HOST, () => {
+  console.log(`Server running on port ${PORT}`);
   console.log(`X automation admin UI: http://${HOST}:${PORT}`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/register   (create local user)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);
@@ -1672,7 +1673,7 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
   console.log(`  DELETE ${HOST}:${PORT}/api/history`);
-  console.log(`  POST ${HOST}:${PORT}/auth/x      (headed browser sign-in -> per-user session file)`);
+  console.log(`  POST ${HOST}:${PORT}/auth/x      (Browserless sign-in -> per-user session file)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
 
