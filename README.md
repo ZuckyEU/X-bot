@@ -36,7 +36,7 @@ npm start -- https://news.ycombinator.com   # custom URL
 npm run auth
 ```
 
-1. A Browserless remote Chromium session opens on `https://twitter.com/login`.
+1. A Browserless remote Chromium session opens directly on `https://x.com/i/flow/login`.
 2. Open that session in the Browserless live view and log in yourself — password, 2FA, captcha, anything X asks for.
 3. Return to the terminal and press **ENTER**.
 4. The script checks for the `auth_token` cookie, then writes all cookies to `auth.json`.
@@ -113,12 +113,12 @@ Notes:
 
 ## Browser sign-in via the web UI (Add X Account)
 
-`server.js` opens a **Browserless remote Chromium** session on `https://twitter.com/login` when you press **Add X Account** in the account dropdown (`POST /auth/x`).
+`server.js` opens a **Browserless remote Chromium** session directly on `https://x.com/i/flow/login` when you press **Add X Account** in the account dropdown (`POST /auth/x`).
 
 Flow:
 
-1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies a desktop Chrome 122 User-Agent/client-hint profile and realistic request headers, clears cookies, navigates to `https://twitter.com/login`, and mints an interactive **Browserless Live URL** with `Browserless.liveURL` over CDP.
-2. The dashboard opens the live URL in an embedded iframe and exposes **Open Remote Sign-In Window** (new tab) plus **Complete Sign-In**.
+1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies stealth init scripts (`navigator.webdriver`, WebGL, canvas), a desktop Chrome 122 User-Agent with native `sec-ch-ua` client hints, and CORS-safe request headers, clears cookies, navigates to `https://x.com/i/flow/login`, and mints an interactive **Browserless Live URL** with `Browserless.liveURL` over CDP.
+2. The dashboard opens the live URL in an embedded iframe and provides **Open Remote Sign-In Window**, a real `target="_blank"` link that opens the same stream in a fresh tab when iframe cookie restrictions get in the way.
 3. Sign in to X in the remote window, including 2FA or any challenge.
 4. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
 5. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
@@ -129,8 +129,8 @@ If the live link cannot be minted, the dashboard still exposes **Complete Sign-I
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
 ```
-{"type":"start","command":"browser sign-in -> https://twitter.com/login (Browserless remote Chromium)"}
-{"type":"stdout","data":"Opening https://twitter.com/login …"}
+{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (Browserless remote Chromium)"}
+{"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
 {"type":"stdout","data":"Waiting for you to complete sign-in in the remote window …"}
 {"type":"live","status":"ready","url":"https://…/live/index.html?i=…","expiresAt":"…"}
 {"type":"status","stage":"signed-in","data":"X session detected. Click Complete Sign-In to save it."}
@@ -214,6 +214,20 @@ Safety rails, because this endpoint can replace your session:
 - Only `auth_token` and `ct0` are writable; other cookies, `origins` and metadata are preserved.
 - Values are validated (`[A-Za-z0-9._~%+/-]+`, 8–512 chars) and **masked** in responses — the API never echoes a full cookie back.
 - Writes are serialised and atomic (temp file + rename), so an interrupted save can't truncate `auth.json`.
+
+## Persistent users and sessions
+
+`user-db.json`, `auth.json`, `sessions/`, and `history.json` all live under `DATA_DIR`. It defaults to the project directory, which is fine locally but is **ephemeral on Render/Docker unless a disk is mounted**.
+
+For durable accounts:
+
+1. Mount a persistent disk on the hosting platform (for example at `/var/data`).
+2. Set `DATA_DIR=/var/data` in the deployment environment.
+3. Keep the same production `SESSION_SECRET` and restart the service. Existing app sessions and linked X sessions survive restarts because the user database, session token, and storage-state files stay on the disk. Changing `SESSION_SECRET` invalidates password verification because it is also the password-hash pepper.
+
+For free/ephemeral deployments, set all three `DEFAULT_ADMIN_USERNAME`, `DEFAULT_ADMIN_EMAIL`, and `DEFAULT_ADMIN_PASSWORD` values. On boot the server creates that account when the database is empty (or when the username/email is missing). It never overwrites an existing account or its password. The server logs a warning at startup when it detects Render without `DATA_DIR`.
+
+The CLI (`npm run auth` and `npm run automate`) honors the same `DATA_DIR` for `auth.json`; the server still passes an explicit `AUTH_FILE_PATH` to automation runs.
 
 ## Versions
 

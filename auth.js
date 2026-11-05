@@ -1,8 +1,8 @@
 import 'dotenv/config';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   closeBrowser,
@@ -11,6 +11,7 @@ import {
   getOrCreatePage,
   safeContextCall,
   safeGoto,
+  X_LOGIN_URL,
 } from './lib/browser.js';
 
 /**
@@ -21,8 +22,10 @@ import {
  * session cookies to auth.json.
  */
 
-const LOGIN_URL = 'https://twitter.com/login';
-const AUTH_FILE = join(dirname(fileURLToPath(import.meta.url)), 'auth.json');
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = resolve(process.env.DATA_DIR || ROOT);
+const LOGIN_URL = X_LOGIN_URL;
+const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const SESSION_COOKIE = 'auth_token'; // set by X once you are actually logged in
 const LOGIN_WAIT_MS = 15_000;
 
@@ -34,7 +37,7 @@ const banner = `
  2. Open the Browserless live view for that session and log in to X
     (password, 2FA, captcha — as prompted).
  3. When you can see your timeline, come back here and press
-    ENTER to save the session to auth.json.
+    ENTER to save the session to ${AUTH_FILE}.
 
  Do NOT type your password in this terminal — only in the browser.
 ────────────────────────────────────────────────────────────
@@ -120,10 +123,11 @@ async function main() {
       cookies,
     };
 
+    await mkdir(DATA_DIR, { recursive: true });
     await writeFile(AUTH_FILE, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
 
     console.log(
-      `\nSaved ${cookies.length} cookies to auth.json` +
+      `\nSaved ${cookies.length} cookies to ${AUTH_FILE}` +
         (session.loggedIn ? ' (session valid).' : ' (session unverified).') +
         `\n\nReuse them in another script with:\n` +
         `  import { readFile } from 'node:fs/promises';\n` +

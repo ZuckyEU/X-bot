@@ -17,6 +17,7 @@ import {
   safeContextCall,
   safeGoto,
   withSessionTimeout,
+  X_LOGIN_URL,
 } from '../lib/browser.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -33,8 +34,9 @@ async function availablePort() {
   return port;
 }
 
-async function startServer(t, extraEnv = {}) {
-  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-test-'));
+async function startServer(t, extraEnv = {}, options = {}) {
+  const dataDir = options.dataDir ?? (await mkdtemp(join(tmpdir(), 'x-engine-test-')));
+  const cleanupData = options.cleanupData ?? !options.dataDir;
   const port = await availablePort();
   const child = spawn(process.execPath, ['server.js'], {
     cwd: ROOT,
@@ -79,7 +81,7 @@ async function startServer(t, extraEnv = {}) {
       child.kill('SIGTERM');
       await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5_000))]);
     }
-    await rm(dataDir, { recursive: true, force: true });
+    if (cleanupData) await rm(dataDir, { recursive: true, force: true });
   };
   t.after(stop);
 
@@ -156,6 +158,62 @@ test('registration writes remain valid under concurrency and passwords use bcryp
   assert.equal(login.status, 200);
   assert.ok(sessionCookie(login).startsWith('x_engine_session='));
   assert.equal(await bcrypt.getRounds(users[0].passwordHash), 10);
+});
+
+test('stable DATA_DIR preserves users and app sessions across restarts', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-persist-'));
+  let first;
+  let second;
+  try {
+    first = await startServer(t, { DATA_DIR: dataDir }, { dataDir });
+    const { cookie } = await register(first.baseUrl, 'persist');
+    await first.stop();
+
+    second = await startServer(t, { DATA_DIR: dataDir }, { dataDir });
+    const me = await fetch(`${second.baseUrl}/api/auth/me`, { headers: { cookie } });
+    assert.equal(me.status, 200);
+    const meBody = await me.json();
+    assert.equal(meBody.authenticated, true);
+    assert.equal(meBody.user.username, 'user_persist');
+
+    const login = await fetch(`${second.baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'user_persist', password: 'Password-persist-123!' }),
+    });
+    assert.equal(login.status, 200);
+
+    const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+    assert.equal(users.length, 1);
+    assert.equal(users[0].username, 'user_persist');
+  } finally {
+    await second?.stop();
+    await first?.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('default admin is seeded on boot when configured', async (t) => {
+  const { baseUrl, dataDir } = await startServer(t, {
+    DEFAULT_ADMIN_USERNAME: 'admin_seed',
+    DEFAULT_ADMIN_EMAIL: 'admin-seed@example.test',
+    DEFAULT_ADMIN_PASSWORD: 'Admin-Seed-Password-123!',
+  });
+
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin_seed', password: 'Admin-Seed-Password-123!' }),
+  });
+  assert.equal(login.status, 200);
+  const body = await login.json();
+  assert.equal(body.user.username, 'admin_seed');
+  assert.equal(body.user.email, 'admin-seed@example.test');
+
+  const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  assert.equal(users.length, 1);
+  assert.equal(users[0].username, 'admin_seed');
+  assert.equal(Object.hasOwn(users[0], 'password'), false);
 });
 
 test('legacy scrypt passwords migrate to bcrypt after a successful login', async (t) => {
@@ -340,7 +398,7 @@ test('production allows Render origins and rejects unknown origins', async (t) =
 
 test('navigation absorbs non-200 HTTP response failures', async () => {
   const failure = new Error(
-    'page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://twitter.com/login',
+    'page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://x.com/i/flow/login',
   );
   const page = {
     goto: async () => {
@@ -348,7 +406,7 @@ test('navigation absorbs non-200 HTTP response failures', async () => {
     },
   };
 
-  const result = await safeGoto(page, 'https://twitter.com/login', { waitUntil: 'commit' });
+  const result = await safeGoto(page, 'https://x.com/i/flow/login', { waitUntil: 'commit' });
   assert.equal(result.response, null);
   assert.equal(result.error, failure);
 });
@@ -475,14 +533,14 @@ test('optional Browserless session timeout is added without rewriting other para
   assert.equal(withSessionTimeout('not a url', 600_000), 'not a url');
 });
 
-test('Browserless contexts and pages use a realistic Chrome identity', async () => {
+test('Browserless contexts and pages use a realistic Chrome identity and stealth profile', async () => {
   const page = { isClosed: () => false };
-  const headerSets = [];
   const commands = [];
+  const initScripts = [];
   const context = {
     pages: () => [page],
     newPage: async () => page,
-    setExtraHTTPHeaders: async (headers) => headerSets.push(headers),
+    addInitScript: async (script) => initScripts.push(script),
     newCDPSession: async (target) => {
       assert.equal(target, page);
       return {
@@ -493,12 +551,16 @@ test('Browserless contexts and pages use a realistic Chrome identity', async () 
   };
   const browser = { contexts: () => [context], newContext: () => context };
 
+  assert.equal(X_LOGIN_URL, 'https://x.com/i/flow/login');
   assert.equal(await getDefaultContext(browser), context);
   assert.equal(await getOrCreatePage(context), page);
-  assert.deepEqual(headerSets[0], {
-    'accept-language': 'en-US,en;q=0.9',
-    'upgrade-insecure-requests': '1',
-  });
+  assert.equal(initScripts.length, 1);
+  const stealthSource = String(initScripts[0]);
+  assert.match(stealthSource, /webdriver/);
+  assert.match(stealthSource, /WebGLRenderingContext/);
+  assert.match(stealthSource, /getParameter/);
+  assert.match(stealthSource, /toDataURL/);
+  assert.match(stealthSource, /toBlob/);
   assert.equal(commands.length, 1);
   assert.equal(commands[0].method, 'Network.setUserAgentOverride');
   assert.equal(commands[0].params.userAgent, CHROME_USER_AGENT);
@@ -507,10 +569,18 @@ test('Browserless contexts and pages use a realistic Chrome identity', async () 
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   );
   assert.equal(commands[0].params.platform, 'Win32');
+  assert.equal(commands[0].params.acceptLanguage, 'en-US,en');
   assert.equal(commands[0].params.userAgentMetadata.platform, 'Windows');
+  assert.deepEqual(commands[0].params.userAgentMetadata.brands, [
+    { brand: 'Chromium', version: '122' },
+    { brand: 'Google Chrome', version: '122' },
+    { brand: 'Not(A:Brand', version: '24' },
+  ]);
   assert.equal(commands[0].params.userAgentMetadata.mobile, false);
 
+  await getDefaultContext(browser);
   await getOrCreatePage(context);
+  assert.equal(initScripts.length, 1);
   assert.equal(commands.length, 1);
 });
 
@@ -598,14 +668,22 @@ test('UI Clear All and sign-out flush backing state and dropdown entries', async
   await page.locator('#auth-modal').waitFor({ state: 'hidden' });
 
   assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
-  await page.evaluate(() => {
-    eval('openRemoteLoginModal()');
-    eval("setRemoteLoginUrl('about:blank', Date.now() + 60_000)");
-  });
+  await page.evaluate(() => eval('openRemoteLoginModal()'));
+  assert.equal(await page.locator('#remote-login-open').getAttribute('aria-disabled'), 'true');
+  await page.evaluate(() => eval("setRemoteLoginUrl('about:blank', Date.now() + 60_000)"));
   assert.equal(await page.locator('#remote-login-modal').isVisible(), true);
-  assert.equal(await page.locator('#remote-login-open').isEnabled(), true);
+  assert.equal(await page.locator('#remote-login-open').getAttribute('aria-disabled'), 'false');
+  assert.equal(await page.locator('#remote-login-open').getAttribute('target'), '_blank');
+  assert.equal(await page.locator('#remote-login-open').getAttribute('rel'), 'noopener noreferrer');
+  assert.equal(await page.locator('#remote-login-open').getAttribute('href'), 'about:blank');
   assert.equal(await page.locator('#remote-login-complete').isEnabled(), true);
   assert.equal(await page.locator('#remote-login-iframe').getAttribute('src'), 'about:blank');
+  const [remoteTab] = await Promise.all([
+    page.waitForEvent('popup'),
+    page.locator('#remote-login-open').click(),
+  ]);
+  assert.equal(remoteTab.url(), 'about:blank');
+  await remoteTab.close();
   await page.locator('#remote-login-cancel').click();
   await page.locator('#remote-login-modal').waitFor({ state: 'hidden' });
   assert.equal(await page.locator('#remote-login-modal').isVisible(), false);

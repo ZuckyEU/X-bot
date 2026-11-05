@@ -17,6 +17,7 @@ import {
   getOrCreatePage,
   safeContextCall,
   safeGoto,
+  X_LOGIN_URL,
 } from './lib/browser.js';
 
 /**
@@ -42,6 +43,11 @@ const DATA_DIR = resolve(process.env.DATA_DIR || ROOT);
 const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
+const DEFAULT_ADMIN_USERNAME = String(process.env.DEFAULT_ADMIN_USERNAME || '').trim();
+const DEFAULT_ADMIN_EMAIL = String(process.env.DEFAULT_ADMIN_EMAIL || '')
+  .trim()
+  .toLowerCase();
+const DEFAULT_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || '');
 const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 10000);
 const HOST = '0.0.0.0';
@@ -84,7 +90,7 @@ if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
 const TWEET_URL = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
-const LOGIN_URL = 'https://twitter.com/login';
+const LOGIN_URL = X_LOGIN_URL;
 const HOME_URL = 'https://x.com/home';
 const SESSION_COOKIE = 'auth_token';
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -211,6 +217,60 @@ async function atomicWritePrivateFile(path, contents) {
 /** Save user database through a private, atomic replacement. Call under withWriteLock. */
 async function saveUserDb(users) {
   await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(users, null, 2)}\n`);
+}
+
+/**
+ * Optional bootstrap account for deployments with ephemeral storage. The
+ * account is only created when the database has no matching username/email, so
+ * an existing password and linked X sessions are never overwritten.
+ */
+async function seedDefaultAdmin() {
+  const configured = [DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD];
+  if (configured.every((value) => value === '')) return;
+
+  if (!configured.every((value) => value !== '')) {
+    throw new Error(
+      'DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_EMAIL and DEFAULT_ADMIN_PASSWORD must all be set when admin seeding is enabled',
+    );
+  }
+
+  const { username, email, password } = validateUserInput({
+    username: DEFAULT_ADMIN_USERNAME,
+    email: DEFAULT_ADMIN_EMAIL,
+    password: DEFAULT_ADMIN_PASSWORD,
+  });
+  const created = await withWriteLock(async () => {
+    const users = await loadUserDb();
+    const exists = users.some(
+      (user) =>
+        String(user.username ?? '').toLowerCase() === username.toLowerCase() ||
+        String(user.email ?? '').toLowerCase() === email,
+    );
+    if (exists) return false;
+
+    const passwordHash = await hashPassword(password);
+    const now = new Date().toISOString();
+    users.push({
+      id: crypto.randomUUID(),
+      username,
+      email,
+      passwordHash,
+      createdAt: now,
+      lastLogin: null,
+      preferences: { defaultXAccount: null },
+      xAccounts: [],
+      sessionToken: null,
+      ipAddress: 'bootstrap',
+    });
+    await saveUserDb(users);
+    return true;
+  });
+
+  console.log(
+    created
+      ? `[bootstrap] Seeded default admin @${username}.`
+      : '[bootstrap] A matching default admin already exists; no changes made.',
+  );
 }
 
 /** Bcrypt receives a fixed-length HMAC so long passwords are never silently truncated. */
@@ -719,7 +779,7 @@ app.put('/api/auth', async (req, res, next) => {
       const now = new Date().toISOString();
 
       payload.savedAt = now;
-      payload.loginUrl ??= 'https://x.com/login';
+      payload.loginUrl ??= X_LOGIN_URL;
       payload.origins ??= [];
       payload.cookies ??= [];
 
@@ -1910,6 +1970,20 @@ app.use((error, req, res, next) => {
   console.error('Request failed:', error);
   return res.status(500).json({ error: 'Something went wrong' });
 });
+
+await mkdir(DATA_DIR, { recursive: true });
+console.log(`[storage] User, session and history data directory: ${DATA_DIR}`);
+if (
+  IS_PRODUCTION &&
+  !process.env.DATA_DIR &&
+  (process.env.RENDER || process.env.RENDER_EXTERNAL_URL)
+) {
+  console.warn(
+    '[storage] DATA_DIR is not set. Render containers have an ephemeral filesystem, so user accounts and X sessions will be lost on restart. Mount a persistent disk and set DATA_DIR (for example /var/data), or configure the DEFAULT_ADMIN_* variables to re-seed an admin account.',
+  );
+}
+
+await seedDefaultAdmin();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);

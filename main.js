@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { access, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   closeBrowser,
@@ -24,7 +24,8 @@ import { generateReply, MAX_REPLY_LENGTH, DEFAULT_TONE } from './lib/reply.js';
  */
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const AUTH_FILE = process.env.AUTH_FILE_PATH || join(ROOT, 'auth.json');
+const DATA_DIR = resolve(process.env.DATA_DIR || ROOT);
+const AUTH_FILE = process.env.AUTH_FILE_PATH || join(DATA_DIR, 'auth.json');
 const TWEET_URL_PATTERN = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 
 const USAGE = `

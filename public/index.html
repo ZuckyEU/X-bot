@@ -99,6 +99,7 @@
         border-radius: 6px;
         background: var(--accent);
         color: #fff;
+        text-decoration: none;
         font-family: inherit;
         font-weight: 650;
         font-size: 13px;
@@ -108,11 +109,11 @@
       }
       button:hover:not(:disabled), a.button:hover { transform: translateY(-1px); }
       button:focus-visible, a.button:focus-visible { outline: 2px solid var(--accent-hover); outline-offset: 2px; }
-      button.ghost { background: #151b24; color: var(--text-soft); font-weight: 600; border-color: var(--border); }
-      button.ghost:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
+      button.ghost, a.button.ghost { background: #151b24; color: var(--text-soft); font-weight: 600; border-color: var(--border); }
+      button.ghost:hover:not(:disabled), a.button.ghost:hover { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
       button.primary { background: var(--accent); border-color: #639bff; box-shadow: 0 8px 24px rgba(24, 91, 214, 0.22); }
       button.primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 10px 28px rgba(24, 91, 214, 0.3); }
-      button:disabled { opacity: 0.5; cursor: default; }
+      button:disabled, a.button.is-disabled { opacity: 0.5; cursor: default; pointer-events: none; }
 
       #msg { font-size: 13px; color: var(--muted); }
       #msg.ok { color: var(--ok); }
@@ -417,7 +418,7 @@
         #remote-login-modal { padding: 8px; }
         .remote-login { max-height: calc(100vh - 16px); padding: 12px; }
         #remote-login-iframe { height: 58vh; min-height: 300px; }
-        .remote-login-actions button { flex: 1 1 150px; }
+        .remote-login-actions button, .remote-login-actions a.button { flex: 1 1 150px; }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -492,7 +493,7 @@
           </div>
         </div>
         <div class="remote-login-actions">
-          <button id="remote-login-open" class="ghost" type="button" disabled>Open Remote Sign-In Window</button>
+          <a id="remote-login-open" class="button ghost is-disabled" href="#" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" role="button" aria-disabled="true">Open Remote Sign-In Window</a>
           <button id="remote-login-complete" class="primary" type="button" disabled>Complete Sign-In</button>
         </div>
         <p class="remote-login-hint">
@@ -812,6 +813,22 @@
         if (status) status.textContent = String(message ?? '');
       }
 
+      function setRemoteLoginOpenState(url) {
+        const link = $('#remote-login-open');
+        if (!link) return;
+        if (url) {
+          link.href = url;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.classList.remove('is-disabled');
+          link.setAttribute('aria-disabled', 'false');
+        } else {
+          link.href = '#';
+          link.classList.add('is-disabled');
+          link.setAttribute('aria-disabled', 'true');
+        }
+      }
+
       function openRemoteLoginModal() {
         const modal = $('#remote-login-modal');
         if (!modal) return;
@@ -825,7 +842,7 @@
         frame.removeAttribute('src');
         $('#remote-login-empty').classList.remove('hidden');
         $('#remote-login-empty').textContent = 'Waiting for the Browserless remote window…';
-        $('#remote-login-open').disabled = true;
+        setRemoteLoginOpenState(null);
         $('#remote-login-complete').disabled = false;
         $('#remote-login-complete').textContent = 'Complete Sign-In';
         $('#remote-login-cancel').disabled = false;
@@ -842,7 +859,7 @@
         const frame = $('#remote-login-iframe');
         frame.classList.add('hidden');
         frame.removeAttribute('src');
-        $('#remote-login-open').disabled = true;
+        setRemoteLoginOpenState(null);
         $('#remote-login-complete').disabled = true;
         $('#remote-login-cancel').disabled = false;
       }
@@ -853,7 +870,7 @@
         frame.src = url;
         frame.classList.remove('hidden');
         $('#remote-login-empty').classList.add('hidden');
-        $('#remote-login-open').disabled = false;
+        setRemoteLoginOpenState(url);
         $('#remote-login-complete').disabled = false;
 
         const expiry = expiresAt ? new Date(expiresAt) : null;
@@ -1247,8 +1264,13 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
-        remoteLoginOpenBtn.addEventListener('click', () => {
-          if (remoteLoginUrl) window.open(remoteLoginUrl, '_blank', 'noopener,noreferrer');
+        remoteLoginOpenBtn.addEventListener('click', (event) => {
+          if (!remoteLoginUrl) {
+            event.preventDefault();
+            return;
+          }
+          event.currentTarget.href = remoteLoginUrl;
+          event.currentTarget.target = '_blank';
         });
         remoteLoginCompleteBtn.addEventListener('click', completeRemoteSignIn);
         remoteLoginCancelBtn.addEventListener('click', cancelRemoteSignIn);
