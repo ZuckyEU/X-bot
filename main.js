@@ -4,7 +4,7 @@ import { stdin as input, stdout as output } from 'node:process';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
 import { generateReply, MAX_REPLY_LENGTH, DEFAULT_TONE } from './lib/reply.js';
 
 /**
@@ -139,7 +139,15 @@ async function loadAuthState() {
 /* ------------------------------- X actions ------------------------------ */
 
 async function ensureLoggedIn(page) {
-  await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded' });
+  const navigation = await safeGoto(page, 'https://x.com/home', {
+    waitUntil: 'domcontentloaded',
+    timeout: 30_000,
+  });
+  if (navigation.error) {
+    console.warn(`[AUTH] Navigation warning: ${navigation.error.message}. Checking the session anyway…`);
+  } else if (navigation.response && navigation.response.status() >= 400) {
+    console.warn(`[AUTH] X returned HTTP ${navigation.response.status()} while opening the timeline.`);
+  }
 
   try {
     await page
@@ -363,7 +371,15 @@ async function main() {
     await ensureLoggedIn(page);
 
     console.log(`Opening ${tweetUrl} …`);
-    await page.goto(tweetUrl, { waitUntil: 'domcontentloaded' });
+    const navigation = await safeGoto(page, tweetUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000,
+    });
+    if (navigation.error) {
+      console.warn(`[NAV] Navigation warning: ${navigation.error.message}. Continuing…`);
+    } else if (navigation.response && navigation.response.status() >= 400) {
+      console.warn(`[NAV] X returned HTTP ${navigation.response.status()} for ${tweetUrl}.`);
+    }
 
     const tweet = await extractTweet(page);
     console.log(`\nTweet by @${tweet.author}:\n  ${truncate(tweet.text, 300)}\n`);

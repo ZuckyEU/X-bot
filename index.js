@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { GoogleGenAI } from '@google/genai';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
 
 const MODEL = process.env.GEMINI_MODEL ?? 'gemini-3.6-flash';
 
@@ -10,7 +10,12 @@ async function scrapeTitle(url) {
     browser = await connectBrowser();
     const context = await getDefaultContext(browser);
     const page = await getOrCreatePage(context);
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    const navigation = await safeGoto(page, url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    if (navigation.error) {
+      console.warn(`Navigation warning: ${navigation.error.message}. Continuing with the loaded page…`);
+    } else if (navigation.response && navigation.response.status() >= 400) {
+      console.warn(`Target returned HTTP ${navigation.response.status()}; continuing with the loaded page…`);
+    }
     return {
       url: page.url(),
       title: await page.title(),

@@ -4,7 +4,7 @@ import { stdin as input, stdout as output } from 'node:process';
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
 
 /**
  * Manual X (Twitter) login helper.
@@ -60,7 +60,14 @@ async function main() {
     await context.clearCookies();
     const page = await getOrCreatePage(context);
 
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
+    const navigation = await safeGoto(page, LOGIN_URL, { waitUntil: 'commit', timeout: 45_000 });
+    if (navigation.error) {
+      console.warn(`Navigation warning: ${navigation.error.message}. Continuing to wait for sign-in…`);
+    } else if (navigation.response && navigation.response.status() >= 400) {
+      console.warn(
+        `X returned HTTP ${navigation.response.status()} on the login page; continuing to wait for sign-in…`,
+      );
+    }
 
     await waitForEnter('Press ENTER after you have finished logging in… ');
 

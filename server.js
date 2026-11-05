@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'crypto';
-import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage, safeGoto } from './lib/browser.js';
 
 /**
  * Local service for the X reply automation.
@@ -1212,7 +1212,18 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
     const page = await getOrCreatePage(context);
 
     send({ type: 'stdout', data: `Opening ${LOGIN_URL} …` });
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
+    const navigation = await safeGoto(page, LOGIN_URL, { waitUntil: 'commit', timeout: 45_000 });
+    if (navigation.error) {
+      send({
+        type: 'stderr',
+        data: `Navigation warning: ${navigation.error.message}. Continuing to wait for sign-in …`,
+      });
+    } else if (navigation.response && navigation.response.status() >= 400) {
+      send({
+        type: 'stderr',
+        data: `X returned HTTP ${navigation.response.status()} on the login page; continuing to wait for sign-in …`,
+      });
+    }
 
     send({ type: 'stdout', data: 'Waiting for you to finish logging in to X …' });
 

@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
+import { safeGoto } from '../lib/browser.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
@@ -327,6 +328,21 @@ test('production allows Render origins and rejects unknown origins', async (t) =
   assert.equal(rejected.status, 403);
   assert.deepEqual(await rejected.json(), { error: 'Origin not allowed' });
   assert.equal(rejected.headers.get('access-control-allow-origin'), null);
+});
+
+test('navigation absorbs non-200 HTTP response failures', async () => {
+  const failure = new Error(
+    'page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://twitter.com/login',
+  );
+  const page = {
+    goto: async () => {
+      throw failure;
+    },
+  };
+
+  const result = await safeGoto(page, 'https://twitter.com/login', { waitUntil: 'commit' });
+  assert.equal(result.response, null);
+  assert.equal(result.error, failure);
 });
 
 test('container exposes the Render port and starts Node directly', async () => {
