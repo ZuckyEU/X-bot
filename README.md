@@ -111,25 +111,35 @@ Notes:
 - Automated posting/liking may violate X's automation rules and can get an account limited. This script handles one reply per run, on your own account — don't turn it into a mass-reply loop.
 - Gemini runs with thinking disabled (`thinkingBudget: 0`) so the whole token budget goes to the reply. Overload 503s are retried 3× with backoff before failing.
 
-## Browser sign-in via the web UI (Connect X Account)
+## Browser sign-in via the web UI (Add X Account)
 
-`server.js` opens a **Browserless remote Chromium** session on `https://twitter.com/login` when you press **Connect X Account** in the admin UI (`POST /auth/x`).
+`server.js` opens a **Browserless remote Chromium** session on `https://twitter.com/login` when you press **Add X Account** in the account dropdown (`POST /auth/x`).
 
 Flow:
 
-1. You press the button in the admin UI → the server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, clears its cookies, and navigates to `https://twitter.com/login`. Open the Browserless live view for that session to complete the login.
-2. You complete the login through the Browserless live view (password, 2FA, captcha, …).
-3. The server polls the browser context until X sets the `auth_token` session cookie, captures `context.cookies()` and saves them to `auth.json`.
-4. The browser closes; the session status refreshes.
+1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, clears its cookies, navigates to `https://twitter.com/login`, and mints an interactive **Browserless Live URL** with `Browserless.liveURL` over CDP.
+2. The dashboard opens the live URL in an embedded iframe and exposes **Open Remote Sign-In Window** (new tab) plus **Complete Sign-In**.
+3. Sign in to X in the remote window, including 2FA or any challenge.
+4. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
+5. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
+
+If the live link cannot be minted, the dashboard still exposes **Complete Sign-In** so an operator who can reach the Browserless dashboard can finish there and confirm it.
 
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
 ```
 {"type":"start","command":"browser sign-in -> https://twitter.com/login (Browserless remote Chromium)"}
 {"type":"stdout","data":"Opening https://twitter.com/login …"}
-{"type":"stdout","data":"Waiting for you to finish logging in to X …"}
-{"type":"exit","code":0,"result":{"ok":true,"cookieCount":2}}
+{"type":"stdout","data":"Waiting for you to complete sign-in in the remote window …"}
+{"type":"live","status":"ready","url":"https://…/live/index.html?i=…","expiresAt":"…"}
+{"type":"status","stage":"signed-in","data":"X session detected. Click Complete Sign-In to save it."}
+{"type":"stdout","data":"Login confirmed. Waiting for X home and account identity …"}
+{"type":"exit","code":0,"result":{"ok":true,"cookieCount":2,"username":"…"}}
 ```
+
+`POST /auth/x/complete` requires the same authenticated session as the active sign-in, asks the running Playwright flow to save the X session, and returns `{"ok":true}`. It returns `409` when no X sign-in is in progress and `403` if the active run belongs to another app user.
+
+The optional `BROWSERLESS_LIVE_TIMEOUT_MS` environment variable controls how long the Live URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserless connection stays open until sign-in finishes or the run is cancelled. If the Browserless plan allows a longer session, set `BROWSERLESS_SESSION_TIMEOUT_MS` (for example `600000`) so the browser does not hit the provider's default session limit mid-login. Free Browserless sessions are only 2 minutes.
 
 The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, writes `auth.json`).
 
@@ -150,7 +160,8 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `POST /api/auth/logout` | Clear `auth.json` |
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |
-| `POST /auth/x` | NDJSON: start → stdout/stderr → exit (Browserless browser sign-in) |
+| `POST /auth/x` | NDJSON: start → live → stdout/stderr/status → exit (Browserless browser sign-in) |
+| `POST /auth/x/complete` | Confirm the active remote X sign-in; saves storage state and updates linked accounts |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:

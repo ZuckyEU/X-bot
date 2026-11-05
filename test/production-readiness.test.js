@@ -9,7 +9,12 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
-import { safeContextCall, safeGoto } from '../lib/browser.js';
+import {
+  createLiveInspection,
+  safeContextCall,
+  safeGoto,
+  withSessionTimeout,
+} from '../lib/browser.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
@@ -397,6 +402,105 @@ test('cookie operations are skipped on closed or disconnected contexts', async (
   assert.match(closingResult.error.message, /browser context was closed/);
 });
 
+function fakeLivePage(liveResponse = { liveURL: 'https://live.example.test/viewer', liveURLId: 'live-1', timeout: 120_000 }) {
+  const sent = [];
+  const listeners = new Map();
+  let detached = false;
+  const cdpSession = {
+    send: async (method, params) => {
+      sent.push({ method, params });
+      if (method === 'Browserless.liveURL') return liveResponse;
+      return {};
+    },
+    on: (event, handler) => listeners.set(event, handler),
+    off: (event, handler) => {
+      if (listeners.get(event) === handler) listeners.delete(event);
+    },
+    detach: async () => {
+      detached = true;
+    },
+  };
+  const page = {
+    context: () => ({
+      newCDPSession: async () => cdpSession,
+    }),
+  };
+  return { page, sent, listeners, isDetached: () => detached };
+}
+
+test('Browserless live inspection URL is minted and closed cleanly', async () => {
+  const { page, sent, listeners, isDetached } = fakeLivePage();
+  const completions = [];
+  const viewers = [];
+  const inspection = await createLiveInspection(page, {
+    timeoutMs: 123_000,
+    onComplete: (event) => completions.push(event),
+    onViewerConnected: (event) => viewers.push(event),
+  });
+
+  assert.equal(inspection.liveURL, 'https://live.example.test/viewer');
+  assert.equal(inspection.liveURLId, 'live-1');
+  assert.ok(inspection.expiresAt > Date.now());
+  assert.equal(sent[0].method, 'Browserless.liveURL');
+  assert.equal(sent[0].params.timeout, 123_000);
+  assert.equal(sent[0].params.interactable, true);
+  assert.equal(sent[0].params.resizable, true);
+  assert.equal(sent[0].params.showBrowserInterface, true);
+  assert.equal(Object.hasOwn(sent[0].params, 'instructions'), false);
+
+  listeners.get('Browserless.liveViewerConnected')({ liveURLId: 'live-1' });
+  listeners.get('Browserless.liveComplete')({ liveURLId: 'live-1', reason: 'viewerDisconnected' });
+  assert.deepEqual(viewers, [{ liveURLId: 'live-1' }]);
+  assert.deepEqual(completions, [{ liveURLId: 'live-1', reason: 'viewerDisconnected' }]);
+
+  await inspection.close();
+  assert.equal(sent.at(-1).method, 'Browserless.closeLiveURL');
+  assert.deepEqual(sent.at(-1).params, { liveURLId: 'live-1' });
+  assert.equal(listeners.size, 0);
+  assert.equal(isDetached(), true);
+});
+
+test('optional Browserless session timeout is added without rewriting other params', () => {
+  const endpoint = 'wss://production-sfo.browserless.io?token=secret-token';
+  const extended = new URL(withSessionTimeout(endpoint, 600_000));
+  assert.equal(extended.searchParams.get('token'), 'secret-token');
+  assert.equal(extended.searchParams.get('timeout'), '600000');
+
+  const tooShort = 'wss://production-sfo.browserless.io?token=secret-token';
+  assert.equal(withSessionTimeout(tooShort, 5_000), tooShort);
+  assert.equal(withSessionTimeout(tooShort, 'not-a-number'), tooShort);
+  assert.equal(withSessionTimeout('not a url', 600_000), 'not a url');
+});
+
+test('Browserless live inspection failures are reported and detached', async () => {
+  const { page, isDetached } = fakeLivePage({ error: 'Live URLs are unavailable for this plan' });
+  await assert.rejects(
+    createLiveInspection(page),
+    /Live URLs are unavailable for this plan/,
+  );
+  assert.equal(isDetached(), true);
+});
+
+test('remote sign-in completion requires an active sign-in run', async (t) => {
+  const { baseUrl } = await startServer(t);
+  const { cookie } = await register(baseUrl, 'remotecomplete');
+
+  const unauthorized = await fetch(`${baseUrl}/auth/x/complete`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assert.equal(unauthorized.status, 401);
+
+  const noRun = await fetch(`${baseUrl}/auth/x/complete`, {
+    method: 'POST',
+    headers: jsonHeaders(cookie),
+    body: JSON.stringify({}),
+  });
+  assert.equal(noRun.status, 409);
+  assert.match((await noRun.json()).error, /No X sign-in/);
+});
+
 test('container exposes the Render port and starts Node directly', async () => {
   const [dockerfile, server] = await Promise.all([
     readFile(join(ROOT, 'Dockerfile'), 'utf8'),
@@ -430,6 +534,18 @@ test('UI Clear All and sign-out flush backing state and dropdown entries', async
   await page.locator('#auth-password').fill('UI-State-Password-123!');
   await page.locator('#auth-submit').click();
   await page.locator('#auth-modal').waitFor({ state: 'hidden' });
+
+  assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
+  await page.evaluate(() => {
+    eval('openRemoteLoginModal()');
+    eval("setRemoteLoginUrl('about:blank', Date.now() + 60_000)");
+  });
+  assert.equal(await page.locator('#remote-login-modal').isVisible(), true);
+  assert.equal(await page.locator('#remote-login-open').isEnabled(), true);
+  assert.equal(await page.locator('#remote-login-complete').isEnabled(), true);
+  assert.equal(await page.locator('#remote-login-iframe').getAttribute('src'), 'about:blank');
+  await page.evaluate(() => eval('closeRemoteLoginModal()'));
+  assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
 
   await page.locator('#run-url').fill('https://x.com/a/status/123\nhttps://x.com/b/status/456');
   assert.equal(await page.evaluate(() => eval('targetUrls.length')), 2);

@@ -12,6 +12,7 @@ import crypto from 'crypto';
 import {
   closeBrowser,
   connectBrowser,
+  createLiveInspection,
   getDefaultContext,
   getOrCreatePage,
   safeContextCall,
@@ -25,7 +26,8 @@ import {
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
- *   POST /auth/x     -> headed sign-in -> sessions/<userId>/<xUsername>.json
+ *   POST /auth/x     -> Browserless Live URL sign-in -> sessions/<userId>/<xUsername>.json
+ *   POST /auth/x/complete -> confirm the remote sign-in and save the X session
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
@@ -85,6 +87,11 @@ const LOGIN_URL = 'https://twitter.com/login';
 const HOME_URL = 'https://x.com/home';
 const SESSION_COOKIE = 'auth_token';
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const LIVE_VIEW_TIMEOUT_MS = (() => {
+  const configured = Number(process.env.BROWSERLESS_LIVE_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured < 30_000) return LOGIN_TIMEOUT_MS;
+  return Math.min(configured, LOGIN_TIMEOUT_MS);
+})();
 const POST_LOGIN_TIMEOUT_MS = 60 * 1000;
 const AUTH_RUN_TIMEOUT_MS = LOGIN_TIMEOUT_MS + POST_LOGIN_TIMEOUT_MS + 5_000;
 const RESERVED_X_ROUTES = new Set(['home', 'explore', 'notifications', 'messages', 'search', 'compose', 'settings', 'i']);
@@ -550,6 +557,50 @@ function createCompletionSignal() {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+/** Coordinates the "Complete Sign-In" button with the long-running login stream. */
+function createLoginControl() {
+  let requested = false;
+  let wake = null;
+
+  return {
+    get requested() {
+      return requested;
+    },
+    request() {
+      requested = true;
+      const resume = wake;
+      wake = null;
+      resume?.();
+    },
+    reset() {
+      requested = false;
+    },
+    wake() {
+      const resume = wake;
+      wake = null;
+      resume?.();
+    },
+    wait(timeoutMs) {
+      if (requested) return Promise.resolve(true);
+
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (wake === onWake) wake = null;
+          resolve(value);
+        };
+        const onWake = () => finish(true);
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        timer.unref?.();
+        wake = onWake;
+      });
+    },
+  };
 }
 
 async function stopActiveRunForUser(userId, { xUsername = null, type = null } = {}) {
@@ -1178,37 +1229,72 @@ async function readSignedInUsername(page, signal) {
   return null;
 }
 
-/** Polls the browser context until X's session cookie exists or the timeout expires. */
-async function waitForLogin(context, signal) {
+/**
+ * Waits for the person to finish signing in in the remote window and click
+ * Complete Sign-In. A missing session cookie keeps the run open for a retry.
+ */
+async function waitForManualSignIn(context, signal, loginControl, send) {
   const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+  let readyAnnounced = false;
 
   while (Date.now() < deadline) {
     throwIfAborted(signal);
 
     const cookieResult = await safeContextCall(context, () => context.cookies(), 'Reading login cookies');
-    if (!cookieResult.ok) return { loggedIn: false, error: cookieResult.error };
-    if (cookieResult.value.some((cookie) => cookie.name === SESSION_COOKIE)) {
-      return { loggedIn: true, error: null };
+    if (!cookieResult.ok) {
+      throwIfAborted(signal);
+      return { loggedIn: false, error: cookieResult.error };
     }
 
-    await sleep(500);
+    const hasSessionCookie = cookieResult.value.some((cookie) => cookie.name === SESSION_COOKIE);
+    if (hasSessionCookie && !readyAnnounced) {
+      readyAnnounced = true;
+      send({
+        type: 'status',
+        stage: 'signed-in',
+        data: 'X session detected. Click Complete Sign-In to save it.',
+      });
+    }
+
+    if (loginControl.requested) {
+      if (hasSessionCookie) return { loggedIn: true, error: null };
+
+      loginControl.reset();
+      send({
+        type: 'status',
+        stage: 'complete-pending',
+        data: 'No X session cookie found yet. Finish signing in in the remote window, then click Complete Sign-In again.',
+      });
+    }
+
+    await loginControl.wait(1_000);
   }
 
-  return { loggedIn: false, error: null };
+  throwIfAborted(signal);
+  return { loggedIn: false, error: null, timedOut: true };
 }
 
 /**
  * Connects to Browserless, reuses its default context, waits for the user to
  * finish logging in, then saves Playwright storage state for that user/X account.
  */
-async function runBrowserLogin({ send, signal, generation, user, requestedXUsername = null }) {
+async function runBrowserLogin({
+  send,
+  signal,
+  generation,
+  user,
+  requestedXUsername = null,
+  loginControl = createLoginControl(),
+}) {
   send({
     type: 'start',
     command: `browser sign-in -> ${LOGIN_URL} (Browserless remote Chromium)`,
   });
 
   let browser = null;
+  let liveInspection = null;
   const closeBrowserOnAbort = () => {
+    loginControl.wake();
     void closeBrowser(browser);
   };
   signal?.addEventListener('abort', closeBrowserOnAbort, { once: true });
@@ -1239,9 +1325,60 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
       });
     }
 
-    send({ type: 'stdout', data: 'Waiting for you to finish logging in to X …' });
+    send({ type: 'stdout', data: 'Waiting for you to complete sign-in in the remote window …' });
 
-    const login = await waitForLogin(context, signal);
+    try {
+      liveInspection = await createLiveInspection(page, {
+        timeoutMs: LIVE_VIEW_TIMEOUT_MS,
+        onViewerConnected: () => {
+          send({
+            type: 'status',
+            stage: 'viewer-connected',
+            data: 'Remote sign-in window connected. Finish signing in to X there.',
+          });
+        },
+        onComplete: ({ reason } = {}) => {
+          if (reason === 'timeout') {
+            send({
+              type: 'status',
+              stage: 'live-expired',
+              data: 'The remote sign-in link expired. Cancel and start a new sign-in if you still need it.',
+            });
+          } else if (reason === 'viewerDisconnected') {
+            send({
+              type: 'status',
+              stage: 'viewer-disconnected',
+              data: 'Remote viewer disconnected. Click Complete Sign-In once the login is finished.',
+            });
+          } else if (reason === 'closed') {
+            send({
+              type: 'status',
+              stage: 'live-closed',
+              data: 'The remote sign-in link closed. The browser is still waiting for Complete Sign-In.',
+            });
+          }
+        },
+      });
+
+      send({
+        type: 'live',
+        status: 'ready',
+        url: liveInspection.liveURL,
+        expiresAt: new Date(liveInspection.expiresAt).toISOString(),
+      });
+      send({
+        type: 'stdout',
+        data: 'Remote sign-in window ready. Sign in there, then click Complete Sign-In in the dashboard.',
+      });
+    } catch (error) {
+      send({ type: 'live', status: 'error', message: error.message });
+      send({
+        type: 'stderr',
+        data: `${error.message}. If you can open the Browserless dashboard, sign in there and then click Complete Sign-In.`,
+      });
+    }
+
+    const login = await waitForManualSignIn(context, signal, loginControl, send);
     if (login.error) {
       send({
         type: 'stderr',
@@ -1250,11 +1387,18 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
       return { ok: false };
     }
     if (!login.loggedIn) {
-      send({ type: 'stderr', data: 'X sign-in was not verified — the session was not saved.' });
+      send({
+        type: 'stderr',
+        data: login.timedOut
+          ? 'X sign-in timed out before Complete Sign-In was confirmed — nothing was saved.'
+          : 'X sign-in was not verified — the session was not saved.',
+      });
       return { ok: false };
     }
 
-    send({ type: 'stdout', data: 'Login detected. Waiting for X home and account identity …' });
+    await liveInspection?.close();
+    liveInspection = null;
+    send({ type: 'stdout', data: 'Login confirmed. Waiting for X home and account identity …' });
     const identity = await readSignedInUsername(page, signal);
     let username = identity?.username ?? null;
     if (identity) send({ type: 'stdout', data: `Detected @${username} from the ${identity.source}.` });
@@ -1308,6 +1452,7 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
     return { ok: login.loggedIn, cookieCount: storageState.cookies.length, username };
   } finally {
     signal?.removeEventListener('abort', closeBrowserOnAbort);
+    await liveInspection?.close();
     await closeBrowser(browser);
   }
 }
@@ -1344,12 +1489,14 @@ app.post('/auth/x', async (req, res) => {
   const controller = new AbortController();
   const generation = authGeneration;
   const completion = createCompletionSignal();
+  const loginControl = createLoginControl();
   let abortRequested = false;
   const handle = {
     type: 'x-auth',
     userId: auth.user.id,
     xUsername: requestedXUsername,
     done: completion.promise,
+    loginControl,
     abort() {
       if (abortRequested) return;
       abortRequested = true;
@@ -1373,6 +1520,7 @@ app.post('/auth/x', async (req, res) => {
       generation,
       user: auth.user,
       requestedXUsername,
+      loginControl,
     });
     send({ type: 'exit', code: result.ok ? 0 : 1, result });
     return res.end();
@@ -1389,6 +1537,25 @@ app.post('/auth/x', async (req, res) => {
     if (activeRun === handle) activeRun = null;
     completion.resolve();
   }
+});
+
+app.post('/auth/x/complete', async (req, res) => {
+  let auth;
+  try {
+    auth = await authenticatedUser(req);
+  } catch (error) {
+    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not confirm X sign-in' });
+  }
+
+  if (!activeRun || activeRun.type !== 'x-auth' || !activeRun.loginControl) {
+    return res.status(409).json({ error: 'No X sign-in is currently in progress' });
+  }
+  if (activeRun.userId !== auth.user.id) {
+    return res.status(403).json({ error: 'This X sign-in belongs to another session' });
+  }
+
+  activeRun.loginControl.request();
+  return res.json({ ok: true });
 });
 
 app.post('/api/run', async (req, res) => {
