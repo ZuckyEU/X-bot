@@ -21,8 +21,10 @@ import crypto from 'crypto';
  *   POST /auth/x     -> headed sign-in -> sessions/<userId>/<xUsername>.json
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
- * Bound to 127.0.0.1 by default: whoever can reach this port can swap your X
- * session or trigger the sign-in browser, so do not expose it on a network interface.
+ * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
+ * Anyone who can reach this port can swap your X session or trigger the sign-in
+ * browser, so terminate TLS and configure access controls before public exposure.
+ * Set HOST=127.0.0.1 for local-only use.
  */
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -32,7 +34,7 @@ const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
 const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT ?? 3000);
-const HOST = process.env.HOST ?? '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MAX_BODY = '16kb';
 
