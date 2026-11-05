@@ -136,7 +136,7 @@ The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, wr
 ## Session admin UI (server.js)
 
 ```powershell
-npm run serve            # http://127.0.0.1:3000
+npm run serve            # http://127.0.0.1:10000
 $env:PORT=4000; npm run serve
 ```
 
@@ -194,7 +194,7 @@ Runner details:
 
 Safety rails, because this endpoint can replace your session:
 
-- Binds to **0.0.0.0** by default for container platforms such as Render. Set `HOST=127.0.0.1` to restrict access to the local machine.
+- Binds to **0.0.0.0** on Render's dynamic `PORT` (falling back to `10000`) so container platforms can reach it.
 - CORS allows the local UI, explicitly configured origins (`PUBLIC_ORIGIN` / `ALLOWED_ORIGINS`), Render's `RENDER_EXTERNAL_URL`, and `*.onrender.com` in production. Other websites are rejected.
 - Only `auth_token` and `ct0` are writable; other cookies, `origins` and metadata are preserved.
 - Values are validated (`[A-Za-z0-9._~%+/-]+`, 8–512 chars) and **masked** in responses — the API never echoes a full cookie back.

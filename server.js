@@ -33,7 +33,7 @@ const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
 const PUBLIC_DIR = join(ROOT, 'public');
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 10000);
 const HOST = '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MAX_BODY = '16kb';
@@ -1663,7 +1663,7 @@ app.use((error, req, res, next) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
   console.log(`X automation admin UI: http://${HOST}:${PORT}`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/register   (create local user)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);

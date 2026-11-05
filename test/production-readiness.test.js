@@ -329,6 +329,20 @@ test('production allows Render origins and rejects unknown origins', async (t) =
   assert.equal(rejected.headers.get('access-control-allow-origin'), null);
 });
 
+test('container exposes the Render port and starts Node directly', async () => {
+  const [dockerfile, server] = await Promise.all([
+    readFile(join(ROOT, 'Dockerfile'), 'utf8'),
+    readFile(join(ROOT, 'server.js'), 'utf8'),
+  ]);
+
+  assert.match(dockerfile, /^ENV PORT=10000$/m);
+  assert.match(dockerfile, /^EXPOSE 10000$/m);
+  assert.match(dockerfile, /^CMD \["node", "server\.js"\]$/m);
+  assert.match(server, /process\.env\.PORT \|\| 10000/);
+  assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
+  assert.match(server, /Server listening on port/);
+});
+
 test('UI Clear All and sign-out flush backing state and dropdown entries', async (t) => {
   const { baseUrl } = await startServer(t);
   // Keep this browser local: Browserless cannot reach the ephemeral 127.0.0.1 test server.
