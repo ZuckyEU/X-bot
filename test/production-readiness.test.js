@@ -10,7 +10,10 @@ import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
 import {
+  CHROME_USER_AGENT,
   createLiveInspection,
+  getDefaultContext,
+  getOrCreatePage,
   safeContextCall,
   safeGoto,
   withSessionTimeout,
@@ -472,6 +475,45 @@ test('optional Browserless session timeout is added without rewriting other para
   assert.equal(withSessionTimeout('not a url', 600_000), 'not a url');
 });
 
+test('Browserless contexts and pages use a realistic Chrome identity', async () => {
+  const page = { isClosed: () => false };
+  const headerSets = [];
+  const commands = [];
+  const context = {
+    pages: () => [page],
+    newPage: async () => page,
+    setExtraHTTPHeaders: async (headers) => headerSets.push(headers),
+    newCDPSession: async (target) => {
+      assert.equal(target, page);
+      return {
+        send: async (method, params) => commands.push({ method, params }),
+        detach: async () => {},
+      };
+    },
+  };
+  const browser = { contexts: () => [context], newContext: () => context };
+
+  assert.equal(await getDefaultContext(browser), context);
+  assert.equal(await getOrCreatePage(context), page);
+  assert.deepEqual(headerSets[0], {
+    'accept-language': 'en-US,en;q=0.9',
+    'upgrade-insecure-requests': '1',
+  });
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].method, 'Network.setUserAgentOverride');
+  assert.equal(commands[0].params.userAgent, CHROME_USER_AGENT);
+  assert.equal(
+    commands[0].params.userAgent,
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  );
+  assert.equal(commands[0].params.platform, 'Win32');
+  assert.equal(commands[0].params.userAgentMetadata.platform, 'Windows');
+  assert.equal(commands[0].params.userAgentMetadata.mobile, false);
+
+  await getOrCreatePage(context);
+  assert.equal(commands.length, 1);
+});
+
 test('Browserless live inspection failures are reported and detached', async () => {
   const { page, isDetached } = fakeLivePage({ error: 'Live URLs are unavailable for this plan' });
   await assert.rejects(
@@ -499,6 +541,26 @@ test('remote sign-in completion requires an active sign-in run', async (t) => {
   });
   assert.equal(noRun.status, 409);
   assert.match((await noRun.json()).error, /No X sign-in/);
+});
+
+test('remote sign-in cancellation is authenticated and idempotent', async (t) => {
+  const { baseUrl } = await startServer(t);
+  const { cookie } = await register(baseUrl, 'remotecancel');
+
+  const unauthorized = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assert.equal(unauthorized.status, 401);
+
+  const noRun = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST',
+    headers: jsonHeaders(cookie),
+    body: JSON.stringify({}),
+  });
+  assert.equal(noRun.status, 200);
+  assert.deepEqual(await noRun.json(), { ok: true, cancelled: false });
 });
 
 test('container exposes the Render port and starts Node directly', async () => {
@@ -544,7 +606,8 @@ test('UI Clear All and sign-out flush backing state and dropdown entries', async
   assert.equal(await page.locator('#remote-login-open').isEnabled(), true);
   assert.equal(await page.locator('#remote-login-complete').isEnabled(), true);
   assert.equal(await page.locator('#remote-login-iframe').getAttribute('src'), 'about:blank');
-  await page.evaluate(() => eval('closeRemoteLoginModal()'));
+  await page.locator('#remote-login-cancel').click();
+  await page.locator('#remote-login-modal').waitFor({ state: 'hidden' });
   assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
 
   await page.locator('#run-url').fill('https://x.com/a/status/123\nhttps://x.com/b/status/456');

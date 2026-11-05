@@ -28,6 +28,7 @@ import {
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
  *   POST /auth/x     -> Browserless Live URL sign-in -> sessions/<userId>/<xUsername>.json
  *   POST /auth/x/complete -> confirm the remote sign-in and save the X session
+ *   POST /auth/x/cancel   -> cancel the active remote sign-in and close Browserless
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
@@ -1285,6 +1286,7 @@ async function runBrowserLogin({
   user,
   requestedXUsername = null,
   loginControl = createLoginControl(),
+  onBrowserConnected = null,
 }) {
   send({
     type: 'start',
@@ -1301,6 +1303,7 @@ async function runBrowserLogin({
 
   try {
     browser = await connectBrowser();
+    onBrowserConnected?.(browser);
     throwIfAborted(signal);
 
     const context = await getDefaultContext(browser);
@@ -1497,6 +1500,7 @@ app.post('/auth/x', async (req, res) => {
     xUsername: requestedXUsername,
     done: completion.promise,
     loginControl,
+    browser: null,
     abort() {
       if (abortRequested) return;
       abortRequested = true;
@@ -1521,6 +1525,9 @@ app.post('/auth/x', async (req, res) => {
       user: auth.user,
       requestedXUsername,
       loginControl,
+      onBrowserConnected: (connectedBrowser) => {
+        handle.browser = connectedBrowser;
+      },
     });
     send({ type: 'exit', code: result.ok ? 0 : 1, result });
     return res.end();
@@ -1556,6 +1563,40 @@ app.post('/auth/x/complete', async (req, res) => {
 
   activeRun.loginControl.request();
   return res.json({ ok: true });
+});
+
+app.post('/auth/x/cancel', async (req, res) => {
+  let auth;
+  try {
+    auth = await authenticatedUser(req);
+  } catch (error) {
+    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not cancel X sign-in' });
+  }
+
+  const handle = activeRun;
+  if (!handle || handle.type !== 'x-auth') {
+    return res.json({ ok: true, cancelled: false });
+  }
+  if (handle.userId !== auth.user.id) {
+    return res.status(403).json({ error: 'This X sign-in belongs to another session' });
+  }
+
+  // Release the lock before cleanup so a new sign-in can start immediately.
+  activeRun = null;
+  handle.abort();
+  if (handle.browser) void closeBrowser(handle.browser);
+
+  let timer;
+  const closed = await Promise.race([
+    handle.done.then(() => true),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), 5_000);
+      timer.unref?.();
+    }),
+  ]);
+  clearTimeout(timer);
+
+  return res.json({ ok: true, cancelled: true, closed });
 });
 
 app.post('/api/run', async (req, res) => {

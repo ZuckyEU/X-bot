@@ -661,6 +661,7 @@
       let elapsedMilliseconds = 0;
       let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
       let remoteLoginUrl = null;
+      let remoteCancelInFlight = false;
       const targetUrls = [];
 
       // Authentication is cookie-only; remove tokens left by older UI versions.
@@ -881,6 +882,34 @@
         } catch (error) {
           setRemoteLoginStatus(`Could not complete sign-in: ${error.message}`);
           button.disabled = false;
+        }
+      }
+
+      async function cancelRemoteSignIn() {
+        if (remoteCancelInFlight) return;
+        remoteCancelInFlight = true;
+
+        const button = $('#remote-login-cancel');
+        if (button) button.disabled = true;
+        setRemoteLoginStatus('Cancelling the remote sign-in…');
+
+        try {
+          const response = await fetch('/auth/x/cancel', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({}),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+        } catch (error) {
+          setRemoteLoginStatus(`Cancel request failed: ${error.message}. Closing the window anyway.`);
+        } finally {
+          remoteCancelInFlight = false;
+          controller?.abort();
+          controller = null;
+          closeRemoteLoginModal();
+          setStatus('Sign-in cancelled', 'warn', 'The remote sign-in was stopped.');
+          setText('auth-msg', 'Remote sign-in cancelled.', 'warn');
         }
       }
 
@@ -1222,11 +1251,7 @@
           if (remoteLoginUrl) window.open(remoteLoginUrl, '_blank', 'noopener,noreferrer');
         });
         remoteLoginCompleteBtn.addEventListener('click', completeRemoteSignIn);
-        remoteLoginCancelBtn.addEventListener('click', () => {
-          remoteLoginCancelBtn.disabled = true;
-          setRemoteLoginStatus('Cancelling sign-in…');
-          controller?.abort();
-        });
+        remoteLoginCancelBtn.addEventListener('click', cancelRemoteSignIn);
         if (saveGroqKeyBtn) {
           saveGroqKeyBtn.addEventListener('click', saveGroqApiKey);
         }

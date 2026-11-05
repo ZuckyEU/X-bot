@@ -117,11 +117,12 @@ Notes:
 
 Flow:
 
-1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, clears its cookies, navigates to `https://twitter.com/login`, and mints an interactive **Browserless Live URL** with `Browserless.liveURL` over CDP.
+1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies a desktop Chrome 122 User-Agent/client-hint profile and realistic request headers, clears cookies, navigates to `https://twitter.com/login`, and mints an interactive **Browserless Live URL** with `Browserless.liveURL` over CDP.
 2. The dashboard opens the live URL in an embedded iframe and exposes **Open Remote Sign-In Window** (new tab) plus **Complete Sign-In**.
 3. Sign in to X in the remote window, including 2FA or any challenge.
 4. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
 5. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
+6. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and closes the Browserless browser so **Add X Account** can start a fresh session.
 
 If the live link cannot be minted, the dashboard still exposes **Complete Sign-In** so an operator who can reach the Browserless dashboard can finish there and confirm it.
 
@@ -138,6 +139,8 @@ If the live link cannot be minted, the dashboard still exposes **Complete Sign-I
 ```
 
 `POST /auth/x/complete` requires the same authenticated session as the active sign-in, asks the running Playwright flow to save the X session, and returns `{"ok":true}`. It returns `409` when no X sign-in is in progress and `403` if the active run belongs to another app user.
+
+`POST /auth/x/cancel` is idempotent: it returns `{ "ok": true, "cancelled": false }` when nothing is running, and otherwise clears the active sign-in lock, aborts the Playwright run, and closes the Browserless browser before replying. It is scoped to the authenticated app user.
 
 The optional `BROWSERLESS_LIVE_TIMEOUT_MS` environment variable controls how long the Live URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserless connection stays open until sign-in finishes or the run is cancelled. If the Browserless plan allows a longer session, set `BROWSERLESS_SESSION_TIMEOUT_MS` (for example `600000`) so the browser does not hit the provider's default session limit mid-login. Free Browserless sessions are only 2 minutes.
 
@@ -162,6 +165,7 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `DELETE /api/history` | Clear the local `history.json` run log |
 | `POST /auth/x` | NDJSON: start → live → stdout/stderr/status → exit (Browserless browser sign-in) |
 | `POST /auth/x/complete` | Confirm the active remote X sign-in; saves storage state and updates linked accounts |
+| `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and close the Browserless browser |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:
