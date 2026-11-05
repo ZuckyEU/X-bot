@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.40.0-focal
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 WORKDIR /usr/src/app
 COPY package*.json ./
 RUN npm install --production
