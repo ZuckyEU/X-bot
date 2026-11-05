@@ -8,8 +8,8 @@ import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
 import crypto from 'crypto';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
 
 /**
  * Local service for the X reply automation.
@@ -36,11 +36,6 @@ const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const IS_RENDER = Boolean(process.env.RENDER);
-const HEADLESS_BROWSER = IS_PRODUCTION || IS_RENDER;
-const CONTAINER_BROWSER_ARGS = HEADLESS_BROWSER
-  ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  : [];
 const MAX_BODY = '16kb';
 
 /** Only these cookies can be written through the API. */
@@ -79,7 +74,7 @@ if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
 const TWEET_URL = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
-const LOGIN_URL = 'https://x.com/i/flow/login';
+const LOGIN_URL = 'https://twitter.com/login';
 const HOME_URL = 'https://x.com/home';
 const SESSION_COOKIE = 'auth_token';
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -1193,37 +1188,28 @@ async function waitForLogin(context, signal) {
 }
 
 /**
- * Launches Chromium with a fresh, empty browser context, waits for the user
- * to finish logging in, then saves Playwright storage state for that user/X account.
- * Production/Render runs headless because containers have no X display.
+ * Connects to Browserless, reuses its default context, waits for the user to
+ * finish logging in, then saves Playwright storage state for that user/X account.
  */
 async function runBrowserLogin({ send, signal, generation, user, requestedXUsername = null }) {
   send({
     type: 'start',
-    command: `browser sign-in -> ${LOGIN_URL} (fresh empty context, ${HEADLESS_BROWSER ? 'headless' : 'headed'} Chromium)`,
+    command: `browser sign-in -> ${LOGIN_URL} (Browserless remote Chromium)`,
   });
 
-  const browser = await chromium.launch({
-    headless: HEADLESS_BROWSER,
-    args: [
-      ...CONTAINER_BROWSER_ARGS,
-      '--disable-blink-features=AutomationControlled',
-      ...(HEADLESS_BROWSER ? [] : ['--start-maximized']),
-    ],
-    ignoreDefaultArgs: ['--enable-automation'],
-  });
-  let context = null;
+  let browser = null;
   const closeBrowserOnAbort = () => {
-    void browser.close().catch(() => {});
+    void closeBrowser(browser);
   };
   signal?.addEventListener('abort', closeBrowserOnAbort, { once: true });
 
   try {
-    context = await browser.newContext({
-      storageState: { cookies: [], origins: [] },
-      viewport: null,
-    });
-    const page = await context.newPage();
+    browser = await connectBrowser();
+    throwIfAborted(signal);
+
+    const context = await getDefaultContext(browser);
+    await context.clearCookies();
+    const page = await getOrCreatePage(context);
 
     send({ type: 'stdout', data: `Opening ${LOGIN_URL} …` });
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
@@ -1281,8 +1267,7 @@ async function runBrowserLogin({ send, signal, generation, user, requestedXUsern
     return { ok: loggedIn, cookieCount: storageState.cookies.length, username };
   } finally {
     signal?.removeEventListener('abort', closeBrowserOnAbort);
-    await context?.close().catch(() => {});
-    await browser.close().catch(() => {});
+    await closeBrowser(browser);
   }
 }
 

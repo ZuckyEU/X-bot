@@ -1,13 +1,15 @@
 import 'dotenv/config';
-import { chromium } from 'playwright';
 import { GoogleGenAI } from '@google/genai';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
 
 const MODEL = process.env.GEMINI_MODEL ?? 'gemini-3.6-flash';
 
 async function scrapeTitle(url) {
-  const browser = await chromium.launch({ headless: true });
+  let browser = null;
   try {
-    const page = await browser.newPage();
+    browser = await connectBrowser();
+    const context = await getDefaultContext(browser);
+    const page = await getOrCreatePage(context);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     return {
       url: page.url(),
@@ -15,14 +17,14 @@ async function scrapeTitle(url) {
       heading: (await page.locator('h1').first().textContent().catch(() => null))?.trim() ?? null,
     };
   } finally {
-    await browser.close();
+    await closeBrowser(browser);
   }
 }
 
 async function main() {
   const target = process.argv[2] ?? 'https://example.com';
 
-  console.log(`Launching Playwright chromium and visiting ${target} ...`);
+  console.log(`Connecting to Browserless Chromium and visiting ${target} ...`);
   const pageInfo = await scrapeTitle(target);
   console.log('Page:', pageInfo);
 

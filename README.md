@@ -6,15 +6,18 @@ Minimal starting point: **Playwright** (browser automation), **@google/genai** (
 
 ```powershell
 npm install
-npx playwright install chromium   # already done
+npx playwright install chromium   # only needed for the local UI regression tests
 ```
 
-Add your key to `.env` (created from `.env.example`):
+Add your keys to `.env` (created from `.env.example`):
 
 ```
 GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-3.6-flash
+BROWSERLESS_WS_ENDPOINT=wss://production-sfo.browserless.io?token=YOUR_API_TOKEN
 ```
+
+All application browser automation connects to Browserless through `chromium.connectOverCDP()`. Keep the Browserless token in `.env` or the deployment environment, never in source control.
 
 `gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
 
@@ -25,7 +28,7 @@ npm start
 npm start -- https://news.ycombinator.com   # custom URL
 ```
 
-`index.js` loads `.env`, opens the URL in headless Chromium, reads the title/heading, then asks Gemini to describe the page. If `GEMINI_API_KEY` is missing it still runs the Playwright part and prints a warning.
+`index.js` loads `.env`, opens the URL in a Browserless remote Chromium session, reads the title/heading, then asks Gemini to describe the page. If `GEMINI_API_KEY` is missing it still runs the Playwright part and prints a warning.
 
 ## X login (saves session to auth.json)
 
@@ -33,8 +36,8 @@ npm start -- https://news.ycombinator.com   # custom URL
 npm run auth
 ```
 
-1. A **visible** Chromium window opens on `https://x.com/login`.
-2. Log in there yourself — password, 2FA, captcha, anything X asks for.
+1. A Browserless remote Chromium session opens on `https://twitter.com/login`.
+2. Open that session in the Browserless live view and log in yourself — password, 2FA, captcha, anything X asks for.
 3. Return to the terminal and press **ENTER**.
 4. The script checks for the `auth_token` cookie, then writes all cookies to `auth.json`.
 
@@ -87,7 +90,7 @@ Crypto framing (tokens, price action, "alpha", on-chain, trading) is allowed onl
 |---|---|
 | `--dry-run` | Stop after printing the generated reply |
 | `--yes`, `-y` | Skip the confirmation prompt |
-| `--headless` | Hide the browser window |
+| `--headless` | Accepted for compatibility; Browserless controls browser visibility |
 
 Output example:
 
@@ -110,20 +113,20 @@ Notes:
 
 ## Browser sign-in via the web UI (Connect X Account)
 
-`server.js` runs a **headed Chromium** window on `https://x.com/i/flow/login` when you press **Connect X Account** in the admin UI (`POST /auth/x`).
+`server.js` opens a **Browserless remote Chromium** session on `https://twitter.com/login` when you press **Connect X Account** in the admin UI (`POST /auth/x`).
 
 Flow:
 
-1. You press the button in the admin UI → the server launches the **bundled Chromium** with a fresh, empty browser context and opens the X login flow. It runs headed locally, but headless on Render/production (`NODE_ENV=production` or `RENDER`) with `--no-sandbox`, `--disable-setuid-sandbox`, and `--disable-dev-shm-usage` for container stability. The interactive flow requires a display.
-2. You complete the login yourself in that window (password, 2FA, captcha, …).
+1. You press the button in the admin UI → the server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, clears its cookies, and navigates to `https://twitter.com/login`. Open the Browserless live view for that session to complete the login.
+2. You complete the login through the Browserless live view (password, 2FA, captcha, …).
 3. The server polls the browser context until X sets the `auth_token` session cookie, captures `context.cookies()` and saves them to `auth.json`.
 4. The browser closes; the session status refreshes.
 
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
 ```
-{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (fresh empty context, Chromium)"}
-{"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
+{"type":"start","command":"browser sign-in -> https://twitter.com/login (Browserless remote Chromium)"}
+{"type":"stdout","data":"Opening https://twitter.com/login …"}
 {"type":"stdout","data":"Waiting for you to finish logging in to X …"}
 {"type":"exit","code":0,"result":{"ok":true,"cookieCount":2}}
 ```
@@ -147,7 +150,7 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `POST /api/auth/logout` | Clear `auth.json` |
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |
-| `POST /auth/x` | NDJSON: start → stdout/stderr → exit (headed browser sign-in) |
+| `POST /auth/x` | NDJSON: start → stdout/stderr → exit (Browserless browser sign-in) |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:

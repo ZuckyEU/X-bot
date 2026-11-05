@@ -331,6 +331,7 @@ test('production allows Render origins and rejects unknown origins', async (t) =
 
 test('UI Clear All and sign-out flush backing state and dropdown entries', async (t) => {
   const { baseUrl } = await startServer(t);
+  // Keep this browser local: Browserless cannot reach the ephemeral 127.0.0.1 test server.
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],

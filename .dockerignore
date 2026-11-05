@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.git/
+node_modules/
+sessions/
+user-data/
+user-db.json
+auth.json
+history.json
+*.log

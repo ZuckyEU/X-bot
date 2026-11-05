@@ -4,31 +4,28 @@ import { stdin as input, stdout as output } from 'node:process';
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+import { closeBrowser, connectBrowser, getDefaultContext, getOrCreatePage } from './lib/browser.js';
 
 /**
  * Manual X (Twitter) login helper.
  *
- * Opens Chromium on the X login page. It stays headed locally so you can log in
- * yourself, and runs headless in production/Render where no display is available.
- * The script then saves the session cookies to auth.json.
+ * Opens a Browserless remote Chromium session on the X login page, lets you
+ * complete sign-in through the Browserless session viewer, then saves the
+ * session cookies to auth.json.
  */
 
-const LOGIN_URL = 'https://x.com/login';
+const LOGIN_URL = 'https://twitter.com/login';
 const AUTH_FILE = join(dirname(fileURLToPath(import.meta.url)), 'auth.json');
 const SESSION_COOKIE = 'auth_token'; // set by X once you are actually logged in
 const LOGIN_WAIT_MS = 15_000;
-const HEADLESS_BROWSER = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
-const CONTAINER_BROWSER_ARGS = HEADLESS_BROWSER
-  ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  : [];
 
 const banner = `
 ────────────────────────────────────────────────────────────
  X login — manual sign-in
 ────────────────────────────────────────────────────────────
- 1. A Chromium window will open on ${LOGIN_URL}
- 2. Log in to X there (password, 2FA, captcha — as prompted).
+ 1. Browserless opens a remote Chromium session on ${LOGIN_URL}
+ 2. Open the Browserless live view for that session and log in to X
+    (password, 2FA, captcha — as prompted).
  3. When you can see your timeline, come back here and press
     ENTER to save the session to auth.json.
 
@@ -55,24 +52,13 @@ async function waitForSessionCookie(context, timeoutMs) {
 
 async function main() {
   console.log(banner);
-  if (HEADLESS_BROWSER) {
-    console.warn(
-      '[auth] Running headless because production/Render has no display. ' +
-        'Interactive sign-in needs a desktop session; run `npm run auth` locally and provide auth.json instead.',
-    );
-  }
 
-  const browser = await chromium.launch({
-    headless: HEADLESS_BROWSER,
-    args: [
-      ...CONTAINER_BROWSER_ARGS,
-      ...(HEADLESS_BROWSER ? [] : ['--start-maximized']),
-    ],
-  });
-
+  let browser = null;
   try {
-    const context = await browser.newContext({ viewport: null });
-    const page = await context.newPage();
+    browser = await connectBrowser();
+    const context = await getDefaultContext(browser);
+    await context.clearCookies();
+    const page = await getOrCreatePage(context);
 
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
 
@@ -114,7 +100,7 @@ async function main() {
         'auth.json grants full access to your X account — keep it private and never commit it.\n',
     );
   } finally {
-    await browser.close();
+    await closeBrowser(browser);
   }
 }
 
