@@ -192,7 +192,7 @@ Runner details:
 Safety rails, because this endpoint can replace your session:
 
 - Binds to **0.0.0.0** by default for container platforms such as Render. Set `HOST=127.0.0.1` to restrict access to the local machine.
-- CORS allowlists only the UI's own origin, so another website cannot `PUT` to localhost. (Installing `cors` and calling it with no options would allow exactly that.)
+- CORS allows the local UI, explicitly configured origins (`PUBLIC_ORIGIN` / `ALLOWED_ORIGINS`), Render's `RENDER_EXTERNAL_URL`, and `*.onrender.com` in production. Other websites are rejected.
 - Only `auth_token` and `ct0` are writable; other cookies, `origins` and metadata are preserved.
 - Values are validated (`[A-Za-z0-9._~%+/-]+`, 8–512 chars) and **masked** in responses — the API never echoes a full cookie back.
 - Writes are serialised and atomic (temp file + rename), so an interrupted save can't truncate `auth.json`.

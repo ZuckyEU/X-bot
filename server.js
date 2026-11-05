@@ -95,12 +95,49 @@ const app = express();
 app.disable('x-powered-by');
 
 // cors() with no options would let any website PUT to localhost and hijack the
-// session, so only the UI's own origin is allowed.
+// session, so only the UI's own origin and explicitly trusted deployment origins
+// are allowed. Render sets RENDER_EXTERNAL_URL automatically; PUBLIC_ORIGIN and
+// ALLOWED_ORIGINS support custom domains (comma-separated).
+function toOrigin(value) {
+  try {
+    return new URL(String(value).trim()).origin;
+  } catch {
+    return null;
+  }
+}
+
 const allowedOrigins = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
+for (const value of [process.env.PUBLIC_ORIGIN, process.env.RENDER_EXTERNAL_URL, process.env.ALLOWED_ORIGINS]) {
+  for (const candidate of String(value || '').split(',')) {
+    if (!candidate.trim()) continue;
+    const origin = toOrigin(candidate);
+    if (origin) allowedOrigins.add(origin);
+    else console.warn(`[cors] Ignoring invalid origin: ${candidate.trim()}`);
+  }
+}
+
+function isOnRenderOrigin(origin) {
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'https:'
+      && (url.hostname === 'onrender.com' || url.hostname.endsWith('.onrender.com'));
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  const normalized = toOrigin(origin);
+  if (!normalized) return false;
+  if (allowedOrigins.has(normalized)) return true;
+  return IS_PRODUCTION && isOnRenderOrigin(normalized);
+}
+
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+      if (isAllowedOrigin(origin)) return callback(null, true);
       return callback(new Error('Origin not allowed'));
     },
   }),

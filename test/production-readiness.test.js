@@ -286,6 +286,49 @@ test('production accepts a strong secret and emits hardened session cookies', as
   assert.match(cookie, /SameSite=Strict/i);
   assert.match(cookie, /Secure/i);
 });
+test('production allows Render origins and rejects unknown origins', async (t) => {
+  const { baseUrl } = await startServer(t, {
+    NODE_ENV: 'production',
+    RENDER_EXTERNAL_URL: 'https://x-bot.onrender.com',
+  });
+
+  const registerFrom = (origin, suffix) => fetch(`${baseUrl}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin },
+    body: JSON.stringify({
+      username: `user_${suffix}`,
+      email: `${suffix}@example.test`,
+      password: `Password-${suffix}-123!`,
+    }),
+  });
+
+  const preflight = await fetch(`${baseUrl}/api/auth/register`, {
+    method: 'OPTIONS',
+    headers: {
+      origin: 'https://preview-check.onrender.com',
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type',
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(
+    preflight.headers.get('access-control-allow-origin'),
+    'https://preview-check.onrender.com',
+  );
+
+  const render = await registerFrom('https://x-bot.onrender.com', 'render');
+  assert.equal(render.status, 201, await render.text());
+  assert.equal(render.headers.get('access-control-allow-origin'), 'https://x-bot.onrender.com');
+
+  const wildcard = await registerFrom('https://preview-check.onrender.com', 'preview');
+  assert.equal(wildcard.status, 201, await wildcard.text());
+
+  const rejected = await registerFrom('https://evil.example', 'evil');
+  assert.equal(rejected.status, 403);
+  assert.deepEqual(await rejected.json(), { error: 'Origin not allowed' });
+  assert.equal(rejected.headers.get('access-control-allow-origin'), null);
+});
+
 test('UI Clear All and sign-out flush backing state and dropdown entries', async (t) => {
   const { baseUrl } = await startServer(t);
   const browser = await chromium.launch({ headless: true });
