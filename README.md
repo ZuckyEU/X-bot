@@ -14,10 +14,10 @@ Add your keys to `.env` (created from `.env.example`):
 ```
 GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-3.6-flash
-BROWSERLESS_WS_ENDPOINT=wss://production-sfo.browserless.io?token=YOUR_API_TOKEN
+BROWSERLESS_TOKEN=YOUR_API_TOKEN
 ```
 
-All application browser automation connects to Browserless through `chromium.connectOverCDP()`. Keep the Browserless token in `.env` or the deployment environment, never in source control.
+All application browser automation connects with `chromium.connectOverCDP()` to `wss://production-sfo.browserless.io/stealth` using `proxy=residential&proxyCountry=us`. The URL is built at runtime from `BROWSERLESS_TOKEN` (or `BROWSERLESS_API_KEY`); keep the token in `.env` or the deployment environment, never in source control. A token can still be extracted from the legacy `BROWSERLESS_WS_ENDPOINT` during migration, but that URL is no longer used as the connection target.
 
 `gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
 
@@ -154,7 +154,7 @@ If the live link cannot be minted, the dashboard still exposes **Complete Sign-I
 
 `POST /auth/x/cancel` is idempotent: it returns `{ "ok": true, "cancelled": false }` when nothing is running, and otherwise clears the active sign-in lock, aborts the Playwright run, and closes the Browserless browser before replying. It is scoped to the authenticated app user.
 
-The optional `BROWSERLESS_LIVE_TIMEOUT_MS` environment variable controls how long the Live URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserless connection stays open until sign-in finishes or the run is cancelled. If the Browserless plan allows a longer session, set `BROWSERLESS_SESSION_TIMEOUT_MS` (for example `600000`) so the browser does not hit the provider's default session limit mid-login. Free Browserless sessions are only 2 minutes.
+The optional `BROWSERLESS_LIVE_TIMEOUT_MS` environment variable controls how long the Live URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserless connection stays open until sign-in finishes or the run is cancelled. If the Browserless plan allows a longer session, set `BROWSERLESS_SESSION_TIMEOUT_MS` (for example `600000`) so the browser does not hit the provider's default session limit mid-login. Free Browserless sessions are only 2 minutes, and managed stealth/residential proxy access also depends on the Browserless plan.
 
 The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, writes `auth.json`).
 

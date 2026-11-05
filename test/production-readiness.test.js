@@ -10,12 +10,14 @@ import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
 import { chromium } from 'playwright';
 import {
+  buildBrowserlessEndpoint,
   CHROME_USER_AGENT,
   createTrustedLoginProfile,
   createLiveInspection,
   getDefaultContext,
   getOrCreatePage,
   restoreStorageState,
+  resolveBrowserlessToken,
   safeContextCall,
   safeGoto,
   withSessionTimeout,
@@ -566,6 +568,30 @@ test('optional Browserless session timeout is added without rewriting other para
   assert.equal(withSessionTimeout(tooShort, 5_000), tooShort);
   assert.equal(withSessionTimeout(tooShort, 'not-a-number'), tooShort);
   assert.equal(withSessionTimeout('not a url', 600_000), 'not a url');
+});
+
+test('Browserless endpoint always uses managed stealth with a US residential proxy', () => {
+  assert.equal(
+    buildBrowserlessEndpoint('secret-token'),
+    'wss://production-sfo.browserless.io/stealth?token=secret-token&proxy=residential&proxyCountry=us',
+  );
+
+  const encoded = new URL(buildBrowserlessEndpoint('secret token/+', 600_000));
+  assert.equal(encoded.protocol, 'wss:');
+  assert.equal(encoded.hostname, 'production-sfo.browserless.io');
+  assert.equal(encoded.pathname, '/stealth');
+  assert.equal(encoded.searchParams.get('token'), 'secret token/+');
+  assert.equal(encoded.searchParams.get('proxy'), 'residential');
+  assert.equal(encoded.searchParams.get('proxyCountry'), 'us');
+  assert.equal(encoded.searchParams.get('timeout'), '600000');
+
+  assert.equal(resolveBrowserlessToken({ BROWSERLESS_TOKEN: 'primary', BROWSERLESS_API_KEY: 'fallback' }), 'primary');
+  assert.equal(resolveBrowserlessToken({ BROWSERLESS_API_KEY: 'fallback' }), 'fallback');
+  assert.equal(
+    resolveBrowserlessToken({ BROWSERLESS_WS_ENDPOINT: 'wss://legacy.example?token=legacy-token' }),
+    'legacy-token',
+  );
+  assert.throws(() => buildBrowserlessEndpoint(''), /BROWSERLESS_TOKEN or BROWSERLESS_API_KEY is required/);
 });
 
 test('storage state restores cookies and localStorage while tenant profiles omit account auth', async () => {
