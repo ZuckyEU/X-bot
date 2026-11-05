@@ -20,7 +20,7 @@ import {
   getBrowserbaseSession,
   getDefaultContext,
   getOrCreatePage,
-  normalizeBrowserbaseLiveURL,
+  resolveBrowserbaseLiveURL,
   resolveBrowserbaseConfig,
   resolveSessionTimeoutSeconds,
   resolveVerifiedModeEnabled,
@@ -668,16 +668,25 @@ test('Browserbase live inspection exposes the SDK debugger URL', async () => {
   await closeBrowser(browser);
 });
 
-test('Browserbase live inspection uses the SDK URL and upgrades the legacy inspector path', async () => {
-  const legacyQuery = 'wss=connect.browserbase.com%2Fsessions%2Fsession-1';
-  const legacy = `https://www.browserbase.com/devtools-fullscreen/inspector.html?${legacyQuery}`;
-  const current = `https://www.browserbase.com/devtools-fullscreen-compiled/index.html?${legacyQuery}`;
-  assert.equal(normalizeBrowserbaseLiveURL(legacy), current);
-  assert.equal(normalizeBrowserbaseLiveURL(current), current);
-  assert.equal(normalizeBrowserbaseLiveURL('not a url'), null);
-  assert.equal(normalizeBrowserbaseLiveURL('javascript:alert(1)'), null);
+test('Browserbase live inspection passes through the SDK URL without hardcoding a domain', async () => {
+  const sdkUrl = 'https://live.browserbase.test/fullscreen?token=abc&navbar=false';
+  assert.equal(resolveBrowserbaseLiveURL({ debuggerFullscreenUrl: sdkUrl }), sdkUrl);
+  assert.equal(resolveBrowserbaseLiveURL({ debuggerUrl: sdkUrl }), sdkUrl);
+  assert.equal(
+    resolveBrowserbaseLiveURL({ pages: [{ debuggerFullscreenUrl: sdkUrl }] }),
+    sdkUrl,
+  );
+  assert.equal(resolveBrowserbaseLiveURL({ debuggerFullscreenUrl: 'not a url' }), null);
+  assert.equal(resolveBrowserbaseLiveURL({ debuggerFullscreenUrl: 'javascript:alert(1)' }), null);
 
-  const { client, calls } = fakeBrowserbaseClient({ debugResponse: { debuggerFullscreenUrl: legacy } });
+  const browserSource = await readFile(join(ROOT, 'lib', 'browser.js'), 'utf8');
+  assert.equal(
+    browserSource.includes('browserbase.com'),
+    false,
+    'the live URL builder must not force a Browserbase domain',
+  );
+
+  const { client, calls } = fakeBrowserbaseClient({ debugResponse: { debuggerFullscreenUrl: sdkUrl } });
   const browser = fakePlaywrightBrowser();
   await connectBrowser({
     client,
@@ -687,7 +696,7 @@ test('Browserbase live inspection uses the SDK URL and upgrades the legacy inspe
   const page = { context: () => ({ browser: () => browser }) };
 
   const inspection = await createLiveInspection(page, { timeoutMs: 60_000 });
-  assert.equal(inspection.liveURL, current);
+  assert.equal(inspection.liveURL, sdkUrl);
   assert.deepEqual(calls.debug, [{ id: 'session-1', query: { expiresIn: 60 } }]);
 
   await closeBrowser(browser);
