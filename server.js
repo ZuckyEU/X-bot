@@ -675,7 +675,7 @@ function createCompletionSignal() {
   return { promise, resolve };
 }
 
-/** Coordinates the "Complete Sign-In" button with the long-running login stream. */
+/** Coordinates the completion confirmation with the long-running login stream. */
 function createLoginControl() {
   let requested = false;
   let wake = null;
@@ -1476,7 +1476,7 @@ async function persistSignedInBrowserSession({
 
 /**
  * Waits for the person to finish signing in in the remote window and click
- * Complete Sign-In. A missing session cookie keeps the run open for a retry.
+ * confirmation button. A missing session cookie keeps the run open for a retry.
  */
 async function waitForManualSignIn(context, signal, loginControl, send) {
   const deadline = Date.now() + LOGIN_TIMEOUT_MS;
@@ -1497,7 +1497,7 @@ async function waitForManualSignIn(context, signal, loginControl, send) {
       send({
         type: 'status',
         stage: 'signed-in',
-        data: 'X session detected. Click Complete Sign-In to save it.',
+        data: 'X session detected. Click I’ve completed sign-in to save it.',
       });
     }
 
@@ -1508,7 +1508,7 @@ async function waitForManualSignIn(context, signal, loginControl, send) {
       send({
         type: 'status',
         stage: 'complete-pending',
-        data: 'No X session cookie found yet. Finish signing in in the remote window, then click Complete Sign-In again.',
+        data: 'No X session cookie found yet. Finish signing in in the remote window, then click I’ve completed sign-in again.',
       });
     }
 
@@ -1596,6 +1596,59 @@ async function runBrowserLogin({
     }
     const page = await getOrCreatePage(context);
 
+    // Mint and stream the viewer URL before X navigation so the client can
+    // launch a native tab immediately while this same remote page loads.
+    try {
+      liveInspection = await createLiveInspection(page, {
+        timeoutMs: LIVE_VIEW_TIMEOUT_MS,
+        onViewerConnected: () => {
+          send({
+            type: 'status',
+            stage: 'viewer-connected',
+            data: 'Remote sign-in window connected. Finish signing in to X there.',
+          });
+        },
+        onComplete: ({ reason } = {}) => {
+          if (reason === 'timeout') {
+            send({
+              type: 'status',
+              stage: 'live-expired',
+              data: 'The remote sign-in link expired. Cancel and start a new sign-in if you still need it.',
+            });
+          } else if (reason === 'viewerDisconnected') {
+            send({
+              type: 'status',
+              stage: 'viewer-disconnected',
+              data: 'Remote viewer disconnected. Click I’ve completed sign-in once login is finished.',
+            });
+          } else if (reason === 'closed') {
+            send({
+              type: 'status',
+              stage: 'live-closed',
+              data: 'The remote sign-in link closed. The browser is still waiting for confirmation.',
+            });
+          }
+        },
+      });
+
+      send({
+        type: 'live',
+        status: 'ready',
+        url: liveInspection.liveURL,
+        expiresAt: new Date(liveInspection.expiresAt).toISOString(),
+      });
+      send({
+        type: 'stdout',
+        data: 'Remote sign-in window ready. Finish signing in there, then confirm completion in the dashboard.',
+      });
+    } catch (error) {
+      send({ type: 'live', status: 'error', message: error.message });
+      send({
+        type: 'stderr',
+        data: `${error.message}. If you can open the Browserless dashboard, finish there and then confirm sign-in.`,
+      });
+    }
+
     send({ type: 'stdout', data: `Opening ${LOGIN_URL} …` });
     const navigation = await safeGoto(page, LOGIN_URL, {
       waitUntil: 'commit',
@@ -1620,57 +1673,6 @@ async function runBrowserLogin({
 
     send({ type: 'stdout', data: 'Waiting for you to complete sign-in in the remote window …' });
 
-    try {
-      liveInspection = await createLiveInspection(page, {
-        timeoutMs: LIVE_VIEW_TIMEOUT_MS,
-        onViewerConnected: () => {
-          send({
-            type: 'status',
-            stage: 'viewer-connected',
-            data: 'Remote sign-in window connected. Finish signing in to X there.',
-          });
-        },
-        onComplete: ({ reason } = {}) => {
-          if (reason === 'timeout') {
-            send({
-              type: 'status',
-              stage: 'live-expired',
-              data: 'The remote sign-in link expired. Cancel and start a new sign-in if you still need it.',
-            });
-          } else if (reason === 'viewerDisconnected') {
-            send({
-              type: 'status',
-              stage: 'viewer-disconnected',
-              data: 'Remote viewer disconnected. Click Complete Sign-In once the login is finished.',
-            });
-          } else if (reason === 'closed') {
-            send({
-              type: 'status',
-              stage: 'live-closed',
-              data: 'The remote sign-in link closed. The browser is still waiting for Complete Sign-In.',
-            });
-          }
-        },
-      });
-
-      send({
-        type: 'live',
-        status: 'ready',
-        url: liveInspection.liveURL,
-        expiresAt: new Date(liveInspection.expiresAt).toISOString(),
-      });
-      send({
-        type: 'stdout',
-        data: 'Remote sign-in window ready. Sign in there, then click Complete Sign-In in the dashboard.',
-      });
-    } catch (error) {
-      send({ type: 'live', status: 'error', message: error.message });
-      send({
-        type: 'stderr',
-        data: `${error.message}. If you can open the Browserless dashboard, sign in there and then click Complete Sign-In.`,
-      });
-    }
-
     const login = await waitForManualSignIn(context, signal, loginControl, send);
     if (login.error) {
       send({
@@ -1683,7 +1685,7 @@ async function runBrowserLogin({
       send({
         type: 'stderr',
         data: login.timedOut
-          ? 'X sign-in timed out before Complete Sign-In was confirmed — nothing was saved.'
+          ? 'X sign-in timed out before completion was confirmed — nothing was saved.'
           : 'X sign-in was not verified — the session was not saved.',
       });
       return { ok: false };

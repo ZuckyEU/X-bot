@@ -846,6 +846,12 @@ test('container exposes the Render port and starts Node directly', async () => {
   assert.match(server, /process\.env\.PORT \|\| 10000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
   assert.match(server, /Server listening on port/);
+
+  const loginFlow = server.slice(
+    server.indexOf('async function runBrowserLogin'),
+    server.indexOf("app.post('/auth/x'"),
+  );
+  assert.ok(loginFlow.indexOf('createLiveInspection(page') < loginFlow.indexOf('safeGoto(page, LOGIN_URL'));
 });
 
 test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain stable', async (t) => {
@@ -932,6 +938,30 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
   assert.equal(await page.locator('.linked-account-item').count(), 1);
   await page.unroute('**/auth/x/credentials');
 
+  const liveUrl = `${baseUrl}/?browserless-live-test=1`;
+  await page.route('**/auth/x', async (route) => {
+    const events = [
+      { type: 'live', status: 'ready', url: liveUrl, expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      { type: 'exit', code: 1, result: { ok: false } },
+    ];
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+    });
+  });
+  await page.locator('#account-chip').click();
+  await page.locator('#add-x-account').click();
+  const [automaticRemoteTab] = await Promise.all([
+    page.waitForEvent('popup'),
+    page.locator('#x-credentials-remote').click(),
+  ]);
+  await automaticRemoteTab.waitForURL(liveUrl);
+  assert.equal(automaticRemoteTab.url(), liveUrl);
+  await automaticRemoteTab.close();
+  await page.locator('#remote-login-modal').waitFor({ state: 'hidden' });
+  await page.unroute('**/auth/x');
+
   assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
   await page.evaluate(() => eval('openRemoteLoginModal()'));
   assert.equal(await page.locator('#remote-login-open').getAttribute('aria-disabled'), 'true');
@@ -942,6 +972,7 @@ test('UI mobile dropdown, credential sign-in, Clear All, and sign-out remain sta
   assert.equal(await page.locator('#remote-login-open').getAttribute('rel'), 'noopener noreferrer');
   assert.equal(await page.locator('#remote-login-open').getAttribute('href'), 'about:blank');
   assert.equal(await page.locator('#remote-login-complete').isEnabled(), true);
+  assert.equal(await page.locator('#remote-login-complete').textContent(), 'I’ve completed sign-in');
   assert.equal(await page.locator('#remote-login-iframe').count(), 0);
   assert.match(await page.locator('#remote-login-empty').textContent(), /new tab/i);
   const [remoteTab] = await Promise.all([

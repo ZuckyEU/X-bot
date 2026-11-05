@@ -125,10 +125,10 @@ After X sets `auth_token`, the server captures the complete Playwright storage s
 Flow:
 
 1. The server connects to **Browserless** with `chromium.connectOverCDP()`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
-2. Before navigation, it restores that app tenant's trusted X cookies and localStorage, then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
-3. The dashboard intentionally does **not** embed the live stream. **Open Remote Sign-In Window** is a real `target="_blank"` link so the Browserless viewer runs in a dedicated tab without inline canvas/input latency.
+2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserless Live URL, and immediately emits it to the authenticated NDJSON client. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
+3. The dashboard intentionally does **not** embed the live stream. The 2FA/captcha action pre-opens a native tab and routes it to the Live URL as soon as the event arrives; **Open Remote Sign-In Window** remains an explicit `window.open(liveUrl, '_blank')` fallback. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
 4. Sign in to X in the remote window, including 2FA or any challenge.
-5. Click **Complete Sign-In** in the dashboard. The server checks for the `auth_token` cookie, captures cookies and localStorage with `context.storageState()`, writes `sessions/<userId>/<xUsername>.json`, updates the user's linked accounts, and refreshes the account list.
+5. Click **I’ve completed sign-in** in the dashboard. The server checks for the `auth_token` cookie, captures cookies and localStorage with `context.storageState()`, writes `sessions/<userId>/<xUsername>.json` under persistent `DATA_DIR`, updates the user's linked accounts, and refreshes the account list.
 6. The browser and live link close. The Live URL is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
 7. Press **Cancel** to stop an active remote sign-in. The dashboard calls `POST /auth/x/cancel`, which releases the active-run lock immediately, aborts the Playwright flow, and closes the Browserless browser so **Add X Account** can start a fresh session.
 
@@ -136,16 +136,16 @@ Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keep
 
 An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserless proxy region is still important.
 
-If the live link cannot be minted, the dashboard still exposes **Complete Sign-In** so an operator who can reach the Browserless dashboard can finish there and confirm it.
+If the live link cannot be minted, the dashboard still exposes **I’ve completed sign-in** so an operator who can reach the Browserless dashboard can finish there and confirm it.
 
 `POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
 
 ```
 {"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (Browserless remote Chromium)"}
+{"type":"live","status":"ready","url":"https://…/live/index.html?i=…","expiresAt":"…"}
 {"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
 {"type":"stdout","data":"Waiting for you to complete sign-in in the remote window …"}
-{"type":"live","status":"ready","url":"https://…/live/index.html?i=…","expiresAt":"…"}
-{"type":"status","stage":"signed-in","data":"X session detected. Click Complete Sign-In to save it."}
+{"type":"status","stage":"signed-in","data":"X session detected. Click I’ve completed sign-in to save it."}
 {"type":"stdout","data":"Login confirmed. Waiting for X home and account identity …"}
 {"type":"exit","code":0,"result":{"ok":true,"cookieCount":2,"username":"…"}}
 ```

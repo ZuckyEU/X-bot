@@ -535,11 +535,11 @@
         </div>
         <div class="remote-login-actions">
           <a id="remote-login-open" class="button ghost is-disabled" href="#" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" role="button" aria-disabled="true">Open Remote Sign-In Window</a>
-          <button id="remote-login-complete" class="primary" type="button" disabled>Complete Sign-In</button>
+          <button id="remote-login-complete" class="primary" type="button" disabled>I’ve completed sign-in</button>
         </div>
         <p class="remote-login-hint">
           Open the remote browser in a new tab, complete any 2FA or challenge, then click
-          <strong>Complete Sign-In</strong> to save the session and update your accounts.
+          <strong>I’ve completed sign-in</strong> to save the session and update your accounts.
         </p>
       </div>
     </div>
@@ -951,11 +951,48 @@
       }
 
       async function useRemoteCredentialFallback() {
+        const preparedWindow = prepareRemoteLoginWindow();
         closeXCredentialModal();
-        await connectX();
+        await connectX({ autoOpen: true, preparedWindow });
       }
 
       /* ------------------------- remote X sign-in ------------------------- */
+
+      function prepareRemoteLoginWindow() {
+        const popup = window.open('about:blank', '_blank');
+        if (!popup) return null;
+        try {
+          popup.opener = null;
+          popup.document.title = 'Preparing remote X sign-in…';
+          popup.document.body.textContent = 'Preparing the secure Browserless sign-in window…';
+          popup.document.body.style.cssText = 'margin:0;padding:32px;background:#07090d;color:#cbd5e1;font:14px system-ui,sans-serif';
+        } catch {
+          // Navigation may have started before the placeholder was painted.
+        }
+        return popup;
+      }
+
+      function launchRemoteLoginWindow(url, preparedWindow = null) {
+        if (preparedWindow && !preparedWindow.closed) {
+          try {
+            preparedWindow.location.replace(url);
+            return true;
+          } catch {
+            // Fall through to a fresh native tab if the placeholder is unavailable.
+          }
+        }
+        return Boolean(window.open(url, '_blank', 'noopener,noreferrer'));
+      }
+
+      function closeUnusedRemoteWindow(preparedWindow, launched) {
+        if (!launched && preparedWindow && !preparedWindow.closed) {
+          try {
+            preparedWindow.close();
+          } catch {
+            // The user may already have closed it.
+          }
+        }
+      }
 
       function setRemoteLoginStatus(message) {
         const status = $('#remote-login-status');
@@ -989,7 +1026,7 @@
         $('#remote-login-empty').textContent = 'Waiting for the Browserless remote window…';
         setRemoteLoginOpenState(null);
         $('#remote-login-complete').disabled = false;
-        $('#remote-login-complete').textContent = 'Complete Sign-In';
+        $('#remote-login-complete').textContent = 'I’ve completed sign-in';
         $('#remote-login-cancel').disabled = false;
         setRemoteLoginStatus('Connecting to Browserless…');
       }
@@ -1016,7 +1053,7 @@
           ? ` Link expires at ${expiry.toLocaleTimeString()}.`
           : '';
         $('#remote-login-empty').textContent = 'Remote browser ready. Open it in a new tab to finish sign-in.';
-        setRemoteLoginStatus(`Remote window ready.${expiryText} Open it in a new tab, then click Complete Sign-In.`);
+        setRemoteLoginStatus(`Remote window ready.${expiryText} Open it in a new tab, then click I’ve completed sign-in.`);
       }
 
       async function completeRemoteSignIn() {
@@ -1421,12 +1458,11 @@
         });
         xCredentialsRemote.addEventListener('click', useRemoteCredentialFallback);
         remoteLoginOpenBtn.addEventListener('click', (event) => {
+          event.preventDefault();
           if (!remoteLoginUrl) {
-            event.preventDefault();
             return;
           }
-          event.currentTarget.href = remoteLoginUrl;
-          event.currentTarget.target = '_blank';
+          window.open(remoteLoginUrl, '_blank', 'noopener,noreferrer');
         });
         remoteLoginCompleteBtn.addEventListener('click', completeRemoteSignIn);
         remoteLoginCancelBtn.addEventListener('click', cancelRemoteSignIn);
@@ -1474,7 +1510,8 @@
 
       /* ------------------------------ sign-in ----------------------------- */
 
-      async function connectX() {
+      async function connectX({ autoOpen = false, preparedWindow = null } = {}) {
+        let remoteWindowLaunched = false;
         controller = new AbortController();
         $('signin').disabled = true;
         $('add-x-account').disabled = true;
@@ -1515,11 +1552,24 @@
                 if (event.type === 'live') {
                   if (event.status === 'ready' && event.url) {
                     setRemoteLoginUrl(event.url, event.expiresAt);
-                    setStatus('Running', 'info', 'Remote sign-in window ready.');
+                    if (autoOpen) {
+                      remoteWindowLaunched = launchRemoteLoginWindow(event.url, preparedWindow);
+                      if (remoteWindowLaunched) {
+                        setRemoteLoginStatus('Remote sign-in opened in a new tab. Finish there, then confirm completion here.');
+                        setStatus('Running', 'info', 'Remote sign-in opened in a new tab.');
+                      } else {
+                        setRemoteLoginStatus('Your browser blocked the new tab. Click Open Remote Sign-In Window.');
+                        setStatus('Running', 'warn', 'Click Open Remote Sign-In Window to continue.');
+                      }
+                    } else {
+                      setStatus('Running', 'info', 'Remote sign-in window ready.');
+                    }
                   } else if (event.status === 'error') {
+                    closeUnusedRemoteWindow(preparedWindow, remoteWindowLaunched);
+                    preparedWindow = null;
                     const message = event.message ?? 'The remote sign-in window is unavailable.';
-                    setRemoteLoginStatus(`${message} You can use the Browserless dashboard, then click Complete Sign-In.`);
-                    $('#remote-login-empty').textContent = `${message} You can use the Browserless dashboard, then click Complete Sign-In.`;
+                    setRemoteLoginStatus(`${message} You can use the Browserless dashboard, then confirm completion.`);
+                    $('#remote-login-empty').textContent = `${message} You can use the Browserless dashboard, then confirm completion.`;
                     setStatus('Running', 'warn', 'Remote sign-in window unavailable.');
                   }
                 } else if (event.type === 'status') {
@@ -1547,6 +1597,7 @@
           if (error.name === 'AbortError') setStatus('Sign-in stopped', 'warn', 'Stopped by user.');
           else setStatus('Sign-in failed', 'err', error.message);
         } finally {
+          closeUnusedRemoteWindow(preparedWindow, remoteWindowLaunched);
           controller = null;
           closeRemoteLoginModal();
           $('signin').disabled = false;
