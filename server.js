@@ -3,6 +3,7 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import bcrypt from 'bcrypt';
+import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -54,7 +55,6 @@ const DEFAULT_ADMIN_EMAIL = String(process.env.DEFAULT_ADMIN_EMAIL || '')
   .trim()
   .toLowerCase();
 const DEFAULT_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || '');
-const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -74,6 +74,7 @@ const APP_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const DEVELOPMENT_SESSION_SECRET = 'dev-secret-change-in-production';
 const SESSION_SECRET = String(process.env.SESSION_SECRET || DEVELOPMENT_SESSION_SECRET);
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS ?? 12);
+const HARVEST_API_TOKEN = String(process.env.HARVEST_API_TOKEN ?? '').trim();
 const INSECURE_SESSION_SECRETS = new Set([
   DEVELOPMENT_SESSION_SECRET,
   'change-me',
@@ -95,6 +96,20 @@ if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
 /** Same shape main.js accepts; keeps anything else out of argv. */
 const TWEET_URL = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
+const HARVEST_LOGIN_TIMEOUT_MS = (() => {
+  const configured = Number(process.env.HARVEST_LOGIN_TIMEOUT_MS ?? process.env.X_HARVEST_LOGIN_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured < 30_000) return 120_000;
+  return Math.min(configured, 300_000);
+})();
+const HARVEST_RUN_TIMEOUT_MS = HARVEST_LOGIN_TIMEOUT_MS + 60_000 + 5_000;
+const HARVEST_LOW_MEMORY_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--disable-gpu',
+  '--single-process',
+];
 
 const LOGIN_URL = X_LOGIN_URL;
 const HOME_URL = 'https://x.com/home';
@@ -161,17 +176,28 @@ function isAllowedOrigin(origin) {
   return IS_PRODUCTION && isOnRenderOrigin(normalized);
 }
 
+async function requireHarvestAccess(req) {
+  const bearer = String(req.headers.authorization ?? '').match(/^Bearer\s+(.+)$/i)?.[1];
+  const isInternalToken = Boolean(HARVEST_API_TOKEN) && bearer === HARVEST_API_TOKEN;
+  if (isInternalToken) return null;
+  const user = await optionalAuthenticatedUser(req);
+  if (IS_PRODUCTION) throw new HttpError(401, 'Harvest token required');
+  if (user) return user;
+  throw new HttpError(401, 'Authentication required');
+}
+
 app.use(
   cors({
     origin(origin, callback) {
       if (isAllowedOrigin(origin)) return callback(null, true);
       return callback(new Error('Origin not allowed'));
     },
+    methods: ['GET', 'PUT', 'DELETE', 'POST'],
+    credentials: false,
   }),
 );
 
 app.use(bodyParser.json({ limit: MAX_BODY }));
-app.use(express.static(PUBLIC_DIR));
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
   next();
@@ -1429,6 +1455,69 @@ async function waitForRemoteSignIn(page, context, signal, send) {
   return { loggedIn: false, error: null, timedOut: true };
 }
 
+async function runAutomatedXLogin({ identifier, password, twoFactorCode = null, signal }) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: HARVEST_LOW_MEMORY_ARGS,
+  });
+  let context;
+  let page;
+
+  try {
+    context = await browser.newContext();
+    page = await context.newPage();
+
+    const navigation = await safeGoto(page, LOGIN_URL, {
+      waitUntil: 'commit',
+      timeout: 45_000,
+      referer: X_REFERER,
+    });
+    if (navigation.error) throw new Error(`X navigation failed: ${navigation.error.message}`);
+    if (navigation.response && navigation.response.status() >= 400) {
+      throw new Error(`X returned HTTP ${navigation.response.status()}`);
+    }
+
+    const usernameInput = page.locator('input[name="username_or_email"], input[autocomplete="username"], input[name="text"]').first();
+    const passwordInput = page.locator('input[name="password"], input[type="password"]').first();
+    await usernameInput.waitFor({ state: 'visible', timeout: 30_000 });
+    await passwordInput.waitFor({ state: 'visible', timeout: 15_000 });
+    await usernameInput.fill(identifier);
+    await passwordInput.fill(password);
+
+    if (twoFactorCode) {
+      const otpInput = page.locator('input[name="otp"], input[inputmode="numeric"], input[type="text"]').first();
+      await otpInput.waitFor({ state: 'visible', timeout: 30_000 });
+      await otpInput.fill(String(twoFactorCode));
+      await otpInput.press('Enter');
+    }
+
+    await passwordInput.press('Enter');
+    const login = await waitForRemoteSignIn(page, context, signal, () => {});
+    if (login.error) throw login.error;
+    if (!login.loggedIn) {
+      throw new Error(login.timedOut ? 'X login timed out' : 'X login was not verified');
+    }
+
+    const storageState = await context.storageState();
+    const cookies = (storageState?.cookies ?? [])
+      .filter((cookie) => cookie?.name === X_AUTH_COOKIE || cookie?.name === X_CSRF_COOKIE)
+      .map((cookie) => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path,
+        secure: Boolean(cookie.secure),
+        httpOnly: Boolean(cookie.httpOnly),
+      }));
+
+    return { ok: true, username: identifier, cookies };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+}
+
 /**
  * Connects to Browserbase, reuses its default context, waits for the user to
  * finish logging in, then saves Playwright storage state for that user/X account.
@@ -1743,6 +1832,48 @@ app.post('/auth/x/cancel', async (req, res) => {
   return res.json({ ok: true, cancelled: true, closed });
 });
 
+app.post('/api/harvest-token', async (req, res) => {
+  let user = null;
+  const controller = new AbortController();
+  const harvestTimer = setTimeout(() => controller.abort(), HARVEST_RUN_TIMEOUT_MS);
+  harvestTimer.unref?.();
+
+  try {
+    user = await requireHarvestAccess(req);
+    const body = req.body ?? {};
+    const identifier = String(body.identifier ?? body.username ?? '').trim();
+    const password = body.password;
+    const twoFactorCode = body.twoFactorCode ?? body.two_factor_code ?? null;
+
+    if (!identifier || identifier.length > 254) {
+      throw new ValidationError('A valid X username or identifier is required');
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 256) {
+      throw new ValidationError('X password must be between 8 and 256 characters');
+    }
+    if (twoFactorCode !== null && (typeof twoFactorCode !== 'string' || !/^\d{6,10}$/.test(twoFactorCode))) {
+      throw new ValidationError('Two-factor code must be 6 to 10 digits');
+    }
+
+    const result = await runAutomatedXLogin({ identifier, password, twoFactorCode, signal: controller.signal });
+    return res.json({ ok: true, username: result.username, cookies: result.cookies });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      return res.status(408).json({ ok: false, error: 'X login timed out or was cancelled' });
+    }
+    return res.status(error.status ?? 502).json({ ok: false, error: error.status ? error.message : 'X login failed' });
+  } finally {
+    clearTimeout(harvestTimer);
+    if (req.body && typeof req.body === 'object') {
+      delete req.body.password;
+      delete req.body.identifier;
+      delete req.body.username;
+      delete req.body.twoFactorCode;
+      delete req.body.two_factor_code;
+    }
+  }
+});
+
 app.post('/api/run', async (req, res) => {
   const { url, urls, dryRun = false, headless = true, reply = false, like = false, repost = false, audit = false, tone } =
     req.body ?? {};
@@ -2035,6 +2166,10 @@ app.post('/api/run', async (req, res) => {
   }
 });
 
+app.get('/', (req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
 app.use('/api', (req, res) => {
   res.status(404).json({ error: `No route for ${req.method} ${req.originalUrl}` });
 });
@@ -2071,7 +2206,7 @@ await seedDefaultAdmin();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
-  console.log(`X automation admin UI: http://${HOST}:${PORT}`);
+  console.log(`X automation API service: http://${HOST}:${PORT}`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/register   (create local user)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);

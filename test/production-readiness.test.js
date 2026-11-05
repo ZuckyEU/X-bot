@@ -8,7 +8,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcrypt';
-import { chromium } from 'playwright';
 import {
   browserbaseSessionParams,
   CHROME_USER_AGENT,
@@ -71,7 +70,7 @@ async function startServer(t, extraEnv = {}, options = {}) {
     const timer = setTimeout(() => reject(new Error(`Server start timed out\n${output}`)), 15_000);
     child.stdout.on('data', (chunk) => {
       output += String(chunk);
-      if (!output.includes('X automation admin UI')) return;
+      if (!output.includes('X automation API service')) return;
       clearTimeout(timer);
       resolve();
     });
@@ -80,7 +79,7 @@ async function startServer(t, extraEnv = {}, options = {}) {
     });
     child.once('error', reject);
     child.once('exit', (code) => {
-      if (!output.includes('X automation admin UI')) {
+      if (!output.includes('X automation API service')) {
         clearTimeout(timer);
         reject(new Error(`Server exited ${code}\n${output}`));
       }
@@ -903,142 +902,28 @@ test('container exposes the Fly.io port and starts Node directly', async () => {
   assert.equal(server.includes('/auth/x/credentials'), false);
 });
 
-test('UI mobile dropdown, remote X handoff, Clear All, and sign-out remain stable', async (t) => {
-  const { baseUrl } = await startServer(t);
-  // Keep this browser local: the remote browser cannot reach the ephemeral 127.0.0.1 test server.
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--single-process',
-    ],
+test('API-only root and X harvest authentication are enforced', async (t) => {
+  const { baseUrl } = await startServer(t, { HARVEST_API_TOKEN: 'harvest-test-token-123' });
+
+  const root = await fetch(`${baseUrl}/`);
+  assert.equal(root.status, 404);
+  assert.deepEqual(await root.json(), { error: 'Not found' });
+
+  const unauthorized = await fetch(`${baseUrl}/api/harvest-token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ identifier: 'x_user', password: 'Password-123!' }),
   });
-  t.after(() => browser.close());
-  const page = await browser.newPage();
-  const pageErrors = [];
-  page.on('pageerror', (error) => pageErrors.push(error.message));
-  await page.goto(baseUrl, { waitUntil: 'networkidle' });
+  assert.equal(unauthorized.status, 401);
+  const unauthorizedBody = await unauthorized.json();
+  assert.equal(unauthorizedBody.ok, false);
 
-  await page.locator('#signup-tab').click();
-  await page.locator('#auth-username').fill('ui_state_user');
-  await page.locator('#auth-email').fill('ui-state@example.test');
-  await page.locator('#auth-password').fill('UI-State-Password-123!');
-  await page.locator('#auth-submit').click();
-  await page.locator('#auth-modal').waitFor({ state: 'hidden' });
-
-  for (const width of [375, 390, 430]) {
-    await page.setViewportSize({ width, height: 760 });
-    await page.locator('#account-chip').click();
-    const dropdownLayout = await page.locator('#account-dropdown').evaluate((dropdown) => {
-      const style = getComputedStyle(dropdown);
-      const rect = dropdown.getBoundingClientRect();
-      const topElement = document.elementFromPoint(
-        Math.min(window.innerWidth - 2, Math.max(1, rect.left + 12)),
-        Math.min(window.innerHeight - 2, Math.max(rect.top + 12, rect.bottom - 12)),
-      );
-      return {
-        backgroundColor: style.backgroundColor,
-        containsTopElement: Boolean(topElement?.closest('#account-dropdown')),
-        left: rect.left,
-        overflow: style.overflow,
-        position: style.position,
-        right: rect.right,
-        viewportWidth: window.innerWidth,
-        zIndex: style.zIndex,
-      };
-    });
-    assert.equal(dropdownLayout.position, 'absolute');
-    assert.equal(dropdownLayout.zIndex, '9999');
-    assert.equal(dropdownLayout.backgroundColor, 'rgb(17, 24, 39)');
-    assert.equal(dropdownLayout.overflow, 'hidden');
-    assert.equal(dropdownLayout.containsTopElement, true);
-    assert.ok(dropdownLayout.left >= 0);
-    assert.ok(dropdownLayout.right <= dropdownLayout.viewportWidth);
-    await page.locator('#account-chip').click();
-  }
-  await page.setViewportSize({ width: 1280, height: 720 });
-
-  const liveUrl = `${baseUrl}/?browserless-live-test=1`;
-  await page.route('**/auth/x', async (route) => {
-    const events = [
-      { type: 'live', status: 'ready', url: liveUrl, expiresAt: new Date(Date.now() + 60_000).toISOString() },
-      { type: 'exit', code: 1, result: { ok: false } },
-    ];
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/x-ndjson',
-      body: `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
-    });
+  const authorized = await fetch(`${baseUrl}/api/harvest-token`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer harvest-test-token-123', 'content-type': 'application/json' },
+    body: JSON.stringify({ identifier: '', password: 'Password-123!' }),
   });
-  await page.locator('#account-chip').click();
-  const [automaticRemoteTab] = await Promise.all([
-    page.waitForEvent('popup'),
-    page.locator('#add-x-account').click(),
-  ]);
-  await automaticRemoteTab.waitForURL(liveUrl);
-  assert.equal(automaticRemoteTab.url(), liveUrl);
-  await automaticRemoteTab.close();
-  await page.locator('#remote-login-modal').waitFor({ state: 'hidden' });
-  await page.unroute('**/auth/x');
-
-  assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
-  await page.evaluate(() => eval('openRemoteLoginModal()'));
-  assert.equal(await page.locator('#remote-login-open').getAttribute('aria-disabled'), 'true');
-  await page.evaluate(() => eval("setRemoteLoginUrl('about:blank', Date.now() + 60_000)"));
-  assert.equal(await page.locator('#remote-login-modal').isVisible(), true);
-  assert.equal(await page.locator('#remote-login-open').getAttribute('aria-disabled'), 'false');
-  assert.equal(await page.locator('#remote-login-open').getAttribute('target'), '_blank');
-  assert.equal(await page.locator('#remote-login-open').getAttribute('rel'), 'noopener noreferrer');
-  assert.equal(await page.locator('#remote-login-open').getAttribute('href'), 'about:blank');
-  assert.equal(await page.locator('#remote-login-complete').count(), 0);
-  assert.equal(await page.locator('#remote-login-iframe').count(), 0);
-  assert.match(await page.locator('#remote-login-empty').textContent(), /new tab/i);
-  const [remoteTab] = await Promise.all([
-    page.waitForEvent('popup'),
-    page.locator('#remote-login-open').click(),
-  ]);
-  assert.equal(remoteTab.url(), 'about:blank');
-  await remoteTab.close();
-  await page.locator('#remote-login-cancel').click();
-  await page.locator('#remote-login-modal').waitFor({ state: 'hidden' });
-  assert.equal(await page.locator('#remote-login-modal').isVisible(), false);
-
-  await page.locator('#run-url').fill('https://x.com/a/status/123\nhttps://x.com/b/status/456');
-  assert.equal(await page.evaluate(() => eval('targetUrls.length')), 2);
-  await page.locator('#clear-urls').click();
-  assert.equal(await page.locator('#run-url').inputValue(), '');
-  assert.equal(await page.evaluate(() => eval('targetUrls.length')), 0);
-
-  await page.evaluate(() => eval("applyLinkedAccounts([{ xUsername: 'alpha', active: true }, { xUsername: 'beta' }], 'alpha')"));
-  await page.locator('#account-chip').click();
-  assert.equal(await page.locator('.linked-account-item').count(), 2);
-  await page.locator('#run-url').fill('https://x.com/c/status/789');
-  await page.locator('#signout').click();
-  await page.locator('#signin').waitFor({ state: 'visible' });
-
-  const state = await page.evaluate(() => ({
-    currentUser: eval('currentUser'),
-    currentAppUsername: eval('currentAppUsername'),
-    currentUserEmail: eval('currentUserEmail'),
-    activeXAccount: eval('activeXAccount'),
-    linkedAccounts: eval('linkedXAccounts.length'),
-    targetUrls: eval('targetUrls.length'),
-    controllerIsNull: eval('controller === null'),
-  }));
-  assert.deepEqual(state, {
-    currentUser: null,
-    currentAppUsername: null,
-    currentUserEmail: '',
-    activeXAccount: null,
-    linkedAccounts: 0,
-    targetUrls: 0,
-    controllerIsNull: true,
-  });
-  assert.equal(await page.locator('.linked-account-item').count(), 0);
-  assert.equal(await page.locator('#run-url').inputValue(), '');
-  assert.deepEqual(pageErrors, []);
+  assert.equal(authorized.status, 400);
+  const authorizedBody = await authorized.json();
+  assert.equal(authorizedBody.ok, false);
 });
