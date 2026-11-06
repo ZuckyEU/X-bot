@@ -210,7 +210,8 @@
       .hidden { display: none !important; }
 
       /* --------------------------- app authentication --------------------- */
-      #auth-modal {
+      #auth-modal,
+      #x-credentials-modal {
         position: fixed;
         inset: 0;
         padding: 24px;
@@ -221,6 +222,7 @@
         overflow-y: auto;
         backdrop-filter: blur(8px);
       }
+      #x-credentials-modal { z-index: 1060; }
       .auth-modal {
         position: relative;
         width: min(430px, 100%);
@@ -292,8 +294,10 @@
         font-size: 12px;
       }
       .auth-error:empty { visibility: hidden; }
-      #auth-submit { width: 100%; padding: 11px 18px; }
-      body.auth-open { overflow: hidden; }
+      #auth-submit,
+      #x-credentials-submit { width: 100%; padding: 11px 18px; }
+      body.auth-open,
+      body.x-credentials-open { overflow: hidden; }
 
       /* --------------------------- remote X sign-in ----------------------- */
       #remote-login-modal {
@@ -410,7 +414,8 @@
         .file-row, .api-key-row { align-items: stretch; }
         .file-row button, .api-key-row button { flex: 1 1 auto; }
         .actions button { flex: 1 1 140px; }
-        #remote-login-modal { padding: 8px; }
+        #remote-login-modal,
+        #x-credentials-modal { padding: 8px; }
         .remote-login { max-height: calc(100vh - 16px); padding: 12px; }
         .remote-login-actions button, .remote-login-actions a.button { flex: 1 1 150px; }
       }
@@ -484,6 +489,33 @@
         <p class="remote-login-hint">
           Complete sign-in, 2FA, or any challenge in the remote browser. The dashboard saves the session automatically when X reaches the home timeline.
         </p>
+      </div>
+    </div>
+
+    <div id="x-credentials-modal" class="hidden" aria-hidden="true">
+      <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="x-credentials-title" aria-describedby="x-credentials-subtitle">
+        <button class="auth-close" id="x-credentials-close" type="button" aria-label="Close connect X account dialog">&times;</button>
+        <div class="auth-header">
+          <div class="auth-mark" aria-hidden="true">X</div>
+          <h2 class="auth-title" id="x-credentials-title">Connect X account</h2>
+          <p class="auth-subtitle" id="x-credentials-subtitle">The harvest service signs in once and returns a reusable session. Credentials are not stored.</p>
+        </div>
+        <form id="x-credentials-form" novalidate>
+          <div class="auth-field">
+            <label class="control-label" for="x-identifier">X username, email, or phone</label>
+            <input type="text" id="x-identifier" name="identifier" placeholder="@username or email" autocomplete="username" maxlength="254" required />
+          </div>
+          <div class="auth-field">
+            <label class="control-label" for="x-password">X password</label>
+            <input type="password" id="x-password" name="password" placeholder="At least 8 characters" autocomplete="current-password" minlength="8" maxlength="256" required />
+          </div>
+          <div class="auth-field">
+            <label class="control-label" for="x-2fa">2FA code <span style="text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label>
+            <input type="text" id="x-2fa" name="twoFactorCode" inputmode="numeric" pattern="[0-9]{6,10}" minlength="6" maxlength="10" placeholder="123456" autocomplete="one-time-code" />
+          </div>
+          <div class="auth-error" id="x-credentials-error" role="alert" aria-live="polite"></div>
+          <button type="submit" class="primary" id="x-credentials-submit">Connect account</button>
+        </form>
       </div>
     </div>
 
@@ -1142,11 +1174,92 @@
         }
       }
 
-      // Add new X account
+      // Connect a new X account through the Fly.io harvest service.
       function addXAccount() {
         closeAccountMenu();
-        const preparedWindow = prepareRemoteLoginWindow();
-        void connectX({ preparedWindow });
+        openXCredentialsModal();
+      }
+
+      function openXCredentialsModal() {
+        const modal = $('#x-credentials-modal');
+        modal.classList.remove('hidden');
+        modal.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('x-credentials-open');
+        $('#x-credentials-form').reset();
+        $('#x-credentials-error').textContent = '';
+        $('#x-credentials-submit').disabled = false;
+        $('#x-credentials-submit').textContent = 'Connect account';
+        $('#x-identifier').focus();
+      }
+
+      function closeXCredentialsModal() {
+        const modal = $('#x-credentials-modal');
+        modal.classList.add('hidden');
+        modal.setAttribute('aria-hidden', 'true');
+        document.body.classList.remove('x-credentials-open');
+        $('#x-password').value = '';
+        $('#x-2fa').value = '';
+        $('#x-credentials-error').textContent = '';
+      }
+
+      async function submitXCredentials(event) {
+        event.preventDefault();
+        const identifier = $('#x-identifier').value.trim();
+        const password = $('#x-password').value;
+        const twoFactorCode = $('#x-2fa').value.trim();
+        const errorBox = $('#x-credentials-error');
+        const submit = $('#x-credentials-submit');
+
+        if (!identifier) {
+          errorBox.textContent = 'Enter your X username, email, or phone number.';
+          $('#x-identifier').focus();
+          return;
+        }
+        if (password.length < 8) {
+          errorBox.textContent = 'X password must be between 8 and 256 characters.';
+          $('#x-password').focus();
+          return;
+        }
+        if (twoFactorCode && !/^\d{6,10}$/.test(twoFactorCode)) {
+          errorBox.textContent = '2FA code must be 6 to 10 digits.';
+          $('#x-2fa').focus();
+          return;
+        }
+
+        const generation = authStateGeneration;
+        errorBox.textContent = '';
+        submit.disabled = true;
+        submit.textContent = 'Connecting…';
+        setStatus('Running', 'info', 'Signing in to X and harvesting a reusable session…');
+
+        try {
+          const response = await fetch('/api/auth/x-accounts/harvest', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({
+              identifier,
+              password,
+              ...(twoFactorCode ? { twoFactorCode } : {}),
+            }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return;
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+          closeXCredentialsModal();
+          setText('auth-msg', `Connected @${data.username ?? data.activeXAccount ?? 'X account'}.`, 'ok');
+          setStatus('Connected', 'ok', 'X session harvested and saved.');
+          await loadAuth();
+        } catch (error) {
+          if (generation !== authStateGeneration) return;
+          errorBox.textContent = error.message;
+          setStatus('Connection failed', 'err', error.message);
+        } finally {
+          if (generation === authStateGeneration) {
+            submit.disabled = false;
+            submit.textContent = 'Connect account';
+          }
+        }
       }
 
       /* ------------------------------ auth state --------------------------- */
@@ -1156,6 +1269,7 @@
         controller?.abort();
         controller = null;
         closeRemoteLoginModal();
+        closeXCredentialsModal();
         stopElapsedTimer();
         batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
         targetUrls.length = 0;
@@ -1230,6 +1344,9 @@
         const clearGroqKeyBtn = $('#clear-groq-key');
         const remoteLoginOpenBtn = $('#remote-login-open');
         const remoteLoginCancelBtn = $('#remote-login-cancel');
+        const xCredentialsOverlay = $('#x-credentials-modal');
+        const xCredentialsClose = $('#x-credentials-close');
+        const xCredentialsForm = $('#x-credentials-form');
 
         signinBtn.addEventListener('click', (event) => {
           event.stopPropagation();
@@ -1247,6 +1364,16 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
+        xCredentialsClose.addEventListener('click', closeXCredentialsModal);
+        xCredentialsOverlay.addEventListener('click', (event) => {
+          if (event.target === xCredentialsOverlay) closeXCredentialsModal();
+        });
+        xCredentialsForm.addEventListener('submit', submitXCredentials);
+        document.addEventListener('keydown', (event) => {
+          if (event.key === 'Escape' && !xCredentialsOverlay.classList.contains('hidden')) {
+            closeXCredentialsModal();
+          }
+        });
         remoteLoginOpenBtn.addEventListener('click', (event) => {
           event.preventDefault();
           if (!remoteLoginUrl) {

@@ -115,9 +115,18 @@ Notes:
 
 ## X sign-in via the web UI (Connect X Account)
 
-**Connect X Account** starts an interactive Browserbase session immediately. The application never asks for or fills X credentials; enter the username, password, 2FA code, captcha, or other challenge directly in X's live remote browser at `https://x.com/i/flow/login`.
+**Connect X Account** opens a credential dialog in the dashboard. Enter the X username, email, or phone number, the X password, and an optional 2FA code. The dashboard sends them to `POST /api/auth/x-accounts/harvest`; the backend calls the Fly.io harvest service through `lib/harvest-client.js`, receives `auth_token` and `ct0`, writes `sessions/<userId>/<xUsername>.json`, links the account, and stages it as the active X session. The credentials are not persisted.
 
-`POST /auth/x` starts this interactive handoff and streams the live URL plus status events to the authenticated dashboard.
+Flow:
+
+1. The dashboard validates the form and posts `{ identifier, password, twoFactorCode? }` to `POST /api/auth/x-accounts/harvest`.
+2. The Render backend calls the Fly.io harvest service with the internal `HARVEST_API_TOKEN`; the service runs headless Playwright, signs in to X, and returns the two cookies.
+3. The backend validates the cookies, saves the account storage state under persistent `DATA_DIR`, updates `user-db.json`, and writes the active session to `auth.json`.
+4. The dashboard reloads `/api/auth` and shows the new account as connected.
+
+### Optional interactive Browserbase sign-in (`POST /auth/x`)
+
+The original interactive handoff remains available for cases where the automated harvest cannot complete (captcha, unusual challenge, etc.). `POST /auth/x` streams a Browserbase live URL plus status events to the authenticated dashboard, and the user finishes sign-in directly in the remote browser.
 
 Flow:
 
@@ -167,6 +176,7 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 | `GET /` | Dashboard UI from `public/index.html` |
 | `GET /api/auth` | JSON status: presence, masked preview, length, domain, flags (browser session) |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
+| `POST /api/auth/x-accounts/harvest` | Body `{"identifier": "…", "password": "…", "twoFactorCode": "…"}` — harvest and link an X account |
 | `POST /api/auth/logout` | Clear `auth.json` |
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |

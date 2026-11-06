@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -141,6 +142,33 @@ function xStorageState(username) {
       },
     ],
   };
+}
+
+async function startHarvestService(t, { status = 200, body } = {}) {
+  const calls = [];
+  const server = createHttpServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      calls.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body: raw ? JSON.parse(raw) : null,
+      });
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = server.address();
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  return { calls, url: `http://127.0.0.1:${port}/api/harvest-token` };
 }
 
 test('registration writes remain valid under concurrency and passwords use bcrypt', async (t) => {
@@ -320,6 +348,77 @@ test('X account deletion rejects traversal and restages the next active account'
     stat(join(dataDir, 'sessions', user.id, '_trusted-login-profile.json')),
     { code: 'ENOENT' },
   );
+});
+
+test('Connect X Account harvests cookies through the Fly service and links the account', async (t) => {
+  const harvest = await startHarvestService(t, {
+    body: {
+      ok: true,
+      username: 'carol',
+      cookies: [
+        { name: 'auth_token', value: 'carol_auth_token_value', domain: '.x.com', path: '/', secure: true, httpOnly: true },
+        { name: 'ct0', value: 'carol_csrf_token_value', domain: '.x.com', path: '/', secure: true, httpOnly: false },
+      ],
+    },
+  });
+  const harvestToken = 'test-harvest-token-1234567890abcdef';
+  const { baseUrl, dataDir } = await startServer(t, {
+    HARVEST_API_URL: harvest.url,
+    HARVEST_API_TOKEN: harvestToken,
+  });
+  const { cookie, body } = await register(baseUrl, 'harvest');
+
+  const unauthenticated = await fetch(`${baseUrl}/api/auth/x-accounts/harvest`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ identifier: 'carol@example.test', password: 'X-Password-123!' }),
+  });
+  assert.equal(unauthenticated.status, 401);
+  assert.equal(harvest.calls.length, 0);
+
+  const response = await fetch(`${baseUrl}/api/auth/x-accounts/harvest`, {
+    method: 'POST',
+    headers: jsonHeaders(cookie),
+    body: JSON.stringify({
+      identifier: 'carol@example.test',
+      password: 'X-Password-123!',
+      twoFactorCode: '123456',
+    }),
+  });
+  const result = await response.json();
+  assert.equal(response.status, 201, JSON.stringify(result));
+  assert.equal(result.ok, true);
+  assert.equal(result.username, 'carol');
+  assert.equal(result.activeXAccount, 'carol');
+  assert.deepEqual(result.accounts, [{ xUsername: 'carol', active: true, status: 'ready' }]);
+
+  assert.equal(harvest.calls.length, 1);
+  assert.equal(harvest.calls[0].method, 'POST');
+  assert.equal(harvest.calls[0].url, '/api/harvest-token');
+  assert.equal(harvest.calls[0].headers.authorization, `Bearer ${harvestToken}`);
+  assert.equal(harvest.calls[0].headers['content-type'], 'application/json');
+  assert.deepEqual(harvest.calls[0].body, {
+    identifier: 'carol@example.test',
+    password: 'X-Password-123!',
+    twoFactorCode: '123456',
+  });
+
+  const saved = JSON.parse(await readFile(join(dataDir, 'sessions', body.user.id, 'carol.json'), 'utf8'));
+  assert.equal(saved.username, 'carol');
+  assert.equal(saved.source, 'fly-harvest');
+  assert.deepEqual(saved.cookies.map((item) => item.name), ['auth_token', 'ct0']);
+  assert.equal(saved.cookies.find((item) => item.name === 'auth_token').httpOnly, true);
+  assert.equal(saved.cookies.find((item) => item.name === 'ct0').httpOnly, false);
+
+  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.equal(staged.username, 'carol');
+  assert.deepEqual(staged.cookies.map((item) => item.name), ['auth_token', 'ct0']);
+
+  const status = await fetch(`${baseUrl}/api/auth`, { headers: { cookie } });
+  const statusBody = await status.json();
+  assert.equal(statusBody.authenticated, true);
+  assert.equal(statusBody.username, 'carol');
+  assert.deepEqual(statusBody.xAccounts, ['carol']);
 });
 
 test('Groq status is masked and explicit deletion purges persisted state', async (t) => {
@@ -938,6 +1037,13 @@ test('production preflight and docs include the harvest API token', async () => 
   assert.match(envExample, /^HARVEST_API_TOKEN=/m);
   assert.match(readme, /POST \/api\/harvest-token/);
   assert.match(readme, /lib\/harvest-client\.js/);
+});
+
+test('dashboard connects X accounts through the harvest endpoint', async () => {
+  const html = await readFile(join(ROOT, 'public', 'index.html'), 'utf8');
+  assert.match(html, /id="x-credentials-form"/);
+  assert.match(html, /\/api\/auth\/x-accounts\/harvest/);
+  assert.match(html, /twoFactorCode/);
 });
 
 test('root serves the dashboard and X harvest authentication is enforced', async (t) => {

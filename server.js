@@ -27,15 +27,17 @@ import {
   X_LOGIN_URL,
   X_REFERER,
 } from './lib/browser.js';
+import { harvestXAccount } from './lib/harvest-client.js';
 
 /**
  * Local service for the X reply automation.
  *
  *   POST /api/auth/register, /api/auth/login -> persisted local user authentication
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
+ *   POST /api/auth/x-accounts/harvest -> Fly.io harvest sign-in -> sessions/<userId>/<xUsername>.json
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
- *   POST /auth/x     -> Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
+ *   POST /auth/x     -> optional Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
  *   POST /auth/x/cancel -> cancel the active remote sign-in and release Browserbase
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
@@ -572,6 +574,39 @@ function validateValue(name, value) {
   return trimmed;
 }
 
+/** Convert the Fly.io harvest response into a Playwright storage-state file. */
+function harvestedXStorageState({ username, cookies }) {
+  const normalized = [];
+  for (const cookie of Array.isArray(cookies) ? cookies : []) {
+    const name = String(cookie?.name ?? '');
+    if (!Object.hasOwn(COOKIE_SPEC, name)) continue;
+    const sameSite = ['Strict', 'Lax', 'None'].includes(cookie?.sameSite) ? cookie.sameSite : undefined;
+    normalized.push({
+      name,
+      value: validateValue(name, cookie?.value),
+      domain: '.x.com',
+      path: '/',
+      secure: cookie?.secure !== false,
+      httpOnly: cookie?.httpOnly ?? COOKIE_SPEC[name].httpOnly,
+      ...(sameSite ? { sameSite } : {}),
+    });
+  }
+
+  const names = new Set(normalized.map((cookie) => cookie.name));
+  if (!names.has(X_AUTH_COOKIE) || !names.has(X_CSRF_COOKIE)) {
+    throw new HttpError(502, `The harvest response did not include both ${X_AUTH_COOKIE} and ${X_CSRF_COOKIE}`);
+  }
+
+  return {
+    cookies: normalized,
+    origins: [],
+    username,
+    savedAt: new Date().toISOString(),
+    cookieCount: normalized.length,
+    source: 'fly-harvest',
+  };
+}
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -1022,6 +1057,105 @@ app.post('/api/auth/x-accounts', async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  }
+});
+
+// Connect and link an X account using the Fly.io harvest service.
+app.post('/api/auth/x-accounts/harvest', async (req, res, next) => {
+  try {
+    const auth = await authenticatedUser(req);
+    const body = req.body ?? {};
+    const identifier = String(body.identifier ?? body.username ?? '').trim();
+    const password = body.password;
+    const twoFactorCode = body.twoFactorCode ?? body.two_factor_code ?? null;
+
+    if (!identifier || identifier.length > 254) {
+      throw new ValidationError('A valid X username, email, or phone number is required');
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 256) {
+      throw new ValidationError('X password must be between 8 and 256 characters');
+    }
+    if (twoFactorCode !== null && (typeof twoFactorCode !== 'string' || !/^\d{6,10}$/.test(twoFactorCode))) {
+      throw new ValidationError('Two-factor code must be 6 to 10 digits');
+    }
+
+    normalizeUserAccounts(auth.user);
+    let identifierHandle = null;
+    try {
+      identifierHandle = normalizeXUsername(identifier);
+    } catch {
+      identifierHandle = null;
+    }
+    if (
+      auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
+      (!identifierHandle || !auth.user.xAccounts.includes(identifierHandle))
+    ) {
+      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+    }
+
+    let harvested;
+    try {
+      harvested = await harvestXAccount({
+        identifier,
+        password,
+        twoFactorCode: twoFactorCode || undefined,
+        token: HARVEST_API_TOKEN || undefined,
+        apiUrl: process.env.HARVEST_API_URL || undefined,
+      });
+    } catch (error) {
+      throw new HttpError(502, error?.message || 'X harvest failed');
+    }
+
+    let xUsername;
+    try {
+      xUsername = normalizeXUsername(harvested.username);
+    } catch {
+      try {
+        xUsername = normalizeXUsername(identifier);
+      } catch {
+        throw new HttpError(502, 'The harvest service did not return a valid X username');
+      }
+    }
+
+    const storageState = harvestedXStorageState({ username: xUsername, cookies: harvested.cookies });
+    const destination = sessionFileFor(auth.user.id, xUsername);
+
+    const user = await withWriteLock(async () => {
+      const users = await loadUserDb();
+      const current = users.find((candidate) => candidate.id === auth.user.id);
+      if (!current) throw new HttpError(401, 'User account no longer exists');
+      normalizeUserAccounts(current);
+
+      const alreadyLinked = current.xAccounts.includes(xUsername);
+      if (!alreadyLinked && current.xAccounts.length >= MAX_X_ACCOUNTS) {
+        throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+      }
+
+      await writeAuthFile(storageState, destination);
+      if (!alreadyLinked) current.xAccounts.push(xUsername);
+      current.preferences.defaultXAccount = xUsername;
+      await saveUserDb(users);
+      return current;
+    });
+
+    await stageActiveSession(user);
+
+    return res.status(201).json({
+      ok: true,
+      username: xUsername,
+      activeXAccount: user.preferences.defaultXAccount,
+      accounts: await accountSummaries(user),
+    });
+  } catch (error) {
+    next(error);
+  } finally {
+    if (req.body && typeof req.body === 'object') {
+      delete req.body.identifier;
+      delete req.body.username;
+      delete req.body.password;
+      delete req.body.twoFactorCode;
+      delete req.body.two_factor_code;
+    }
   }
 });
 
@@ -1512,6 +1646,17 @@ async function runAutomatedXLogin({ identifier, password, twoFactorCode = null, 
       throw new Error(login.timedOut ? 'X login timed out' : 'X login was not verified');
     }
 
+    const identity = await readSignedInUsername(page, signal);
+    let username = identity?.username ?? null;
+    if (!username) {
+      try {
+        username = normalizeXUsername(identifier);
+      } catch {
+        username = null;
+      }
+    }
+    if (!username) throw new Error('Could not determine the signed-in X username');
+
     const storageState = await context.storageState();
     const cookies = (storageState?.cookies ?? [])
       .filter((cookie) => cookie?.name === X_AUTH_COOKIE || cookie?.name === X_CSRF_COOKIE)
@@ -1524,7 +1669,7 @@ async function runAutomatedXLogin({ identifier, password, twoFactorCode = null, 
         httpOnly: Boolean(cookie.httpOnly),
       }));
 
-    return { ok: true, username: identifier, cookies };
+    return { ok: true, username, cookies };
   } finally {
     if (page) await page.close().catch(() => {});
     if (context) await context.close().catch(() => {});
@@ -2229,6 +2374,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/x-accounts (list saved X sessions)`);
+  console.log(`  POST ${HOST}:${PORT}/api/auth/x-accounts/harvest (harvest and link an X account)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/switch-account (select active X session)`);
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
