@@ -1554,7 +1554,7 @@ test('container exposes only the Fly.io app port and starts the supervised deskt
   assert.match(dockerfile, /^EXPOSE 3000$/m);
   assert.match(dockerfile, /^CMD \["\/usr\/local\/bin\/start-x-login"\]$/m);
   assert.match(dockerfile, /xvfb x11vnc novnc websockify openbox/);
-  assert.match(dockerfile, /ENTRYPOINT \["\/usr\/bin\/tini", "--"\]/);
+  assert.match(dockerfile, /ENTRYPOINT \["\/usr\/bin\/tini", "-s", "--"\]/);
   assert.equal((dockerfile.match(/^EXPOSE /gm) || []).length, 1);
   assert.match(server, /process\.env\.PORT \|\| 3000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);

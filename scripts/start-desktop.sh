@@ -20,11 +20,13 @@ install -d -m 750 -o root -g xbrowser /run/x-login-desktop
 install -d -m 700 -o xdesktop -g xbrowser /run/x-login-desktop/wm
 install -d -m 711 -o root -g root /run/x-login-browser
 touch "$XAUTHORITY"
-chown root:xbrowser "$XAUTHORITY"
-chmod 640 "$XAUTHORITY"
 cookie="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 xauth -f "$XAUTHORITY" add "$DISPLAY" . "$cookie"
 unset cookie
+# xauth replaces the file atomically with root-only access; restore the shared
+# browser/desktop group's read access only after the last write.
+chown root:xbrowser "$XAUTHORITY"
+chmod 640 "$XAUTHORITY"
 
 pids=()
 cleanup() {

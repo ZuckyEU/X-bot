@@ -423,6 +423,19 @@ test('Fly session routing replays to the owning Machine without accepting header
   routing({ originalUrl: '/session?machine=bad%0D%0Aheader' }, response, (error) => assert.equal(error.status, 400));
 });
 
+test('desktop restores Xauthority group access after the atomic xauth write', async () => {
+  const startup = await readFile(join(ROOT, 'scripts', 'start-desktop.sh'), 'utf8');
+  const write = startup.indexOf('xauth -f "$XAUTHORITY" add ');
+  const ownership = startup.indexOf('chown root:xbrowser "$XAUTHORITY"');
+  const permissions = startup.indexOf('chmod 640 "$XAUTHORITY"');
+  const displayStart = startup.indexOf('env -i PATH="$SERVICE_PATH" Xvfb ');
+
+  assert.notEqual(write, -1);
+  assert.ok(ownership > write, 'Restore group ownership after xauth replaces the file');
+  assert.ok(permissions > ownership, 'Restore group read access after the write');
+  assert.ok(displayStart > permissions, 'Finalize restricted access before starting the display');
+});
+
 test('container privacy and lifetime settings are explicit, and the dashboard script parses', async () => {
   const [dockerfile, startup, worker, fly, html, viewer] = await Promise.all([
     readFile(join(ROOT, 'Dockerfile'), 'utf8'), readFile(join(ROOT, 'scripts', 'start-desktop.sh'), 'utf8'),

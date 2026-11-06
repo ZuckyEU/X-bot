@@ -36,5 +36,6 @@ ENV DISPLAY=:99
 # VNC (5900) and websockify (6080) bind ONLY to loopback; Node gates access.
 EXPOSE 3000
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Fly's init owns PID 1; subreaper mode still collects orphaned desktop children.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["/usr/local/bin/start-x-login"]
