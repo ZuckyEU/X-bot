@@ -153,18 +153,18 @@ The optional `BROWSERBASE_LIVE_TIMEOUT_MS` environment variable controls how lon
 
 The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, writes `auth.json`).
 
-## Session API (server.js)
+## Session dashboard and API (server.js)
 
 ```powershell
-npm run serve            # API on http://127.0.0.1:10000
+npm run serve            # dashboard + API on http://127.0.0.1:10000
 $env:PORT=4000; npm run serve
 ```
 
-The server is API-only. `GET /` returns `404`; `public/index.html` is retained for reference but is not served.
+The dashboard is served from `public/index.html` at `/`. All API routes remain under `/api` and are unaffected by static file serving.
 
 | Route | Purpose |
 |---|---|
-| `GET /` | `404` — API-only service (no HTML dashboard) |
+| `GET /` | Dashboard UI from `public/index.html` |
 | `GET /api/auth` | JSON status: presence, masked preview, length, domain, flags (browser session) |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
 | `POST /api/auth/logout` | Clear `auth.json` |

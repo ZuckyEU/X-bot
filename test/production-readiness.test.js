@@ -940,12 +940,20 @@ test('production preflight and docs include the harvest API token', async () => 
   assert.match(readme, /lib\/harvest-client\.js/);
 });
 
-test('API-only root and X harvest authentication are enforced', async (t) => {
+test('root serves the dashboard and X harvest authentication is enforced', async (t) => {
   const { baseUrl } = await startServer(t, { HARVEST_API_TOKEN: 'harvest-test-token-123' });
 
   const root = await fetch(`${baseUrl}/`);
-  assert.equal(root.status, 404);
-  assert.deepEqual(await root.json(), { error: 'Not found' });
+  assert.equal(root.status, 200);
+  assert.match(root.headers.get('content-type') ?? '', /text\/html/);
+  assert.match(await root.text(), /<title>X automation console<\/title>/);
+
+  const index = await fetch(`${baseUrl}/index.html`);
+  assert.equal(index.status, 200);
+
+  const missingApi = await fetch(`${baseUrl}/api/does-not-exist`);
+  assert.equal(missingApi.status, 404);
+  assert.deepEqual(await missingApi.json(), { error: 'No route for GET /api/does-not-exist' });
 
   const unauthorized = await fetch(`${baseUrl}/api/harvest-token`, {
     method: 'POST',

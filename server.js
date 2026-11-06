@@ -46,6 +46,8 @@ import {
  */
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = join(ROOT, 'public');
+const INDEX_FILE = join(PUBLIC_DIR, 'index.html');
 const DATA_DIR = resolve(process.env.DATA_DIR || ROOT);
 const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
@@ -2178,13 +2180,17 @@ app.post('/api/run', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  res.status(404).json({ error: 'Not found' });
+app.get('/', (req, res, next) => {
+  res.sendFile(INDEX_FILE, (error) => {
+    if (error) next(error);
+  });
 });
 
 app.use('/api', (req, res) => {
   res.status(404).json({ error: `No route for ${req.method} ${req.originalUrl}` });
 });
+
+app.use(express.static(PUBLIC_DIR, { index: 'index.html' }));
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
 
