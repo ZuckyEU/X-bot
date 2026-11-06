@@ -11,7 +11,7 @@
     "serve": "node server.js",
     "check:prod": "node scripts/check-prod.js",
     "test": "node --test \"test/*.test.js\"",
-    "test:ui": "node --test test/interactive-dashboard.browser.js"
+    "test:ui": "node --test test/session-import-dashboard.browser.js"
   },
   "keywords": [
     "playwright",

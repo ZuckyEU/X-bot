@@ -90,7 +90,7 @@
       .options label { display: inline-flex; gap: 8px; align-items: center; cursor: pointer; }
       .options input { accent-color: var(--accent); }
 
-      button, a.button {
+      button {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -109,13 +109,13 @@
         cursor: pointer;
         transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
       }
-      button:hover:not(:disabled), a.button:hover { transform: translateY(-1px); }
-      button:focus-visible, a.button:focus-visible { outline: 2px solid var(--accent-hover); outline-offset: 2px; }
-      button.ghost, a.button.ghost { background: #151b24; color: var(--text-soft); font-weight: 600; border-color: var(--border); }
-      button.ghost:hover:not(:disabled), a.button.ghost:hover { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
+      button:hover:not(:disabled) { transform: translateY(-1px); }
+      button:focus-visible { outline: 2px solid var(--accent-hover); outline-offset: 2px; }
+      button.ghost { background: #151b24; color: var(--text-soft); font-weight: 600; border-color: var(--border); }
+      button.ghost:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
       button.primary { background: var(--accent); border-color: #639bff; box-shadow: 0 8px 24px rgba(24, 91, 214, 0.22); }
       button.primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 10px 28px rgba(24, 91, 214, 0.3); }
-      button:disabled, a.button.is-disabled { opacity: 0.5; cursor: default; pointer-events: none; }
+      button:disabled { opacity: 0.5; cursor: default; pointer-events: none; }
 
       #msg { font-size: 13px; color: var(--muted); }
       #msg.ok { color: var(--ok); }
@@ -295,8 +295,8 @@
       #auth-submit { width: 100%; padding: 11px 18px; }
       body.auth-open { overflow: hidden; }
 
-      /* --------------------------- remote X sign-in ----------------------- */
-      #remote-login-modal {
+      /* --------------------------- manual X session import ---------------- */
+      #session-import-modal {
         position: fixed;
         inset: 0;
         padding: 24px;
@@ -307,9 +307,10 @@
         overflow-y: auto;
         backdrop-filter: blur(8px);
       }
-      .remote-login {
+      .session-import {
         width: min(560px, 100%);
         max-height: calc(100vh - 48px);
+        overflow-y: auto;
         display: flex;
         flex-direction: column;
         gap: 12px;
@@ -319,40 +320,25 @@
         border-radius: 9px;
         box-shadow: 0 24px 80px rgba(0, 0, 0, 0.72);
       }
-      .remote-login-head {
+      .session-import-head {
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
         gap: 16px;
       }
-      .remote-login-head h2 { margin: 0; font-size: 18px; letter-spacing: -0.01em; }
-      .remote-login-head p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
-      .remote-login-body {
-        position: relative;
-        flex: 1 1 auto;
-        min-height: 160px;
-        overflow: hidden;
-        border: 1px solid var(--border);
-        border-radius: 7px;
-        background: #05070a;
-      }
-      .remote-login-empty {
-        min-height: 160px;
-        display: grid;
-        place-items: center;
-        padding: 32px;
-        color: var(--muted);
-        text-align: center;
-        font-size: 13px;
-      }
-      .remote-login-actions {
+      .session-import-head h2 { margin: 0; font-size: 18px; letter-spacing: -0.01em; }
+      .session-import-head p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+      .session-import-help { color: var(--text-soft); font-size: 12px; }
+      .session-import-help summary { cursor: pointer; }
+      .session-import-help ol { padding-left: 20px; }
+      .session-import-actions {
         display: flex;
         gap: 10px;
         justify-content: flex-end;
         flex-wrap: wrap;
       }
-      .remote-login-hint { margin: 0; color: var(--muted); font-size: 11px; }
-      body.remote-open { overflow: hidden; }
+      .session-import-hint { margin: 0; color: var(--muted); font-size: 12px; }
+      body.import-open { overflow: hidden; }
 
       .panel { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(17, 23, 32, 0.98), rgba(11, 15, 21, 0.98)); padding: 20px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.025); }
       .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
@@ -410,9 +396,9 @@
         .file-row, .api-key-row { align-items: stretch; }
         .file-row button, .api-key-row button { flex: 1 1 auto; }
         .actions button { flex: 1 1 140px; }
-        #remote-login-modal { padding: 8px; }
-        .remote-login { max-height: calc(100vh - 16px); padding: 12px; }
-        .remote-login-actions button, .remote-login-actions a.button { flex: 1 1 150px; }
+        #session-import-modal { padding: 8px; }
+        .session-import { max-height: calc(100vh - 16px); padding: 16px; }
+        .session-import-actions button { flex: 1 1 150px; }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -464,26 +450,45 @@
       </div>
     </div>
 
-    <div id="remote-login-modal" class="hidden" aria-hidden="true">
-      <div class="remote-login" role="dialog" aria-modal="true" aria-labelledby="remote-login-title" aria-describedby="remote-login-status">
-        <div class="remote-login-head">
+    <div id="session-import-modal" class="hidden" aria-hidden="true">
+      <div class="session-import" role="dialog" aria-modal="true" aria-labelledby="session-import-title" aria-describedby="session-import-hint">
+        <div class="session-import-head">
           <div>
-            <h2 id="remote-login-title">Remote X sign-in</h2>
-            <p id="remote-login-status" aria-live="polite">Preparing the Fly remote browser…</p>
+            <h2 id="session-import-title">Import X session</h2>
+            <p>Connect an account using cookies from your signed-in browser.</p>
           </div>
-          <button id="remote-login-cancel" class="ghost" type="button">Cancel</button>
+          <button id="session-import-close" class="ghost" type="button" aria-label="Close session import">Close</button>
         </div>
-        <div class="remote-login-body">
-          <div id="remote-login-empty" class="remote-login-empty">
-            Waiting for the remote browser window…
-          </div>
-        </div>
-        <div class="remote-login-actions">
-          <a id="remote-login-open" class="button ghost is-disabled" href="#" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" role="button" aria-disabled="true">Open Remote Sign-In Window</a>
-        </div>
-        <p class="remote-login-hint">
-          Enter your credentials, 2FA, or any challenge only on the official X page in the remote browser. This app stores the resulting session cookies to use your X account. Do not share the temporary sign-in URL.
+        <p id="session-import-hint" class="session-import-hint">
+          These cookies grant access to your X account. Only import accounts you own or are authorized to manage. Values are stored privately on the server, not in browser storage.
         </p>
+        <details class="session-import-help">
+          <summary>Where do I find these cookies?</summary>
+          <ol>
+            <li>Sign in to the matching account on <strong>x.com</strong> in your own browser.</li>
+            <li>Open Developer Tools → Application (or Storage) → Cookies → <strong>https://x.com</strong>.</li>
+            <li>Copy the <strong>Value</strong> of <code>auth_token</code> and <code>ct0</code>. Paste only the values below, not a full cookie header.</li>
+          </ol>
+          <p>Both cookies must come from the same account. Imports do not check validity with X; expired or revoked cookies need to be replaced.</p>
+        </details>
+        <form id="session-import-form" autocomplete="off">
+          <div class="auth-field">
+            <label class="control-label" for="session-handle">X handle</label>
+            <input id="session-handle" name="handle" type="text" placeholder="@your_handle" required maxlength="16" pattern="@?[A-Za-z0-9_]{1,15}" autocapitalize="none" spellcheck="false" />
+          </div>
+          <div class="auth-field">
+            <label class="control-label" for="session-auth-token">auth_token</label>
+            <input id="session-auth-token" name="auth_token" type="password" placeholder="Paste auth_token value" required minlength="8" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" />
+          </div>
+          <div class="auth-field">
+            <label class="control-label" for="session-ct0">ct0</label>
+            <input id="session-ct0" name="ct0" type="password" placeholder="Paste ct0 value" required minlength="8" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" />
+          </div>
+          <div id="session-import-error" class="auth-error" role="alert" aria-live="polite"></div>
+          <div class="session-import-actions">
+            <button id="session-import-submit" class="primary" type="submit">Import &amp; activate account</button>
+          </div>
+        </form>
       </div>
     </div>
 
@@ -645,9 +650,8 @@
       let elapsedStartedAt = null;
       let elapsedMilliseconds = 0;
       let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
-      let remoteLoginUrl = null;
-      let remoteLoginRequestId = null;
-      let remoteCancelInFlight = false;
+      let sessionImportRequest = null;
+      let sessionImportReturnFocus = null;
       const targetUrls = [];
 
       // Authentication is cookie-only; remove tokens left by older UI versions.
@@ -792,150 +796,43 @@
         document.body.classList.remove('auth-open');
       }
 
-      /* ------------------------- remote X sign-in ------------------------- */
+      /* ------------------------- manual X session import ------------------ */
 
-      function prepareRemoteLoginWindow() {
-        const popup = window.open('about:blank', '_blank');
-        if (!popup) return null;
-        try {
-          popup.opener = null;
-          popup.document.title = 'Preparing remote X sign-in…';
-          popup.document.body.textContent = 'Preparing the secure remote X sign-in window…';
-          popup.document.body.style.cssText = 'margin:0;padding:32px;background:#07090d;color:#cbd5e1;font:14px system-ui,sans-serif';
-        } catch {
-          // Navigation may have started before the placeholder was painted.
+      function setSessionImportBusy(busy) {
+        $('session-import-form').setAttribute('aria-busy', String(busy));
+        for (const id of ['session-handle', 'session-auth-token', 'session-ct0', 'session-import-submit']) {
+          $(id).disabled = busy;
         }
-        return popup;
+        $('session-import-submit').textContent = busy ? 'Importing…' : 'Import & activate account';
+        $('add-x-account').disabled = busy || Boolean(controller);
+        $('run').disabled = busy || Boolean(controller);
+        $('dry-run-btn').disabled = busy || Boolean(controller);
       }
 
-      function launchRemoteLoginWindow(url, preparedWindow = null) {
-        const popup = preparedWindow && !preparedWindow.closed
-          ? preparedWindow : prepareRemoteLoginWindow();
-        if (!popup) return false;
-        try {
-          popup.location.replace(url);
-          return true;
-        } catch {
-          closeUnusedRemoteWindow(popup, false);
-          return false;
-        }
+      function openSessionImport() {
+        if (!currentAppUsername) return showAuthOverlay();
+        if (controller || sessionImportRequest) return;
+        sessionImportReturnFocus = $('account-chip');
+        $('session-import-form').reset();
+        $('session-import-error').textContent = '';
+        setSessionImportBusy(false);
+        $('session-import-modal').classList.remove('hidden');
+        $('session-import-modal').setAttribute('aria-hidden', 'false');
+        document.body.classList.add('import-open');
+        $('session-handle').focus();
       }
 
-      function closeUnusedRemoteWindow(preparedWindow, launched) {
-        if (!launched && preparedWindow && !preparedWindow.closed) {
-          try {
-            preparedWindow.close();
-          } catch {
-            // The user may already have closed it.
-          }
-        }
-      }
-
-      function setRemoteLoginStatus(message) {
-        const status = $('#remote-login-status');
-        if (status) status.textContent = String(message ?? '');
-      }
-
-      function setRemoteLoginOpenState(url) {
-        const link = $('#remote-login-open');
-        if (!link) return;
-        if (url) {
-          link.href = url;
-          link.target = '_blank';
-          link.rel = 'noopener noreferrer';
-          link.classList.remove('is-disabled');
-          link.setAttribute('aria-disabled', 'false');
-        } else {
-          link.href = '#';
-          link.classList.add('is-disabled');
-          link.setAttribute('aria-disabled', 'true');
-        }
-      }
-
-      function openRemoteLoginModal() {
-        const modal = $('#remote-login-modal');
-        if (!modal) return;
-        modal.classList.remove('hidden');
-        modal.setAttribute('aria-hidden', 'false');
-        document.body.classList.add('remote-open');
-        remoteLoginUrl = null;
-        remoteLoginRequestId = null;
-
-        $('#remote-login-empty').textContent = 'Waiting for the remote browser window…';
-        setRemoteLoginOpenState(null);
-        $('#remote-login-cancel').disabled = false;
-        setRemoteLoginStatus('Preparing the remote browser…');
-      }
-
-      function closeRemoteLoginModal() {
-        const modal = $('#remote-login-modal');
-        if (!modal) return;
-        modal.classList.add('hidden');
-        modal.setAttribute('aria-hidden', 'true');
-        document.body.classList.remove('remote-open');
-        remoteLoginUrl = null;
-        remoteLoginRequestId = null;
-        setRemoteLoginOpenState(null);
-        $('#remote-login-cancel').disabled = false;
-      }
-
-      function setRemoteLoginUrl(url, expiresAt) {
-        remoteLoginUrl = url;
-        setRemoteLoginOpenState(url);
-
-        const expiry = expiresAt ? new Date(expiresAt) : null;
-        const expiryText = expiry && !Number.isNaN(expiry.getTime())
-          ? ` Link expires at ${expiry.toLocaleTimeString()}.`
-          : '';
-        $('#remote-login-empty').textContent = 'Remote browser ready. Open it in a new tab to finish sign-in.';
-        setRemoteLoginStatus(`Remote window ready.${expiryText} Sign in there; saving is automatic.`);
-      }
-
-      async function cancelRemoteSignIn() {
-        if (remoteCancelInFlight) return;
-        const generation = authStateGeneration;
-        const cancelledRequest = controller;
-        const requestId = remoteLoginRequestId;
-        remoteCancelInFlight = true;
-        cancelledRequest?.abort();
-        let notice = 'The remote sign-in was stopped.';
-        let completed = false;
-
-        const button = $('#remote-login-cancel');
-        if (button) button.disabled = true;
-        setRemoteLoginStatus('Cancelling the remote sign-in…');
-
-        try {
-          const response = await fetch('/auth/x/cancel', {
-            method: 'POST',
-            headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify(requestId ? { requestId } : {}),
-            signal: AbortSignal.timeout(30_000),
-          });
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-          if (data.closed === false) notice = 'Close could not be confirmed. Access expires automatically; try a new login shortly.';
-          completed = data.status === 'completed';
-        } catch (error) {
-          notice = `Cancel could not be confirmed: ${error.message}. Access still expires automatically.`;
-        } finally {
-          remoteCancelInFlight = false;
-          if (generation === authStateGeneration && controller === cancelledRequest) {
-            controller = null;
-            closeRemoteLoginModal();
-            $('signin').disabled = false;
-            $('add-x-account').disabled = false;
-            if (completed) {
-              await loadAuth();
-              if (generation !== authStateGeneration) return;
-              setStatus('Connected', 'ok', 'The login was already saved before cancellation.');
-              setText('auth-msg', 'X account connected.', 'ok');
-            } else {
-              setStatus('Sign-in cancelled', 'warn', notice);
-              setText('auth-msg', notice, 'warn');
-            }
-          }
-        }
+      function closeSessionImport({ restoreFocus = true } = {}) {
+        sessionImportRequest?.abort();
+        sessionImportRequest = null;
+        $('session-import-modal').classList.add('hidden');
+        $('session-import-modal').setAttribute('aria-hidden', 'true');
+        document.body.classList.remove('import-open');
+        $('session-import-form').reset();
+        $('session-import-error').textContent = '';
+        setSessionImportBusy(false);
+        if (restoreFocus) sessionImportReturnFocus?.focus();
+        sessionImportReturnFocus = null;
       }
 
       // Toggle between sign in and sign up
@@ -1166,95 +1063,62 @@
         }
       }
 
-      // Credentials are entered on X itself, never into a dashboard form.
       function addXAccount() {
         closeAccountMenu();
-        if (controller) return;
-        void connectInteractiveX({ preparedWindow: prepareRemoteLoginWindow() });
+        openSessionImport();
       }
 
-      async function connectInteractiveX({ preparedWindow = null } = {}) {
+      async function importSession(event) {
+        event.preventDefault();
+        if (controller || sessionImportRequest) return;
         const generation = authStateGeneration;
         const request = new AbortController();
-        const requestId = crypto.randomUUID();
-        controller = request;
-        let launched = false;
-        let completed = false;
-        $('signin').disabled = true;
-        $('add-x-account').disabled = true;
-        openRemoteLoginModal();
-        remoteLoginRequestId = requestId;
-        setStatus('Running', 'info', 'Preparing the Fly noVNC sign-in window…');
+        sessionImportRequest = request;
+        const payload = JSON.stringify({
+          handle: $('session-handle').value.trim(),
+          auth_token: $('session-auth-token').value.trim(),
+          ct0: $('session-ct0').value.trim(),
+        });
+        // Keep pasted secrets out of the DOM once the request starts.
+        $('session-auth-token').value = '';
+        $('session-ct0').value = '';
+        $('session-import-error').textContent = '';
+        setSessionImportBusy(true);
         try {
-          const response = await fetch('/api/auth/x-accounts/interactive', {
+          const response = await fetch('/api/auth/import-session', {
             method: 'POST',
             headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({ requestId }),
-            signal: request.signal,
+            credentials: 'same-origin',
+            body: payload,
+            signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]),
           });
           const data = await response.json().catch(() => ({}));
-          if (generation !== authStateGeneration) return;
+          if (generation !== authStateGeneration || sessionImportRequest !== request) return;
           request.signal.throwIfAborted();
-          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-          setRemoteLoginUrl(data.viewerUrl, data.expiresAt);
-          launched = launchRemoteLoginWindow(data.viewerUrl, preparedWindow);
-          if (!launched) setRemoteLoginStatus('Popup blocked. Click Open Remote Sign-In Window to continue.');
-          const messages = {
-            starting: 'Starting headed Chromium on Fly…',
-            waiting: 'Sign in on the official X page in the remote window. 2FA and challenges are interactive.',
-            capturing: 'X login detected. Verifying the account and capturing its session…',
-            delivering: 'Saving the X session to your Render account…',
-          };
-          while (!request.signal.aborted && generation === authStateGeneration) {
-            const poll = await fetch(`/api/auth/x-accounts/interactive/${encodeURIComponent(data.requestId)}`, {
-              headers: appSessionHeaders(),
-              signal: AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]),
-            });
-            const state = await poll.json().catch(() => ({}));
-            if (generation !== authStateGeneration) return;
-            request.signal.throwIfAborted();
-            if (!poll.ok) throw new Error(state.error ?? `HTTP ${poll.status}`);
-            if (state.status === 'completed') {
-              completed = true;
-              applyLinkedAccounts(state.accounts, state.activeXAccount);
-              setText('auth-msg', `Connected @${state.username}.`, 'ok');
-              setStatus('Connected', 'ok', 'X session saved securely to your account.');
-              await loadAuth();
-              return;
-            }
-            if (['failed', 'cancelled', 'expired'].includes(state.status)) {
-              throw new Error(state.error ?? 'Remote sign-in ended. Start a new session.');
-            }
-            if (launched) setRemoteLoginStatus(messages[state.status] ?? 'Waiting for remote sign-in…');
-            await new Promise((resolve) => {
-              const done = () => { clearTimeout(timer); request.signal.removeEventListener('abort', done); resolve(); };
-              const timer = setTimeout(done, 2_000);
-              request.signal.addEventListener('abort', done, { once: true });
-              if (request.signal.aborted) done();
-            });
+          if (response.status === 401) {
+            resetSignedOutState();
+            showAuthOverlay();
+            setText('auth-msg', 'Your app session expired. Sign in before importing cookies.', 'warn');
+            return;
           }
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          applyLinkedAccounts(data.accounts, data.activeXAccount);
+          closeSessionImport();
+          setText('auth-msg', `Imported session for @${data.username}.`, 'ok');
+          setStatus('Session imported', 'ok', 'The account is active. X will check the cookies when the bot runs.');
         } catch (error) {
-          if (generation !== authStateGeneration) return;
+          if (generation !== authStateGeneration || sessionImportRequest !== request) return;
           if (error.name !== 'AbortError') {
-            setText('auth-msg', `Could not connect X: ${error.message}`, 'err');
-            setStatus('Connection failed', 'err', error.message);
+            const message = error.name === 'TimeoutError'
+              ? 'Import timed out. Check the account list before retrying.'
+              : error.message;
+            $('session-import-error').textContent = message;
+            setStatus('Import failed', 'err', message);
           }
         } finally {
-          closeUnusedRemoteWindow(preparedWindow, launched);
-          if (generation === authStateGeneration && controller === request && !remoteCancelInFlight) {
-            if (!completed && !request.signal.aborted) {
-              await fetch('/auth/x/cancel', {
-                method: 'POST',
-                headers: appSessionHeaders({ 'content-type': 'application/json' }),
-                body: JSON.stringify({ requestId }),
-                signal: AbortSignal.timeout(30_000),
-              }).catch(() => {});
-            }
-            if (generation !== authStateGeneration || controller !== request) return;
-            if (controller === request) controller = null;
-            closeRemoteLoginModal();
-            $('signin').disabled = false;
-            $('add-x-account').disabled = false;
+          if (generation === authStateGeneration && sessionImportRequest === request) {
+            sessionImportRequest = null;
+            setSessionImportBusy(false);
           }
         }
       }
@@ -1265,7 +1129,7 @@
         authStateGeneration += 1;
         controller?.abort();
         controller = null;
-        closeRemoteLoginModal();
+        closeSessionImport({ restoreFocus: false });
         stopElapsedTimer();
         batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
         targetUrls.length = 0;
@@ -1340,8 +1204,7 @@
         const addXAccountBtn = $('#add-x-account');
         const saveGroqKeyBtn = $('#save-groq-key');
         const clearGroqKeyBtn = $('#clear-groq-key');
-        const remoteLoginOpenBtn = $('#remote-login-open');
-        const remoteLoginCancelBtn = $('#remote-login-cancel');
+        const sessionImportModal = $('session-import-modal');
 
         signinBtn.addEventListener('click', (event) => {
           event.stopPropagation();
@@ -1359,17 +1222,30 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
+        $('session-import-form').addEventListener('submit', importSession);
+        $('session-import-close').addEventListener('click', () => closeSessionImport());
+        window.addEventListener('pagehide', () => closeSessionImport({ restoreFocus: false }));
+        sessionImportModal.addEventListener('click', (event) => {
+          if (event.target === sessionImportModal) closeSessionImport();
+        });
         document.addEventListener('keydown', (event) => {
-          if (event.key === 'Escape' && !$('#remote-login-modal').classList.contains('hidden')) void cancelRemoteSignIn();
-        });
-        remoteLoginOpenBtn.addEventListener('click', (event) => {
-          event.preventDefault();
-          if (!remoteLoginUrl) {
-            return;
+          if (sessionImportModal.classList.contains('hidden')) return;
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            closeSessionImport();
+          } else if (event.key === 'Tab') {
+            const controls = [...sessionImportModal.querySelectorAll('button:not(:disabled), input:not(:disabled), summary')];
+            const first = controls[0];
+            const last = controls[controls.length - 1];
+            if (event.shiftKey && (document.activeElement === first || !sessionImportModal.contains(document.activeElement))) {
+              event.preventDefault();
+              last.focus();
+            } else if (!event.shiftKey && (document.activeElement === last || !sessionImportModal.contains(document.activeElement))) {
+              event.preventDefault();
+              first.focus();
+            }
           }
-          window.open(remoteLoginUrl, '_blank', 'noopener,noreferrer');
         });
-        remoteLoginCancelBtn.addEventListener('click', cancelRemoteSignIn);
         if (saveGroqKeyBtn) {
           saveGroqKeyBtn.addEventListener('click', saveGroqApiKey);
         }
@@ -1413,98 +1289,6 @@
         if (auth) window.history.replaceState(null, '', window.location.pathname);
       }
 
-      /* ------------------------------ sign-in ----------------------------- */
-
-      async function connectX({ preparedWindow = null } = {}) {
-        let remoteWindowLaunched = false;
-        controller = new AbortController();
-        $('signin').disabled = true;
-        $('add-x-account').disabled = true;
-        openRemoteLoginModal();
-        setStatus('Running', 'info', 'Waiting for the remote browser sign-in window…');
-        setText('auth-msg', 'Waiting for the remote browser sign-in window…');
-        setText('config-hint', '');
-        $('run-msg').textContent = '';
-
-        try {
-          const response = await fetch('/auth/x', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({}),
-            signal: controller.signal,
-          });
-
-          if (!response.ok) {
-            const data = await response.json().catch(() => ({}));
-            throw new Error(data.error ?? `HTTP ${response.status}`);
-          }
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-
-          for (;;) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let newline;
-            while ((newline = buffer.indexOf('\n')) >= 0) {
-              const raw = buffer.slice(0, newline).trim();
-              buffer = buffer.slice(newline + 1);
-              if (!raw) continue;
-              try {
-                const event = JSON.parse(raw);
-                if (event.type === 'live') {
-                  if (event.status === 'ready' && event.url) {
-                    setRemoteLoginUrl(event.url, event.expiresAt);
-                    remoteWindowLaunched = launchRemoteLoginWindow(event.url, preparedWindow);
-                    if (remoteWindowLaunched) {
-                      setRemoteLoginStatus('Remote sign-in opened in a new tab. Finish there; saving is automatic.');
-                      setStatus('Running', 'info', 'Remote sign-in opened in a new tab.');
-                    } else {
-                      setRemoteLoginStatus('Your browser blocked the new tab. Click Open Remote Sign-In Window.');
-                      setStatus('Running', 'warn', 'Click Open Remote Sign-In Window to continue.');
-                    }
-                  } else if (event.status === 'error') {
-                    closeUnusedRemoteWindow(preparedWindow, remoteWindowLaunched);
-                    preparedWindow = null;
-                    const message = event.message ?? 'The remote sign-in window is unavailable.';
-                    setRemoteLoginStatus(`${message} You can use the Browserbase dashboard; saving remains automatic.`);
-                    $('#remote-login-empty').textContent = `${message} You can use the Browserbase dashboard; saving remains automatic.`;
-                    setStatus('Running', 'warn', 'Remote sign-in window unavailable.');
-                  }
-                } else if (event.type === 'status') {
-                  setRemoteLoginStatus(event.data);
-                  setStatus('Running', 'info', event.data);
-                } else if (event.type === 'stderr') {
-                  setText('auth-msg', event.data, 'err');
-                  setRemoteLoginStatus(event.data);
-                  setStatus('Running', 'warn', event.data);
-                } else if (event.type === 'exit') {
-                  const ok = event.code === 0;
-                  setStatus(ok ? 'Signed in successfully' : 'Sign-in failed', ok ? 'ok' : 'err', ok ? `Saved ${event.result?.cookieCount ?? 0} cookies.` : `Exit ${event.code ?? ''}`);
-                  if (ok) {
-                    setText('auth-msg', 'Signed in — cookies saved for this account.', 'ok');
-                    await loadAuth();
-                  }
-                }
-              } catch {
-                /* raw log lines are no longer rendered */
-              }
-            }
-          }
-        } catch (error) {
-          if (error.name === 'AbortError') setStatus('Sign-in stopped', 'warn', 'Stopped by user.');
-          else setStatus('Sign-in failed', 'err', error.message);
-        } finally {
-          closeUnusedRemoteWindow(preparedWindow, remoteWindowLaunched);
-          controller = null;
-          closeRemoteLoginModal();
-          $('signin').disabled = false;
-          $('add-x-account').disabled = false;
-        }
-      }
-
       $('account-chip').addEventListener('click', (event) => {
         event.stopPropagation();
         const dd = $('account-dropdown');
@@ -1531,7 +1315,7 @@
         authStateGeneration += 1;
         controller?.abort();
         controller = null;
-        closeRemoteLoginModal();
+        closeSessionImport({ restoreFocus: false });
         try {
           const response = await fetch('/api/auth/logout', {
             method: 'POST',
@@ -1610,6 +1394,7 @@
         $('save-groq-key').disabled = running;
         $('clear-groq-key').disabled = running || !groqConfigured;
         $('stop').disabled = !running;
+        $('add-x-account').disabled = running || Boolean(sessionImportRequest);
       }
 
       function setDraft(data) {
@@ -1712,6 +1497,8 @@
       }
 
       async function startRun(dryRun) {
+        if (controller || sessionImportRequest) return;
+        const generation = authStateGeneration;
         syncTargetUrlsFromInput();
         const urls = [...targetUrls];
         const url = urls[0] ?? '';
@@ -1725,6 +1512,7 @@
         else startElapsedTimer();
 
         const groqConfiguration = await loadGroqConfiguration();
+        if (generation !== authStateGeneration || controller || sessionImportRequest) return;
         if (!groqConfiguration?.configured) {
           stopElapsedTimer();
           setStatus('Groq key required', 'err', 'Save a session API key in the dashboard.');

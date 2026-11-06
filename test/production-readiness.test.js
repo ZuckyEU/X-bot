@@ -3,14 +3,12 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import bcrypt from 'bcrypt';
-import { INTERACTIVE_CALLBACK_PATH, INTERACTIVE_LOGIN_PATH } from '../lib/interactive-login.js';
 import {
   browserbaseSessionParams,
   CHROME_USER_AGENT,
@@ -38,7 +36,6 @@ import {
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
-const INTERACTIVE_SERVICE_TOKEN = 'test-interactive-service-token-with-more-than-32-characters';
 
 async function availablePort() {
   const probe = createServer();
@@ -65,11 +62,6 @@ async function startServer(t, extraEnv = {}, options = {}) {
       PORT: String(port),
       SESSION_SECRET,
       BCRYPT_ROUNDS: '10',
-      INTERACTIVE_LOGIN_ENABLED: 'false',
-      ...(options.callbackToSelf ? {
-        RENDER_EXTERNAL_URL: `http://127.0.0.1:${port}`,
-        HARVEST_CALLBACK_URL: '',
-      } : {}),
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -158,37 +150,14 @@ function xStorageState(username) {
   };
 }
 
-async function startHarvestService(t, { status = 200, body } = {}) {
-  const calls = [];
-  const server = createHttpServer((req, res) => {
-    let raw = '';
-    req.on('data', (chunk) => { raw += chunk; });
-    req.on('end', () => {
-      calls.push({
-        method: req.method,
-        url: req.url,
-        headers: req.headers,
-        body: raw ? JSON.parse(raw) : null,
-      });
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(body));
-    });
-  });
-
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  const { port } = server.address();
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-
-  return { calls, url: `http://127.0.0.1:${port}/api/harvest-token` };
+function importPayload(handle, prefix = handle) {
+  return { handle, auth_token: `${prefix}_auth_token_value`, ct0: `${prefix}_csrf_token_value` };
 }
 
-function deferred() {
-  let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
+function importSession(baseUrl, cookie, body) {
+  return fetch(`${baseUrl}/api/auth/import-session`, {
+    method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify(body),
+  });
 }
 
 async function until(check, message = 'condition did not become true') {
@@ -198,97 +167,6 @@ async function until(check, message = 'condition did not become true') {
     await delay(10);
   }
   assert.fail(message);
-}
-
-async function startInteractiveService(t, options = {}) {
-  const calls = [];
-  const sessions = new Map();
-  let origin;
-  const server = createHttpServer(async (req, res) => {
-    const respond = (status, body) => {
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(body));
-    };
-    try {
-      let raw = '';
-      for await (const chunk of req) raw += chunk;
-      const call = { method: req.method, url: req.url, headers: req.headers, body: raw ? JSON.parse(raw) : null };
-      calls.push(call);
-      if (req.headers.authorization !== `Bearer ${INTERACTIVE_SERVICE_TOKEN}`) {
-        return respond(401, { error: 'Service token required' });
-      }
-      const url = new URL(req.url, origin);
-      if (req.method === 'POST' && url.pathname === INTERACTIVE_LOGIN_PATH) {
-        const id = call.body.requestId;
-        if (sessions.has(id)) return respond(409, { error: 'Request already used' });
-        const session = {
-          sessionId: id,
-          machineId: 'test-machine-a',
-          status: options.status ?? 'waiting',
-          expiresAt: new Date(Date.now() + 60_000).toISOString(),
-          browserClosed: false,
-        };
-        sessions.set(id, session);
-        await options.onStart?.(call, session);
-        return respond(201, {
-          ...session,
-          viewerUrl: `${origin}/remote-login/${id}?machine=${session.machineId}#token=${'v'.repeat(43)}`,
-        });
-      }
-      const id = url.pathname.slice(`${INTERACTIVE_LOGIN_PATH}/`.length);
-      const session = sessions.get(id);
-      if (!session) return respond(404, { error: 'Session not found' });
-      if (req.method === 'DELETE') {
-        await options.onCancel?.(call, session);
-        session.status = 'cancelled';
-        session.browserClosed = options.cancelClosed !== false;
-      }
-      return respond(200, session);
-    } catch {
-      respond(503, { error: 'Simulated Fly failure' });
-    }
-  });
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  origin = `http://127.0.0.1:${server.address().port}`;
-  t.after(() => {
-    server.closeAllConnections();
-    return new Promise((resolve) => server.close(resolve));
-  });
-  const callback = (id, overrides = {}, token) => {
-    const call = calls.find((request) => request.method === 'POST' && request.body.requestId === id);
-    assert.ok(call, 'Fly START was not received');
-    return fetch(call.body.callbackUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${token ?? call.body.callbackToken}` },
-      body: JSON.stringify({
-        requestId: id, sessionId: id, status: 'completed', browserClosed: true,
-        username: 'alice', cookies: xStorageState('alice').cookies, ...overrides,
-      }),
-    });
-  };
-  return { calls, sessions, callback, url: `${origin}/api/harvest-token` };
-}
-
-async function startInteractiveRender(t, { flyOptions, environment, ...options } = {}) {
-  const fly = await startInteractiveService(t, flyOptions);
-  const render = await startServer(t, {
-    HARVEST_API_URL: fly.url,
-    HARVEST_API_TOKEN: INTERACTIVE_SERVICE_TOKEN,
-    ...environment,
-  }, { callbackToSelf: true, ...options });
-  return { ...render, fly };
-}
-
-async function startInteractiveLogin(baseUrl, cookie, body = {}) {
-  const response = await fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
-    method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify(body),
-  });
-  const result = await response.json();
-  assert.equal(response.status, 201, JSON.stringify(result));
-  return result;
 }
 
 test('registration writes remain valid under concurrency and passwords use bcrypt', async (t) => {
@@ -470,408 +348,212 @@ test('X account deletion rejects traversal and restages the next active account'
   );
 });
 
-test('Connect X Account harvests cookies through the Fly service and links the account', async (t) => {
-  const harvest = await startHarvestService(t, {
-    body: {
-      ok: true,
-      username: 'carol',
-      cookies: [
-        { name: 'auth_token', value: 'carol_auth_token_value', domain: '.x.com', path: '/', secure: true, httpOnly: true },
-        { name: 'ct0', value: 'carol_csrf_token_value', domain: '.x.com', path: '/', secure: true, httpOnly: false },
-      ],
-    },
-  });
-  const harvestToken = 'test-harvest-token-1234567890abcdef';
-  const { baseUrl, dataDir } = await startServer(t, {
-    HARVEST_API_URL: harvest.url,
-    HARVEST_API_TOKEN: harvestToken,
-  });
-  const { cookie, body } = await register(baseUrl, 'harvest');
-
-  const unauthenticated = await fetch(`${baseUrl}/api/auth/x-accounts/harvest`, {
+test('manual session import saves standard X cookies, activates the account, and never exposes values', async (t) => {
+  const { baseUrl, dataDir, output } = await startServer(t, { BROWSERBASE_API_KEY: '' });
+  const { cookie, body } = await register(baseUrl, 'import');
+  const values = importPayload('carol');
+  const unauthenticated = await fetch(`${baseUrl}/api/auth/import-session`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ identifier: 'carol@example.test', password: 'X-Password-123!' }),
+    body: JSON.stringify(values),
   });
   assert.equal(unauthenticated.status, 401);
-  assert.equal(harvest.calls.length, 0);
-
-  const response = await fetch(`${baseUrl}/api/auth/x-accounts/harvest`, {
-    method: 'POST',
-    headers: jsonHeaders(cookie),
-    body: JSON.stringify({
-      identifier: 'carol@example.test',
-      password: 'X-Password-123!',
-      twoFactorCode: '123456',
-    }),
+  const response = await importSession(baseUrl, cookie, {
+    ...values, handle: ' @CAROL ', auth_token: ` ${values.auth_token} `,
+    userId: crypto.randomUUID(), domain: '.attacker.test', path: '../escape',
+    storageState: xStorageState('ignored'),
   });
-  const result = await response.json();
+  const responseText = await response.text();
+  const result = JSON.parse(responseText);
   assert.equal(response.status, 201, JSON.stringify(result));
   assert.equal(result.ok, true);
+  assert.equal(result.authenticated, true);
+  assert.equal(result.cookieCount, 2);
   assert.equal(result.username, 'carol');
   assert.equal(result.activeXAccount, 'carol');
   assert.deepEqual(result.accounts, [{ xUsername: 'carol', active: true, status: 'ready' }]);
-
-  assert.equal(harvest.calls.length, 1);
-  assert.equal(harvest.calls[0].method, 'POST');
-  assert.equal(harvest.calls[0].url, '/api/harvest-token');
-  assert.equal(harvest.calls[0].headers.authorization, `Bearer ${harvestToken}`);
-  assert.equal(harvest.calls[0].headers['content-type'], 'application/json');
-  assert.deepEqual(harvest.calls[0].body, {
-    identifier: 'carol@example.test',
-    password: 'X-Password-123!',
-    twoFactorCode: '123456',
-  });
-
-  const saved = JSON.parse(await readFile(join(dataDir, 'sessions', body.user.id, 'carol.json'), 'utf8'));
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const destination = join(dataDir, 'sessions', body.user.id, 'carol.json');
+  const saved = JSON.parse(await readFile(destination, 'utf8'));
   assert.equal(saved.username, 'carol');
-  assert.equal(saved.source, 'fly-harvest');
-  assert.deepEqual(saved.cookies.map((item) => item.name), ['auth_token', 'ct0']);
-  assert.equal(saved.cookies.find((item) => item.name === 'auth_token').httpOnly, true);
-  assert.equal(saved.cookies.find((item) => item.name === 'ct0').httpOnly, false);
-
+  assert.equal(saved.source, 'manual-import');
+  assert.equal(saved.cookieCount, 2);
+  assert.ok(Number.isFinite(Date.parse(saved.savedAt)));
+  assert.deepEqual(saved.origins, []);
+  assert.deepEqual(saved.cookies, [
+    { name: 'auth_token', value: values.auth_token, domain: '.x.com', path: '/', expires: -1, secure: true, httpOnly: true, sameSite: 'Lax' },
+    { name: 'ct0', value: values.ct0, domain: '.x.com', path: '/', expires: -1, secure: true, httpOnly: false, sameSite: 'Lax' },
+  ]);
   const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
-  assert.equal(staged.username, 'carol');
-  assert.deepEqual(staged.cookies.map((item) => item.name), ['auth_token', 'ct0']);
-
+  assert.deepEqual(staged, saved);
+  if (process.platform !== 'win32') assert.equal((await stat(destination)).mode & 0o777, 0o600);
   const status = await fetch(`${baseUrl}/api/auth`, { headers: { cookie } });
-  const statusBody = await status.json();
+  const statusText = await status.text();
+  const statusBody = JSON.parse(statusText);
   assert.equal(statusBody.authenticated, true);
   assert.equal(statusBody.username, 'carol');
   assert.deepEqual(statusBody.xAccounts, ['carol']);
-});
-
-test('interactive Render starts require app authentication and keep pending logins session-owned', { timeout: 20_000 }, async (t) => {
-  const { baseUrl, fly } = await startInteractiveRender(t, { flyOptions: { status: 'completed' } });
-  const owner = await register(baseUrl, 'interactive_owner');
-  const other = await register(baseUrl, 'interactive_other');
-  const endpoint = `${baseUrl}/api/auth/x-accounts/interactive`;
-  const unauthenticated = await fetch(endpoint, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
-  });
-  assert.equal(unauthenticated.status, 401);
-  const malformed = await fetch(endpoint, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: [crypto.randomUUID()] }),
-  });
-  assert.equal(malformed.status, 400);
-  assert.equal(fly.calls.length, 0);
-
-  const id = crypto.randomUUID();
-  const login = await startInteractiveLogin(baseUrl, owner.cookie, {
-    requestId: id, userId: other.body.user.id,
-    callbackUrl: 'http://169.254.169.254/', callbackToken: 'browser-supplied-token',
-  });
-  assert.equal(login.requestId, id);
-  const start = fly.calls.find((call) => call.method === 'POST');
-  assert.equal(start.body.callbackUrl, `${baseUrl}${INTERACTIVE_CALLBACK_PATH}`);
-  assert.match(start.body.callbackToken, /^[A-Za-z0-9_-]{43}$/);
-  assert.equal(start.headers.authorization, `Bearer ${INTERACTIVE_SERVICE_TOKEN}`);
-  assert.equal(Object.hasOwn(start.body, 'userId'), false);
-  assert.equal(JSON.stringify(login).includes(INTERACTIVE_SERVICE_TOKEN), false);
-  assert.equal(JSON.stringify(login).includes(start.body.callbackToken), false);
-  await until(() => fly.calls.some((call) => call.method === 'GET'));
-  assert.equal(new URL(fly.calls.find((call) => call.method === 'GET').url, fly.url).searchParams.get('machine'), 'test-machine-a');
-  const status = await fetch(`${endpoint}/${id}`, { headers: { cookie: owner.cookie } });
-  const state = await status.json();
-  assert.notEqual(state.status, 'completed', 'Fly status alone must not link an account');
-  assert.equal(Object.hasOwn(state, 'viewerUrl'), false);
-  assert.equal(Object.hasOwn(state, 'cookies'), false);
-
-  const foreignStatus = await fetch(`${endpoint}/${id}`, { headers: { cookie: other.cookie } });
-  assert.equal(foreignStatus.status, 404);
-  const foreignCancel = await fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(other.cookie), body: JSON.stringify({ requestId: id }),
-  });
-  assert.equal(foreignCancel.status, 404);
-  const foreignGenericCancel = await fetch(`${baseUrl}/auth/x/cancel`, { method: 'POST', headers: jsonHeaders(other.cookie), body: '{}' });
-  assert.equal(foreignGenericCancel.status, 403);
-  const overlaps = await Promise.all([owner.cookie, other.cookie].map((cookie) => fetch(endpoint, {
-    method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify({ requestId: id }),
-  })));
-  assert.deepEqual(overlaps.map((response) => response.status), [409, 409]);
-  assert.equal(fly.calls.filter((call) => call.method === 'POST').length, 1);
-  assert.equal(fly.calls.some((call) => call.method === 'DELETE'), false, 'A duplicate START must not cancel the real owner');
-  const cancelled = await fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: id }),
-  });
-  assert.equal(cancelled.status, 200);
-  assert.equal((await cancelled.json()).closed, true);
-});
-
-test('interactive callbacks validate identity and cookies, persist per tenant, and acknowledge identical retries', { timeout: 20_000 }, async (t) => {
-  const { baseUrl, dataDir, fly, output } = await startInteractiveRender(t);
-  const owner = await register(baseUrl, 'callback_owner');
-  const other = await register(baseUrl, 'callback_other');
-  const login = await startInteractiveLogin(baseUrl, owner.cookie);
-  const id = login.requestId;
-  const wrongToken = await fly.callback(id, {}, INTERACTIVE_SERVICE_TOKEN);
-  assert.equal(wrongToken.status, 401, 'The shared service token is not a callback credential');
-  for (const [body, expected] of [
-    [{ sessionId: crypto.randomUUID() }, 400],
-    [{ username: '../escape' }, 400],
-    [{ cookies: [xStorageState('alice').cookies[0]] }, 400],
-    [{ cookies: xStorageState('alice').cookies.map((cookie) => ({ ...cookie, domain: '.evilx.com' })) }, 400],
-    [{ cookies: xStorageState('alice').cookies.map((cookie) => ({ ...cookie, secure: false })) }, 400],
-    [{ browserClosed: false }, 400],
-  ]) {
-    const rejected = await fly.callback(id, body);
-    assert.equal(rejected.status, expected, await rejected.text());
+  for (const secret of [values.auth_token, values.ct0]) {
+    assert.equal(responseText.includes(secret), false);
+    assert.equal(statusText.includes(secret), false);
+    assert.equal(output().includes(secret), false);
+    assert.equal((await readFile(join(dataDir, 'user-db.json'), 'utf8')).includes(secret), false);
   }
-  await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
-  const acknowledgements = await Promise.all([fly.callback(id), fly.callback(id)]);
-  assert.deepEqual(acknowledgements.map((response) => response.status), [200, 200]);
+});
+
+test('manual imports keep identical handles isolated between users and support account switching', async (t) => {
+  const { baseUrl, dataDir } = await startServer(t);
+  const owner = await register(baseUrl, 'import_owner');
+  const other = await register(baseUrl, 'import_other');
+  const first = await importSession(baseUrl, owner.cookie, { ...importPayload('alice', 'owner'), userId: other.body.user.id });
+  assert.equal(first.status, 201);
   const destination = join(dataDir, 'sessions', owner.body.user.id, 'alice.json');
   const firstSave = await readFile(destination, 'utf8');
-  const saved = JSON.parse(firstSave);
-  assert.equal(saved.username, 'alice');
-  assert.equal(saved.source, 'fly-interactive');
-  assert.deepEqual(saved.cookies.map((cookie) => cookie.name), ['auth_token', 'ct0']);
-  assert.deepEqual(saved.origins, []);
-  assert.equal(saved.cookies[0].httpOnly, true);
-  assert.equal(saved.cookies[1].httpOnly, false);
-  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
-  assert.deepEqual(staged.cookies, saved.cookies);
-  if (process.platform !== 'win32') assert.equal((await stat(destination)).mode & 0o777, 0o600);
-
-  const retry = await fly.callback(id);
-  assert.equal(retry.status, 200);
-  assert.equal(await readFile(destination, 'utf8'), firstSave, 'An acknowledged retry must not rewrite the session');
-  const conflicting = await fly.callback(id, { cookies: xStorageState('conflict').cookies });
-  assert.equal(conflicting.status, 409);
-  const status = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${id}`, { headers: { cookie: owner.cookie } });
-  const statusText = await status.text();
-  const state = JSON.parse(statusText);
-  assert.equal(state.status, 'completed');
-  assert.equal(state.username, 'alice');
-  assert.deepEqual(state.accounts, [{ xUsername: 'alice', active: true, status: 'ready' }]);
-  assert.equal(statusText.includes(saved.cookies[0].value), false);
-  const cancelledAfterSave = await fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: id }),
-  });
-  assert.deepEqual(await cancelledAfterSave.json(), { ok: true, cancelled: false, closed: true, status: 'completed' });
-
-  const otherLogin = await startInteractiveLogin(baseUrl, other.cookie);
-  const otherCookies = xStorageState('other_tenant').cookies;
-  const secondCallback = await fly.callback(otherLogin.requestId, { username: 'alice', cookies: otherCookies });
-  assert.equal(secondCallback.status, 200);
+  const second = await importSession(baseUrl, other.cookie, importPayload('alice', 'other'));
+  assert.equal(second.status, 201);
   assert.equal(await readFile(destination, 'utf8'), firstSave);
   const otherSave = JSON.parse(await readFile(join(dataDir, 'sessions', other.body.user.id, 'alice.json'), 'utf8'));
-  assert.equal(otherSave.cookies[0].value, otherCookies[0].value);
+  assert.equal(otherSave.cookies[0].value, importPayload('alice', 'other').auth_token);
+  assert.notEqual(otherSave.cookies[0].value, JSON.parse(firstSave).cookies[0].value);
+  const switched = await fetch(`${baseUrl}/api/auth/switch-account`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ xUsername: 'alice' }),
+  });
+  assert.equal(switched.status, 200);
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), firstSave);
   const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
   for (const user of users) {
     assert.deepEqual(user.xAccounts, ['alice']);
     assert.equal(user.preferences.defaultXAccount, 'alice');
   }
-  for (const secret of [INTERACTIVE_SERVICE_TOKEN, saved.cookies[0].value, otherCookies[0].value]) {
-    assert.equal(output().includes(secret), false, 'Login credentials must not appear in server logs');
-  }
 });
 
-test('interactive starts and callbacks enforce requested handles and recheck the three-account limit', { timeout: 20_000 }, async (t) => {
-  const { baseUrl, dataDir, fly } = await startInteractiveRender(t);
-  const full = await register(baseUrl, 'interactive_full');
-  const link = async (cookie, username) => {
-    const response = await fetch(`${baseUrl}/api/auth/x-accounts`, {
-      method: 'POST', headers: jsonHeaders(cookie),
-      body: JSON.stringify({ xUsername: username, storageState: xStorageState(username) }),
-    });
-    assert.equal(response.status, 201, await response.text());
-  };
-  for (const username of ['alpha', 'beta', 'gamma']) await link(full.cookie, username);
-  const refused = await fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
-    method: 'POST', headers: jsonHeaders(full.cookie), body: '{}',
-  });
-  assert.equal(refused.status, 409);
-  assert.equal(fly.calls.length, 0);
-  const refresh = await startInteractiveLogin(baseUrl, full.cookie, { xUsername: '@beta' });
-  const wrongIdentity = await fly.callback(refresh.requestId);
-  assert.equal(wrongIdentity.status, 409);
-  const refreshed = await fly.callback(refresh.requestId, { username: 'beta', cookies: xStorageState('beta').cookies });
-  assert.equal(refreshed.status, 200);
-
-  const growing = await register(baseUrl, 'interactive_growing');
-  await link(growing.cookie, 'alpha');
-  await link(growing.cookie, 'beta');
-  const pending = await startInteractiveLogin(baseUrl, growing.cookie);
-  await link(growing.cookie, 'gamma');
-  const overLimit = await fly.callback(pending.requestId, { username: 'delta', cookies: xStorageState('delta').cookies });
-  assert.equal(overLimit.status, 409);
-  await assert.rejects(stat(join(dataDir, 'sessions', growing.body.user.id, 'delta.json')), { code: 'ENOENT' });
+test('manual imports enforce the account limit under concurrency and allow refreshing a linked handle', async (t) => {
+  const { baseUrl, dataDir } = await startServer(t);
+  const owner = await register(baseUrl, 'import_limit');
+  const responses = await Promise.all(['alpha', 'beta', 'gamma', 'delta'].map((handle) =>
+    importSession(baseUrl, owner.cookie, importPayload(handle))));
+  assert.deepEqual(responses.map((response) => response.status).sort(), [201, 201, 201, 409]);
   const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
-  assert.deepEqual(users.find((user) => user.id === growing.body.user.id).xAccounts, ['alpha', 'beta', 'gamma']);
-  await fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(growing.cookie), body: JSON.stringify({ requestId: pending.requestId }),
-  });
+  const user = users.find((candidate) => candidate.id === owner.body.user.id);
+  assert.equal(user.xAccounts.length, 3);
+  const rejected = ['alpha', 'beta', 'gamma', 'delta'].find((handle) => !user.xAccounts.includes(handle));
+  await assert.rejects(stat(join(dataDir, 'sessions', user.id, `${rejected}.json`)), { code: 'ENOENT' });
+  const refreshedHandle = user.xAccounts[0];
+  const refreshed = await importSession(baseUrl, owner.cookie, importPayload(`@${refreshedHandle.toUpperCase()}`, 'fresh'));
+  assert.equal(refreshed.status, 201);
+  const result = await refreshed.json();
+  assert.equal(result.accounts.length, 3);
+  assert.equal(result.activeXAccount, refreshedHandle);
+  const state = JSON.parse(await readFile(join(dataDir, 'sessions', user.id, `${refreshedHandle}.json`), 'utf8'));
+  assert.equal(state.cookies[0].value, importPayload(refreshedHandle, 'fresh').auth_token);
 });
 
-test('cancel, logout, session rotation, and unlink reject late interactive callbacks', { timeout: 30_000 }, async (t) => {
-  const { baseUrl, dataDir, fly } = await startInteractiveRender(t);
-  for (const action of ['request', 'generic', 'logout', 'rotation', 'unlink']) {
-    const owner = await register(baseUrl, `late_${action}`);
-    if (action === 'unlink') {
-      const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
-        method: 'POST', headers: jsonHeaders(owner.cookie),
-        body: JSON.stringify({ xUsername: 'alice', storageState: xStorageState('alice') }),
-      });
-      assert.equal(linked.status, 201);
-    }
-    const login = await startInteractiveLogin(baseUrl, owner.cookie, action === 'unlink' ? { xUsername: 'alice' } : {});
-    let response;
-    if (action === 'logout') {
-      response = await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie: owner.cookie } });
-    } else if (action === 'rotation') {
-      response = await fetch(`${baseUrl}/api/auth/login`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
-      });
-    } else if (action === 'unlink') {
-      response = await fetch(`${baseUrl}/api/auth/x-accounts/alice`, { method: 'DELETE', headers: { cookie: owner.cookie } });
-    } else {
-      response = await fetch(`${baseUrl}/auth/x/cancel`, {
-        method: 'POST', headers: jsonHeaders(owner.cookie),
-        body: JSON.stringify(action === 'request' ? { requestId: login.requestId } : {}),
-      });
-    }
-    assert.equal(response.status, 200, `${action}: ${await response.text()}`);
-    const late = await fly.callback(login.requestId);
-    assert.equal(late.status, 410, `${action}: ${await late.text()}`);
-    await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
-    const deletion = fly.calls.find((call) => call.method === 'DELETE' && call.url.includes(login.requestId));
-    assert.ok(deletion, `${action} must cancel the Fly browser`);
-    assert.equal(new URL(deletion.url, fly.url).searchParams.get('machine'), 'test-machine-a');
-    const status = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${login.requestId}`, { headers: { cookie: owner.cookie } });
-    assert.equal(status.status, ['logout', 'rotation'].includes(action) ? 401 : 200);
+test('manual imports reject invalid handles, cookie values, and malformed bodies without saving or leaking secrets', async (t) => {
+  const { baseUrl, dataDir, output } = await startServer(t);
+  const owner = await register(baseUrl, 'import_invalid');
+  const values = importPayload('alice');
+  for (const invalid of [
+    { handle: undefined }, { handle: null }, { handle: 123 }, { handle: ['alice'] },
+    { handle: '../escape' }, { handle: 'a'.repeat(16) }, { handle: '@@alice' },
+    { auth_token: undefined }, { ct0: undefined }, { auth_token: null }, { ct0: 12345678 },
+    { auth_token: 'short' }, { ct0: 'x'.repeat(513) }, { ct0: 'embedded whitespace' },
+    { auth_token: 'auth_token=unsafe; ct0=unsafe' },
+  ]) {
+    const response = await importSession(baseUrl, owner.cookie, { ...values, ...invalid });
+    assert.equal(response.status, 400, await response.text());
   }
+  const malformed = await fetch(`${baseUrl}/api/auth/import-session`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: `{"auth_token":"${values.auth_token}",`,
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.text()).includes(values.auth_token), false);
+  const oversized = await importSession(baseUrl, owner.cookie, { ...values, padding: 'x'.repeat(17_000) });
+  assert.equal(oversized.status, 413);
+  assert.equal((await oversized.text()).includes(values.auth_token), false);
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
   const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
-  assert.ok(users.every((user) => user.xAccounts.length === 0));
+  assert.deepEqual(users[0].xAccounts, []);
+  for (const secret of [values.auth_token, values.ct0]) assert.equal(output().includes(secret), false);
 });
 
-test('cancelling a delayed Fly START waits for its Machine affinity before closing the desktop', { timeout: 20_000 }, async (t) => {
-  const acknowledgement = deferred();
-  t.after(() => acknowledgement.resolve());
-  const { baseUrl, fly } = await startInteractiveRender(t, { flyOptions: { onStart: () => acknowledgement.promise } });
-  const owner = await register(baseUrl, 'delayed_start');
-  const requestId = crypto.randomUUID();
-  const starting = fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId }),
-  });
-  await until(() => fly.calls.some((call) => call.method === 'POST'));
-  const cancelling = fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId }),
-  });
-  await until(async () => {
-    const response = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${requestId}`, { headers: { cookie: owner.cookie } });
-    return (await response.json()).status === 'cancelled';
-  });
-  assert.equal(fly.calls.some((call) => call.method === 'DELETE'), false);
-  const overlap = await fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
-  });
-  assert.equal(overlap.status, 409, 'The pending desktop cleanup must keep the reservation');
-  acknowledgement.resolve();
-  assert.equal((await starting).status, 410);
-  const cancelled = await cancelling;
-  assert.equal(cancelled.status, 200);
-  assert.equal((await cancelled.json()).closed, true);
-  const deletion = fly.calls.find((call) => call.method === 'DELETE');
-  assert.equal(new URL(deletion.url, fly.url).searchParams.get('machine'), 'test-machine-a');
-  const next = await startInteractiveLogin(baseUrl, owner.cookie);
-  await fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: next.requestId }),
-  });
-});
-
-test('interactive terminal callbacks are idempotent and unconfirmed cleanup is never reported as closed', { timeout: 20_000 }, async (t) => {
-  const { baseUrl, fly } = await startInteractiveRender(t, { flyOptions: { cancelClosed: false } });
-  const owner = await register(baseUrl, 'terminal_callbacks');
-  for (const status of ['failed', 'expired']) {
-    const login = await startInteractiveLogin(baseUrl, owner.cookie);
-    for (let retry = 0; retry < 2; retry += 1) {
-      const response = await fly.callback(login.requestId, { status, cookies: undefined, username: undefined });
-      assert.equal(response.status, 200);
-    }
-    assert.equal((await fly.callback(login.requestId)).status, 410);
+test('import storage errors never expose existing or newly pasted cookie values', async (t) => {
+  const { baseUrl, dataDir, output } = await startServer(t);
+  const owner = await register(baseUrl, 'import_storage_error');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice', 'saved'))).status, 201);
+  const destination = join(dataDir, 'sessions', owner.body.user.id, 'alice.json');
+  const corrupted = 'saved_cookie_secret:invalid-json';
+  await writeFile(destination, corrupted);
+  const before = await readFile(join(dataDir, 'user-db.json'), 'utf8');
+  const values = importPayload('alice', 'newly_pasted');
+  const response = await importSession(baseUrl, owner.cookie, values);
+  assert.equal(response.status, 500);
+  const text = await response.text();
+  assert.match(text, /Check persistent storage/);
+  for (const secret of ['saved_cookie', values.auth_token, values.ct0]) {
+    assert.equal(text.includes(secret), false);
+    assert.equal(output().includes(secret), false);
   }
-  const login = await startInteractiveLogin(baseUrl, owner.cookie);
-  const cancel = await fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: login.requestId }),
-  });
-  assert.equal(cancel.status, 200);
-  assert.equal((await cancel.json()).closed, false);
-  const state = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${login.requestId}`, { headers: { cookie: owner.cookie } });
-  assert.match((await state.json()).error, /close could not be confirmed/);
-  assert.equal((await fly.callback(login.requestId)).status, 410);
+  assert.equal(await readFile(destination, 'utf8'), corrupted);
+  assert.equal(await readFile(join(dataDir, 'user-db.json'), 'utf8'), before);
 });
 
-test('Fly interactive APIs require the backend service token, not an app session', { timeout: 20_000 }, async (t) => {
-  const { baseUrl } = await startServer(t, {
-    HARVEST_API_TOKEN: INTERACTIVE_SERVICE_TOKEN,
-    INTERACTIVE_LOGIN_ENABLED: 'true',
-    INTERACTIVE_LOGIN_PUBLIC_ORIGIN: 'https://fly.example.test',
-    HARVEST_CALLBACK_URL: `https://render.example.test${INTERACTIVE_CALLBACK_PATH}`,
+test('manual imports reject logged-out and rotated app-session tokens', async (t) => {
+  const { baseUrl } = await startServer(t);
+  const owner = await register(baseUrl, 'import_revoked');
+  const logout = await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie: owner.cookie } });
+  assert.equal(logout.status, 200);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 401);
+  const login = async () => fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
   });
-  const owner = await register(baseUrl, 'fly_access');
-  const requestId = crypto.randomUUID();
-  for (const method of ['POST', 'GET', 'DELETE']) {
-    const path = method === 'POST' ? INTERACTIVE_LOGIN_PATH : `${INTERACTIVE_LOGIN_PATH}/${requestId}`;
-    const denied = await fetch(`${baseUrl}${path}`, {
-      method, headers: jsonHeaders(owner.cookie), ...(method === 'POST' ? { body: '{}' } : {}),
-    });
-    assert.equal(denied.status, 401);
-  }
-  const internalHeaders = { 'content-type': 'application/json', authorization: `Bearer ${INTERACTIVE_SERVICE_TOKEN}` };
-  const deleted = await fetch(`${baseUrl}${INTERACTIVE_LOGIN_PATH}/${requestId}`, { method: 'DELETE', headers: internalHeaders });
-  assert.equal(deleted.status, 200);
-  assert.equal((await deleted.json()).browserClosed, true);
-  const delayed = await fetch(`${baseUrl}${INTERACTIVE_LOGIN_PATH}`, {
-    method: 'POST', headers: internalHeaders,
-    body: JSON.stringify({ requestId, callbackUrl: `https://render.example.test${INTERACTIVE_CALLBACK_PATH}`, callbackToken: 't'.repeat(43) }),
-  });
-  assert.equal(delayed.status, 409, 'Cancellation must reject a later START with the same ID');
-  const override = await fetch(`${baseUrl}${INTERACTIVE_LOGIN_PATH}`, {
-    method: 'POST', headers: internalHeaders,
-    body: JSON.stringify({ requestId: crypto.randomUUID(), callbackUrl: 'http://169.254.169.254/', callbackToken: 't'.repeat(43) }),
-  });
-  assert.equal(override.status, 400);
+  const firstLogin = await login();
+  const oldCookie = sessionCookie(firstLogin);
+  const rotated = await login();
+  const newCookie = sessionCookie(rotated);
+  assert.equal((await importSession(baseUrl, oldCookie, importPayload('alice'))).status, 401);
+  assert.equal((await importSession(baseUrl, newCookie, importPayload('alice'))).status, 201);
 });
 
-test('a failed interactive save rolls back tenant metadata and permits an identical callback retry', { timeout: 20_000 }, async (t) => {
+test('a failed import rolls back account metadata and session files, then permits a retry', { timeout: 20_000 }, async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-write-retry-'));
   const marker = join(dataDir, 'stage-write-gate');
-  const { baseUrl, fly } = await startInteractiveRender(t, {
+  const { baseUrl } = await startServer(t, { SESSION_TEST_WRITE_GATE: marker }, {
     dataDir, cleanupData: true,
-    environment: { INTERACTIVE_TEST_WRITE_GATE: marker },
-    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-write-gate.cjs')],
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
   });
   const owner = await register(baseUrl, 'storage_retry');
   const previousUsers = await readFile(join(dataDir, 'user-db.json'), 'utf8');
   const previousActive = `${JSON.stringify({ ...xStorageState('previous'), username: 'previous' })}\n`;
   await writeFile(join(dataDir, 'auth.json'), previousActive);
-  const login = await startInteractiveLogin(baseUrl, owner.cookie);
   await writeFile(marker, 'fail');
-  const failure = await fly.callback(login.requestId);
+  const failure = await importSession(baseUrl, owner.cookie, importPayload('alice'));
   assert.equal(failure.status, 500);
   assert.equal(await readFile(join(dataDir, 'user-db.json'), 'utf8'), previousUsers);
   assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), previousActive);
   await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
-  const changedPayload = await fly.callback(login.requestId, { cookies: xStorageState('different').cookies });
-  assert.equal(changedPayload.status, 409, 'A retriable save must remain bound to the original cookie payload');
-  const retry = await fly.callback(login.requestId);
-  assert.equal(retry.status, 200, await retry.text());
+  const retry = await importSession(baseUrl, owner.cookie, importPayload('alice'));
+  assert.equal(retry.status, 201, await retry.text());
   const saved = JSON.parse(await readFile(join(dataDir, 'sessions', owner.body.user.id, 'alice.json'), 'utf8'));
-  assert.equal(saved.cookies[0].value, xStorageState('alice').cookies[0].value);
+  assert.equal(saved.cookies[0].value, importPayload('alice').auth_token);
   const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
   assert.deepEqual(users.find((user) => user.id === owner.body.user.id).xAccounts, ['alice']);
+  const paths = [join(dataDir, 'user-db.json'), join(dataDir, 'auth.json'), join(dataDir, 'sessions', owner.body.user.id, 'alice.json')];
+  const beforeRefresh = await Promise.all(paths.map((path) => readFile(path, 'utf8')));
+  await writeFile(marker, 'fail');
+  const refreshFailure = await importSession(baseUrl, owner.cookie, importPayload('alice', 'updated'));
+  assert.equal(refreshFailure.status, 500);
+  assert.deepEqual(await Promise.all(paths.map((path) => readFile(path, 'utf8'))), beforeRefresh);
 });
 
-test('cancellation during an interactive save restores the prior session before acknowledging cleanup', { timeout: 20_000 }, async (t) => {
+test('disconnecting during import rolls back the prior session and staging blocks browser starts', { timeout: 20_000 }, async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-write-cancel-'));
   const marker = join(dataDir, 'stage-write-gate');
   t.after(() => unlink(marker).catch(() => {}));
-  const { baseUrl, fly } = await startInteractiveRender(t, {
+  const { baseUrl } = await startServer(t, { SESSION_TEST_WRITE_GATE: marker }, {
     dataDir, cleanupData: true,
-    environment: { INTERACTIVE_TEST_WRITE_GATE: marker },
-    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-write-gate.cjs')],
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
   });
   const owner = await register(baseUrl, 'storage_cancel');
   const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
@@ -885,51 +567,135 @@ test('cancellation during an interactive save restores the prior session before 
   assert.equal(switched.status, 200);
   const paths = [join(dataDir, 'user-db.json'), join(dataDir, 'auth.json'), join(dataDir, 'sessions', owner.body.user.id, 'alice.json')];
   const previous = await Promise.all(paths.map((path) => readFile(path, 'utf8')));
-  const login = await startInteractiveLogin(baseUrl, owner.cookie, { xUsername: 'alice' });
   await writeFile(marker, 'pause');
-  const saving = fly.callback(login.requestId, { cookies: xStorageState('updated').cookies });
-  await until(() => stat(`${marker}.entered`).then(() => true, () => false), 'The callback did not reach session staging');
-  const cancelling = fetch(`${baseUrl}/auth/x/cancel`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: login.requestId }),
+  const request = new AbortController();
+  const saving = fetch(`${baseUrl}/api/auth/import-session`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify(importPayload('alice', 'updated')), signal: request.signal,
+  }).catch((error) => error);
+  await until(() => stat(`${marker}.entered`).then(() => true, () => false), 'The import did not reach session staging');
+  const browserStart = await fetch(`${baseUrl}/auth/x`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
   });
-  await until(async () => {
-    const response = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${login.requestId}`, { headers: { cookie: owner.cookie } });
-    return (await response.json()).status === 'cancelled';
+  assert.equal(browserStart.status, 409);
+  const run = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true }),
   });
-  assert.equal(fly.calls.some((call) => call.method === 'DELETE'), false, 'Cancellation must wait for the interrupted write to roll back');
+  assert.equal(run.status, 409);
+  request.abort();
+  assert.equal((await saving).name, 'AbortError');
+  await delay(50);
   await unlink(marker);
-  assert.equal((await saving).status, 410);
-  const cancelled = await cancelling;
-  assert.equal(cancelled.status, 200);
-  assert.equal((await cancelled.json()).closed, true);
+  await until(async () => (await readFile(paths[1], 'utf8')) === previous[1] &&
+    (await readFile(paths[2], 'utf8')) === previous[2], 'Cancelled import did not restore the prior session');
   assert.deepEqual(await Promise.all(paths.map((path) => readFile(path, 'utf8'))), previous);
-  assert.equal((await fly.callback(login.requestId)).status, 410);
 });
 
-test('a Render restart preserves saved users but discards pending interactive callback ownership', { timeout: 20_000 }, async (t) => {
-  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-pending-restart-'));
+test('imported sessions and active-account selection survive a server restart', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-import-restart-'));
+  const first = await startServer(t, {}, { dataDir });
   t.after(() => rm(dataDir, { recursive: true, force: true }));
-  const first = await startInteractiveRender(t, { dataDir });
-  const owner = await register(first.baseUrl, 'pending_restart');
-  const pending = await startInteractiveLogin(first.baseUrl, owner.cookie);
-  const start = first.fly.calls.find((call) => call.method === 'POST');
+  const owner = await register(first.baseUrl, 'import_restart');
+  assert.equal((await importSession(first.baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  const previous = await readFile(join(dataDir, 'auth.json'), 'utf8');
   await first.stop();
-  const second = await startServer(t, {
-    HARVEST_API_URL: first.fly.url, HARVEST_API_TOKEN: INTERACTIVE_SERVICE_TOKEN,
-  }, { dataDir, callbackToSelf: true });
-  const status = await fetch(`${second.baseUrl}/api/auth/x-accounts/interactive/${pending.requestId}`, { headers: { cookie: owner.cookie } });
-  assert.equal(status.status, 404);
-  const late = await fetch(`${second.baseUrl}${INTERACTIVE_CALLBACK_PATH}`, {
-    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${start.body.callbackToken}` },
-    body: JSON.stringify({ requestId: pending.requestId, sessionId: pending.requestId, status: 'completed', browserClosed: true, username: 'alice', cookies: xStorageState('alice').cookies }),
-  });
-  assert.equal(late.status, 404);
+  const second = await startServer(t, {}, { dataDir });
   const me = await fetch(`${second.baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } });
   assert.equal(me.status, 200);
-  const fresh = await startInteractiveLogin(second.baseUrl, owner.cookie);
-  assert.notEqual(fresh.requestId, pending.requestId);
-  const completed = await first.fly.callback(fresh.requestId);
-  assert.equal(completed.status, 200);
+  const status = await fetch(`${second.baseUrl}/api/auth`, { headers: { cookie: owner.cookie } });
+  const result = await status.json();
+  assert.equal(result.authenticated, true);
+  assert.equal(result.activeXAccount, 'alice');
+  assert.deepEqual(result.xAccounts, ['alice']);
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), previous);
+});
+
+test('automation restores imported cookies and rejects imports while the bot is running', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-import-run-'));
+  const marker = join(dataDir, 'automation-gate');
+  const { baseUrl } = await startServer(t, { SESSION_TEST_RUN_GATE: marker }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'import_run');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  const key = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'test-only-groq-key-no-external-requests' }),
+  });
+  assert.equal(key.status, 200);
+  await writeFile(marker, 'pause');
+  const running = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true }),
+  });
+  assert.equal(running.status, 200);
+  await until(() => stat(`${marker}.entered`).then(() => true, () => false), 'The runner did not receive a staged session');
+  const staged = JSON.parse(await readFile(`${marker}.entered`, 'utf8'));
+  assert.equal(staged.username, 'alice');
+  assert.equal(staged.state.cookies[0].value, importPayload('alice').auth_token);
+  assert.equal(staged.state.cookies[1].value, importPayload('alice').ct0);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('bob'))).status, 409);
+  await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'bob.json')), { code: 'ENOENT' });
+  await unlink(marker);
+  await running.text();
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('bob'))).status, 201);
+});
+
+test('runner startup reserves its session before staging and blocks conflicting account changes', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-startup-reservation-'));
+  const writeMarker = join(dataDir, 'write-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, {
+    SESSION_TEST_WRITE_GATE: writeMarker, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'startup_owner');
+  const other = await register(baseUrl, 'startup_other');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('bob'))).status, 201);
+  const key = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-for-runner-fixture' }),
+  });
+  assert.equal(key.status, 200);
+  const runBody = JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true });
+  await writeFile(writeMarker, 'pause');
+  await writeFile(runMarker, 'pause');
+  const starting = fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: runBody,
+  });
+  await until(() => stat(`${writeMarker}.entered`).then(() => true, () => false), 'Runner did not reach session staging');
+  const unchanged = await readFile(join(dataDir, 'auth.json'), 'utf8');
+  assert.equal(JSON.parse(unchanged).username, 'bob');
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('bob', 'replacement'))).status, 409);
+  const overlap = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: runBody,
+  });
+  assert.equal(overlap.status, 409);
+  const signIn = await fetch(`${baseUrl}/auth/x`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: '{}',
+  });
+  assert.equal(signIn.status, 409);
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), unchanged);
+  await unlink(writeMarker);
+  const running = await starting;
+  assert.equal(running.status, 200);
+  await until(() => stat(`${runMarker}.entered`).then(() => true, () => false), 'Runner did not receive the reserved session');
+  const staged = JSON.parse(await readFile(`${runMarker}.entered`, 'utf8'));
+  assert.equal(staged.username, 'alice');
+  assert.equal(staged.state.cookies[0].value, importPayload('alice').auth_token);
+  const switched = await fetch(`${baseUrl}/api/auth/switch-account`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: JSON.stringify({ xUsername: 'bob' }),
+  });
+  assert.equal(switched.status, 409);
+  assert.equal(JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8')).username, 'alice');
+  await unlink(runMarker);
+  await running.text();
+  const afterRun = await fetch(`${baseUrl}/api/auth/switch-account`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: JSON.stringify({ xUsername: 'bob' }),
+  });
+  assert.equal(afterRun.status, 200);
 });
 
 test('Groq status is masked and explicit deletion purges persisted state', async (t) => {
@@ -981,31 +747,10 @@ test('production refuses an insecure session secret', async () => {
   assert.match(output, /SESSION_SECRET must be a unique value/);
 });
 
-test('production refuses an insecure harvest token', async () => {
-  const port = await availablePort();
-  const child = spawn(process.execPath, ['server.js'], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      NODE_ENV: 'production',
-      PORT: String(port),
-      SESSION_SECRET: 'test-only-session-secret-with-more-than-32-characters',
-      HARVEST_API_TOKEN: 'change-me',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  child.stderr.on('data', (chunk) => { output += String(chunk); });
-  child.stdout.on('data', (chunk) => { output += String(chunk); });
-  const code = await new Promise((resolve) => child.once('exit', resolve));
-  assert.notEqual(code, 0);
-  assert.match(output, /HARVEST_API_TOKEN must be a unique value/);
-});
-
 test('production accepts a strong secret and emits hardened session cookies', async (t) => {
   const { baseUrl } = await startServer(t, {
     NODE_ENV: 'production',
-    HARVEST_API_TOKEN: 'test-harvest-token-1234567890abcdef',
+    HARVEST_API_TOKEN: '',
   });
   const response = await fetch(`${baseUrl}/api/auth/register`, {
     method: 'POST',
@@ -1021,13 +766,13 @@ test('production accepts a strong secret and emits hardened session cookies', as
   assert.match(cookie, /HttpOnly/i);
   assert.match(cookie, /SameSite=Strict/i);
   assert.match(cookie, /Secure/i);
-
+  const imported = await importSession(baseUrl, sessionCookie(response), importPayload('production_x'));
+  assert.equal(imported.status, 201);
 });
 test('production allows Render origins and rejects unknown origins', async (t) => {
   const { baseUrl } = await startServer(t, {
     NODE_ENV: 'production',
     RENDER_EXTERNAL_URL: 'https://x-bot.onrender.com',
-    HARVEST_API_TOKEN: 'test-harvest-token-1234567890abcdef',
   });
 
   const registerFrom = (origin, suffix) => fetch(`${baseUrl}/api/auth/register`, {
@@ -1537,25 +1282,8 @@ test('remote sign-in cancellation is authenticated and idempotent', async (t) =>
   assert.deepEqual(await noRun.json(), { ok: true, cancelled: false });
 });
 
-test('container exposes only the Fly.io app port and starts the supervised desktop stack', async () => {
-  const [dockerfile, server, lockText] = await Promise.all([
-    readFile(join(ROOT, 'Dockerfile'), 'utf8'),
-    readFile(join(ROOT, 'server.js'), 'utf8'),
-    readFile(join(ROOT, 'package-lock.json'), 'utf8'),
-  ]);
-
-  const playwrightVersion = JSON.parse(lockText).packages['node_modules/playwright'].version;
-  const playwrightImage = `v${playwrightVersion}-jammy`.replace(/\./g, '\\.');
-  assert.match(
-    dockerfile,
-    new RegExp(`^FROM mcr\\.microsoft\\.com/playwright:${playwrightImage}$`, 'm'),
-  );
-  assert.match(dockerfile, /^ENV PORT=3000$/m);
-  assert.match(dockerfile, /^EXPOSE 3000$/m);
-  assert.match(dockerfile, /^CMD \["\/usr\/local\/bin\/start-x-login"\]$/m);
-  assert.match(dockerfile, /xvfb x11vnc novnc websockify openbox/);
-  assert.match(dockerfile, /ENTRYPOINT \["\/usr\/bin\/tini", "-s", "--"\]/);
-  assert.equal((dockerfile.match(/^EXPOSE /gm) || []).length, 1);
+test('native service uses the platform port and retains optional Browserbase sign-in', async () => {
+  const server = await readFile(join(ROOT, 'server.js'), 'utf8');
   assert.match(server, /process\.env\.PORT \|\| 3000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
   assert.match(server, /Server listening on port/);
@@ -1567,32 +1295,36 @@ test('container exposes only the Fly.io app port and starts the supervised deskt
   assert.ok(loginFlow.indexOf('createLiveInspection(page') < loginFlow.indexOf('safeGoto(page, LOGIN_URL'));
   assert.match(loginFlow, /waitForRemoteSignIn\(page, context, signal, send\)/);
   assert.equal(server.includes('/auth/x/credentials'), false);
+  assert.doesNotMatch(server, /HARVEST_|INTERACTIVE_LOGIN_|remote-desktop-http|desktop-browser/);
 });
 
-test('production preflight and docs include the harvest API token', async () => {
+test('production preflight and docs describe manual imports without the retired service configuration', async () => {
   const [checkProd, envExample, readme] = await Promise.all([
     readFile(join(ROOT, 'scripts', 'check-prod.js'), 'utf8'),
     readFile(join(ROOT, '.env.example'), 'utf8'),
     readFile(join(ROOT, 'README.md'), 'utf8'),
   ]);
 
-  assert.match(checkProd, /HARVEST_API_TOKEN/);
-  assert.match(envExample, /^HARVEST_API_TOKEN=/m);
-  assert.match(readme, /POST \/api\/harvest-token/);
-  assert.match(readme, /lib\/harvest-client\.js/);
+  assert.match(checkProd, /BROWSERBASE_API_KEY/);
+  assert.match(checkProd, /SESSION_SECRET/);
+  assert.match(readme, /POST \/api\/auth\/import-session/);
+  for (const contents of [checkProd, envExample, readme]) {
+    assert.doesNotMatch(contents, /HARVEST_|INTERACTIVE_LOGIN_|fly\.dev|noVNC|Xvfb/);
+  }
 });
 
-test('dashboard connects X accounts through interactive Fly login without asking for X credentials', async () => {
+test('dashboard imports X sessions with masked inputs instead of asking for X credentials', async () => {
   const html = await readFile(join(ROOT, 'public', 'index.html'), 'utf8');
   assert.equal(html.includes('id="x-credentials-form"'), false);
   assert.equal(html.includes('id="x-password"'), false);
-  assert.match(html, /\/api\/auth\/x-accounts\/interactive/);
-  assert.match(html, /launchRemoteLoginWindow\(data\.viewerUrl, preparedWindow\)/);
-  assert.match(html, /state\.status === 'completed'/);
+  assert.match(html, /\/api\/auth\/import-session/);
+  assert.match(html, /id="session-auth-token"[^>]*type="password"/);
+  assert.match(html, /id="session-ct0"[^>]*type="password"/);
+  assert.doesNotMatch(html, /remote-login|\/x-accounts\/interactive|window\.open|(?:local|session)Storage\.setItem/);
 });
 
-test('root serves the dashboard and X harvest authentication is enforced', async (t) => {
-  const { baseUrl } = await startServer(t, { HARVEST_API_TOKEN: 'harvest-test-token-123' });
+test('root serves the dashboard and retired desktop and harvest routes are unavailable', async (t) => {
+  const { baseUrl } = await startServer(t);
 
   const root = await fetch(`${baseUrl}/`);
   assert.equal(root.status, 200);
@@ -1606,21 +1338,28 @@ test('root serves the dashboard and X harvest authentication is enforced', async
   assert.equal(missingApi.status, 404);
   assert.deepEqual(await missingApi.json(), { error: 'No route for GET /api/does-not-exist' });
 
-  const unauthorized = await fetch(`${baseUrl}/api/harvest-token`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ identifier: 'x_user', password: 'Password-123!' }),
-  });
-  assert.equal(unauthorized.status, 401);
-  const unauthorizedBody = await unauthorized.json();
-  assert.equal(unauthorizedBody.ok, false);
+  for (const path of [
+    '/api/harvest-token', '/api/auth/x-accounts/harvest',
+    '/api/auth/x-accounts/interactive', '/api/auth/x-accounts/interactive/callback',
+    '/api/interactive-login/sessions',
+  ]) {
+    const retired = await fetch(`${baseUrl}${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(retired.status, 404, path);
+  }
+  const viewer = await fetch(`${baseUrl}/remote-login/viewer.html`);
+  assert.equal(viewer.status, 404);
+});
 
-  const authorized = await fetch(`${baseUrl}/api/harvest-token`, {
-    method: 'POST',
-    headers: { authorization: 'Bearer harvest-test-token-123', 'content-type': 'application/json' },
-    body: JSON.stringify({ identifier: '', password: 'Password-123!' }),
-  });
-  assert.equal(authorized.status, 400);
-  const authorizedBody = await authorized.json();
-  assert.equal(authorizedBody.ok, false);
+test('retired deployment and desktop worker files have been removed', async () => {
+  for (const path of [
+    'fly.toml', 'Dockerfile', '.dockerignore', 'docker/openbox.xml',
+    'scripts/desktop-browser-server.cjs', 'scripts/start-desktop.sh',
+    'lib/desktop-browser.js', 'lib/harvest-client.js', 'lib/interactive-login.js',
+    'lib/interactive-login-client.js', 'lib/remote-desktop-http.js',
+    'public/remote-login/viewer.html', 'public/remote-login/viewer.js', 'public/remote-login/viewer.css',
+  ]) {
+    await assert.rejects(stat(join(ROOT, path)), { code: 'ENOENT' });
+  }
 });

@@ -3,7 +3,6 @@ import { spawn, spawnSync } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveInteractiveLoginConfig } from '../lib/interactive-login.js';
 
 /**
  * Deployment gate for `npm run check:prod`.
@@ -73,12 +72,6 @@ const INSECURE_SESSION_SECRETS = new Set([
   'your-session-secret',
   'replace-with-at-least-32-random-characters',
 ]);
-const INSECURE_HARVEST_TOKENS = new Set([
-  'change-me',
-  'changeme',
-  'harvest-token',
-  'replace-with-at-least-32-random-characters',
-]);
 const sessionSecret = String(process.env.SESSION_SECRET ?? '');
 if (sessionSecret.length < 32 || INSECURE_SESSION_SECRETS.has(sessionSecret.toLowerCase())) {
   fail(
@@ -89,29 +82,11 @@ if (sessionSecret.length < 32 || INSECURE_SESSION_SECRETS.has(sessionSecret.toLo
 }
 
 const browserbaseApiKey = String(process.env.BROWSERBASE_API_KEY ?? '').trim();
-if (process.env.INTERACTIVE_LOGIN_ENABLED !== 'true' && (!browserbaseApiKey || browserbaseApiKey === 'YOUR_API_KEY')) {
+if (!browserbaseApiKey || browserbaseApiKey === 'YOUR_API_KEY') {
   fail(
     'BROWSERBASE_API_KEY must be set to a real Browserbase API key.\n' +
       'Get it from https://www.browserbase.com/settings and keep it out of source control.',
   );
-}
-
-const harvestApiToken = String(process.env.HARVEST_API_TOKEN ?? '').trim();
-if (harvestApiToken.length < 32 || INSECURE_HARVEST_TOKENS.has(harvestApiToken.toLowerCase())) {
-  fail(
-    'HARVEST_API_TOKEN must be set to a unique value of at least 32 characters in production.\n' +
-      'This is the bearer token used by trusted backends to call POST /api/harvest-token.\n' +
-      'Generate one with:\n' +
-      'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"',
-  );
-}
-
-if (process.env.INTERACTIVE_LOGIN_ENABLED === 'true') {
-  try {
-    resolveInteractiveLoginConfig();
-  } catch (error) {
-    fail(error.message);
-  }
 }
 
 console.log('[check:prod] Environment verified (NODE_ENV=production).');

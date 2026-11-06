@@ -3,17 +3,13 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import bcrypt from 'bcrypt';
-import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'crypto';
-import { setTimeout as waitForPoll } from 'node:timers/promises';
 import {
-  applyStealthProfile,
-  chromeIdentityForVersion,
   closeBrowser,
   connectBrowser,
   createTrustedLoginProfile,
@@ -30,31 +26,13 @@ import {
   X_LOGIN_URL,
   X_REFERER,
 } from './lib/browser.js';
-import { harvestXAccount } from './lib/harvest-client.js';
-import { fillXLoginForm, safeXHandle, waitForXHomeTimeline } from './lib/x-login.js';
-import { openDesktopBrowser } from './lib/desktop-browser.js';
-import { createInteractiveLoginClient } from './lib/interactive-login-client.js';
-import {
-  CALLBACK_GRACE_MS,
-  createInteractiveLoginService,
-  extractXSessionCookies,
-  INTERACTIVE_CALLBACK_PATH,
-  INTERACTIVE_LOGIN_PATH,
-  InteractiveLoginError,
-  matchesSecret,
-  resolveInteractiveLoginConfig,
-  secretDigest,
-  SESSION_ID_PATTERN,
-} from './lib/interactive-login.js';
-import { attachRemoteDesktopUpgrade, bearerToken, flySessionRouting, installRemoteViewer } from './lib/remote-desktop-http.js';
 
 /**
  * Local service for the X reply automation.
  *
  *   POST /api/auth/register, /api/auth/login -> persisted local user authentication
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
- *   POST /api/auth/x-accounts/harvest -> Fly.io harvest sign-in -> sessions/<userId>/<xUsername>.json
- *   POST /api/auth/x-accounts/interactive -> Fly noVNC sign-in, callback -> per-tenant state
+ *   POST /api/auth/import-session -> import X cookies -> active per-user session
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
  *   POST /auth/x     -> optional Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
@@ -62,9 +40,8 @@ import { attachRemoteDesktopUpgrade, bearerToken, flySessionRouting, installRemo
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
- * Terminate TLS before public exposure. Fly desktop APIs require the internal
- * service token; desktop viewers receive only short-lived, per-login access.
- * Set HOST=127.0.0.1 for local-only use.
+ * Terminate TLS before public exposure. Imported X cookies grant account access
+ * and must only be sent by authenticated users over HTTPS in production.
  */
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -98,18 +75,11 @@ const APP_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const DEVELOPMENT_SESSION_SECRET = 'dev-secret-change-in-production';
 const SESSION_SECRET = String(process.env.SESSION_SECRET || DEVELOPMENT_SESSION_SECRET);
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS ?? 12);
-const HARVEST_API_TOKEN = String(process.env.HARVEST_API_TOKEN ?? '').trim();
 const INSECURE_SESSION_SECRETS = new Set([
   DEVELOPMENT_SESSION_SECRET,
   'change-me',
   'changeme',
   'your-session-secret',
-  'replace-with-at-least-32-random-characters',
-]);
-const INSECURE_HARVEST_TOKENS = new Set([
-  'change-me',
-  'changeme',
-  'harvest-token',
   'replace-with-at-least-32-random-characters',
 ]);
 
@@ -119,12 +89,6 @@ if (!Number.isInteger(BCRYPT_ROUNDS) || BCRYPT_ROUNDS < 10 || BCRYPT_ROUNDS > 15
 if (IS_PRODUCTION && (SESSION_SECRET.length < 32 || INSECURE_SESSION_SECRETS.has(SESSION_SECRET.toLowerCase()))) {
   throw new Error('SESSION_SECRET must be a unique value of at least 32 characters in production');
 }
-if (
-  IS_PRODUCTION &&
-  (HARVEST_API_TOKEN.length < 32 || INSECURE_HARVEST_TOKENS.has(HARVEST_API_TOKEN.toLowerCase()))
-) {
-  throw new Error('HARVEST_API_TOKEN must be a unique value of at least 32 characters in production');
-}
 if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
   console.warn('[security] SESSION_SECRET is using the development fallback; set a unique 32+ character value before deployment.');
 }
@@ -132,33 +96,6 @@ if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
 /** Same shape main.js accepts; keeps anything else out of argv. */
 const TWEET_URL = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
-const HARVEST_LOGIN_TIMEOUT_MS = (() => {
-  const configured = Number(process.env.HARVEST_LOGIN_TIMEOUT_MS ?? process.env.X_HARVEST_LOGIN_TIMEOUT_MS);
-  if (!Number.isFinite(configured) || configured < 30_000) return 120_000;
-  return Math.min(configured, 300_000);
-})();
-const HARVEST_RUN_TIMEOUT_MS = HARVEST_LOGIN_TIMEOUT_MS + 120_000 + 5_000;
-const HARVEST_LOW_MEMORY_ARGS = [
-  '--no-sandbox',
-  '--disable-setuid-sandbox',
-  '--disable-dev-shm-usage',
-  '--disable-accelerated-2d-canvas',
-  '--disable-gpu',
-  '--single-process',
-];
-const HARVEST_VIEWPORT = Object.freeze({ width: 1366, height: 768 });
-const HARVEST_STEALTH_ARGS = Object.freeze([
-  ...HARVEST_LOW_MEMORY_ARGS,
-  '--disable-blink-features=AutomationControlled',
-  '--lang=en-US',
-  '--window-size=1366,768',
-  '--no-first-run',
-  '--no-default-browser-check',
-  '--disable-background-networking',
-  '--disable-sync',
-  '--metrics-recording-only',
-  '--mute-audio',
-]);
 
 const LOGIN_URL = X_LOGIN_URL;
 const HOME_URL = 'https://x.com/home';
@@ -198,7 +135,7 @@ function toOrigin(value) {
 }
 
 const allowedOrigins = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
-for (const value of [process.env.PUBLIC_ORIGIN, process.env.RENDER_EXTERNAL_URL, process.env.ALLOWED_ORIGINS, process.env.INTERACTIVE_LOGIN_PUBLIC_ORIGIN]) {
+for (const value of [process.env.PUBLIC_ORIGIN, process.env.RENDER_EXTERNAL_URL, process.env.ALLOWED_ORIGINS]) {
   for (const candidate of String(value || '').split(',')) {
     if (!candidate.trim()) continue;
     const origin = toOrigin(candidate);
@@ -225,16 +162,6 @@ function isAllowedOrigin(origin) {
   return IS_PRODUCTION && isOnRenderOrigin(normalized);
 }
 
-async function requireHarvestAccess(req) {
-  const bearer = String(req.headers.authorization ?? '').match(/^Bearer\s+(.+)$/i)?.[1];
-  const isInternalToken = Boolean(HARVEST_API_TOKEN) && bearer === HARVEST_API_TOKEN;
-  if (isInternalToken) return null;
-  const user = await optionalAuthenticatedUser(req);
-  if (IS_PRODUCTION) throw new HttpError(401, 'Harvest token required');
-  if (user) return user;
-  throw new HttpError(401, 'Authentication required');
-}
-
 app.use(
   cors({
     origin(origin, callback) {
@@ -246,11 +173,11 @@ app.use(
   }),
 );
 
-app.use(bodyParser.json({ limit: MAX_BODY }));
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
   next();
 });
+app.use(bodyParser.json({ limit: MAX_BODY }));
 
 /* -------------------------------- helpers -------------------------------- */
 
@@ -607,39 +534,6 @@ function validateValue(name, value) {
   return trimmed;
 }
 
-/** Convert the Fly.io harvest response into a Playwright storage-state file. */
-function harvestedXStorageState({ username, cookies }) {
-  const normalized = [];
-  for (const cookie of Array.isArray(cookies) ? cookies : []) {
-    const name = String(cookie?.name ?? '');
-    if (!Object.hasOwn(COOKIE_SPEC, name)) continue;
-    const sameSite = ['Strict', 'Lax', 'None'].includes(cookie?.sameSite) ? cookie.sameSite : undefined;
-    normalized.push({
-      name,
-      value: validateValue(name, cookie?.value),
-      domain: '.x.com',
-      path: '/',
-      secure: cookie?.secure !== false,
-      httpOnly: cookie?.httpOnly ?? COOKIE_SPEC[name].httpOnly,
-      ...(sameSite ? { sameSite } : {}),
-    });
-  }
-
-  const names = new Set(normalized.map((cookie) => cookie.name));
-  if (!names.has(X_AUTH_COOKIE) || !names.has(X_CSRF_COOKIE)) {
-    throw new HttpError(502, `The harvest response did not include both ${X_AUTH_COOKIE} and ${X_CSRF_COOKIE}`);
-  }
-
-  return {
-    cookies: normalized,
-    origins: [],
-    username,
-    savedAt: new Date().toISOString(),
-    cookieCount: normalized.length,
-    source: 'fly-harvest',
-  };
-}
-
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -652,48 +546,6 @@ class ValidationError extends HttpError {
     super(400, message);
   }
 }
-
-const interactiveConfig = resolveInteractiveLoginConfig();
-const interactiveLogins = createInteractiveLoginService({
-  config: interactiveConfig,
-  openBrowser: openDesktopBrowser,
-  readIdentity: readSignedInUsername,
-});
-installRemoteViewer(app, { service: interactiveLogins, config: interactiveConfig, publicDir: PUBLIC_DIR });
-
-const internalHarvestDigest = secretDigest(HARVEST_API_TOKEN);
-function requireInternalHarvestAccess(req) {
-  if (!HARVEST_API_TOKEN || !matchesSecret(bearerToken(req.headers), internalHarvestDigest)) {
-    throw new HttpError(401, 'Harvest token required');
-  }
-}
-
-app.post(INTERACTIVE_LOGIN_PATH, (req, res, next) => {
-  try {
-    requireInternalHarvestAccess(req);
-    res.status(201).json(interactiveLogins.start(req.body ?? {}));
-  } catch (error) {
-    next(error);
-  } finally {
-    if (req.body) delete req.body.callbackToken;
-  }
-});
-app.get(`${INTERACTIVE_LOGIN_PATH}/:sessionId`, flySessionRouting(interactiveConfig), (req, res, next) => {
-  try {
-    requireInternalHarvestAccess(req);
-    res.json(interactiveLogins.status(req.params.sessionId));
-  } catch (error) {
-    next(error);
-  }
-});
-app.delete(`${INTERACTIVE_LOGIN_PATH}/:sessionId`, flySessionRouting(interactiveConfig), async (req, res, next) => {
-  try {
-    requireInternalHarvestAccess(req);
-    res.json(await interactiveLogins.cancel(req.params.sessionId));
-  } catch (error) {
-    next(error);
-  }
-});
 
 function getGroqConfiguration(user) {
   const apiKey = String(user?.groqApiKey ?? '').trim() || null;
@@ -795,7 +647,7 @@ async function stopActiveRunForUser(userId, { xUsername = null, type = null } = 
   const stopped = await Promise.race([
     handle.done.then(() => true),
     new Promise((resolveTimeout) => {
-      timer = setTimeout(() => resolveTimeout(false), handle.type === 'fly-x-auth' ? 25_000 : 10_000);
+      timer = setTimeout(() => resolveTimeout(false), 10_000);
       timer.unref?.();
     }),
   ]);
@@ -832,11 +684,18 @@ async function accountSummaries(user) {
   );
 }
 
-async function stageActiveSession(user) {
-  const session = await activeSessionFor(user, { required: true });
-  const payload = await readAuthFile(session.path);
-  await withWriteLock(() => writeAuthFile(payload, AUTH_FILE));
-  return session;
+async function stageActiveSession(user, { sessionToken = null } = {}) {
+  return withWriteLock(async () => {
+    if (sessionToken) {
+      const users = await loadUserDb();
+      user = users.find((candidate) => candidate.id === user.id && candidate.sessionToken === sessionToken);
+      if (!user) throw new HttpError(401, 'The app session is no longer active');
+    }
+    const session = await activeSessionFor(user, { required: true });
+    const payload = await readAuthFile(session.path);
+    await writeAuthFile(payload, AUTH_FILE);
+    return session;
+  });
 }
 
 function trustedLoginProfilePayload(storageState) {
@@ -905,290 +764,117 @@ async function addAccountToUser(userId, xUsername) {
   });
 }
 
-/* ------------------------ Render's pending Fly sign-ins ------------------- */
+/* --------------------------- manual X session import ---------------------- */
 
-// Pending logins are intentionally ephemeral. A restart requires a new login;
-// cookie state is persisted only after a valid, tenant-bound callback.
-const pendingFlyLogins = new Map();
-
-function publicFlyLogin(record) {
-  return {
-    requestId: record.id,
-    status: record.status,
-    expiresAt: new Date(record.expiresAt).toISOString(),
-    ...(record.error ? { error: record.error } : {}),
-    ...(record.result || {}),
-  };
-}
-
-function finishFlyLogin(record, status, { error, result } = {}) {
-  if (record.finished) return;
-  record.finished = true;
-  record.status = status;
-  record.error = error;
-  record.result = result;
-  clearTimeout(record.expiryTimer);
-  record.controller.abort();
-  if (activeRun === record.handle) activeRun = null;
-  record.completion.resolve();
-  const retentionTimer = setTimeout(() => pendingFlyLogins.delete(record.id), 60_000);
-  retentionTimer.unref?.();
-}
-
-function cancelFlyLogin(record, status = 'cancelled') {
-  if (record.finished) return Promise.resolve();
-  if (record.cancelPromise) return record.cancelPromise;
-  record.status = status;
-  record.controller.abort();
-  record.cancelPromise = (async () => {
-    // Unlink/logout must wait for any callback already writing under the lock.
-    await record.savePromise?.catch(() => {});
-    // Keep the short START request alive long enough to learn Machine affinity.
-    // Aborting it could hide an accepted login on a different Fly Machine.
-    await record.startPromise?.catch(() => {});
-    let error;
-    try {
-      const remote = await record.client.cancel(record.id, { machineId: record.machineId });
-      record.handle.closed = remote.browserClosed === true;
-      if (!record.handle.closed) throw new Error('Desktop cleanup was not confirmed');
-    } catch {
-      error = 'The remote close could not be confirmed; its access still expires automatically.';
-    }
-    finishFlyLogin(record, status, { error });
-  })();
-  return record.cancelPromise;
-}
-
-async function monitorFlyLogin(record) {
-  while (!record.finished && !record.controller.signal.aborted) {
-    try {
-      const remote = await record.client.status(record.id, { machineId: record.machineId, signal: record.controller.signal });
-      if (record.finished || record.controller.signal.aborted) return;
-      if (['failed', 'expired', 'cancelled'].includes(remote.status)) {
-        record.handle.closed = remote.browserClosed === true;
-        finishFlyLogin(record, remote.status, { error: remote.error || 'Remote sign-in did not complete. Try again.' });
-        return;
-      }
-      if (['starting', 'waiting', 'capturing', 'delivering'].includes(remote.status)) record.status = remote.status;
-      // "completed" alone is never proof of a login: only the authenticated
-      // cookie callback can link an account or mark this record completed.
-    } catch {
-      // Transient Fly outages do not erase the pending login or link an account.
-    }
-    await waitForPoll(2_000, undefined, { signal: record.controller.signal, ref: false }).catch(() => {});
-  }
-}
-
-app.post('/api/auth/x-accounts/interactive', async (req, res, next) => {
-  let record;
+app.post('/api/auth/import-session', async (req, res, next) => {
   try {
     const auth = await authenticatedUser(req);
-    normalizeUserAccounts(auth.user);
-    if (req.body?.requestId !== undefined &&
-        (typeof req.body.requestId !== 'string' || !SESSION_ID_PATTERN.test(req.body.requestId))) {
-      throw new ValidationError('Invalid remote sign-in request ID');
-    }
-    const requestedXUsername = req.body?.xUsername ? normalizeXUsername(req.body.xUsername) : null;
-    if (auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
-        (!requestedXUsername || !auth.user.xAccounts.includes(requestedXUsername))) {
-      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-    }
-    const client = createInteractiveLoginClient();
-    const callbackToken = crypto.randomBytes(32).toString('base64url');
-    record = {
-      id: req.body?.requestId ?? crypto.randomUUID(),
-      userId: auth.user.id,
-      sessionDigest: secretDigest(auth.token),
-      callbackDigest: secretDigest(callbackToken),
-      requestedXUsername,
-      generation: authGeneration,
-      status: 'starting',
-      expiresAt: Date.now() + 900_000,
-      machineId: null,
-      controller: new AbortController(),
-      completion: createCompletionSignal(),
-      client,
+    const body = req.body ?? {};
+    if (typeof body.handle !== 'string') throw new ValidationError('handle must be an X username');
+    const username = normalizeXUsername(body.handle);
+    const storageState = {
+      cookies: Object.entries(COOKIE_SPEC).map(([name, spec]) => ({
+        name,
+        value: validateValue(name, body[name]),
+        domain: '.x.com',
+        path: '/',
+        expires: -1,
+        secure: true,
+        httpOnly: spec.httpOnly,
+        sameSite: 'Lax',
+      })),
+      origins: [],
+      username,
+      savedAt: new Date().toISOString(),
+      loginUrl: X_LOGIN_URL,
+      cookieCount: 2,
+      source: 'manual-import',
     };
-    record.handle = {
-      type: 'fly-x-auth',
-      userId: record.userId,
-      xUsername: requestedXUsername,
-      closed: false,
-      done: record.completion.promise,
-      abort() { void cancelFlyLogin(record); },
-    };
-    await withWriteLock(async () => {
+    if (activeRun && activeRun.type !== 'session-import') {
+      throw new HttpError(409, 'A run is already in progress');
+    }
+
+    const result = await withWriteLock(async () => {
       const users = await loadUserDb();
-      const current = users.find((candidate) => candidate.id === record.userId);
-      assertPendingFlyLogin(record, current);
+      const current = users.find((user) => user.id === auth.user.id && user.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
       normalizeUserAccounts(current);
-      if (current.xAccounts.length >= MAX_X_ACCOUNTS &&
-          (!requestedXUsername || !current.xAccounts.includes(requestedXUsername))) {
+      if (!current.xAccounts.includes(username) && current.xAccounts.length >= MAX_X_ACCOUNTS) {
         throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
       }
       if (activeRun) throw new HttpError(409, 'A run is already in progress');
-      if (pendingFlyLogins.has(record.id)) throw new HttpError(409, 'This sign-in request ID was already used');
-      pendingFlyLogins.set(record.id, record);
-      activeRun = record.handle;
-    });
-    res.on('close', () => {
-      if (!res.writableEnded && !record.finished) record.handle.abort();
-    });
-    if (res.destroyed) throw new HttpError(410, 'Sign-in was cancelled');
 
-    record.startPromise = client.start({ requestId: record.id, callbackToken }).then((remote) => {
-      record.machineId = remote.machineId;
-      record.expiresAt = Date.parse(remote.expiresAt);
-      return remote;
-    });
-    const remote = await record.startPromise;
-    if (record.controller.signal.aborted && record.status !== 'completed') throw new HttpError(410, 'Sign-in was cancelled');
-    if (!record.finished) {
-      record.expiryTimer = setTimeout(() => void cancelFlyLogin(record, 'expired'),
-        Math.max(1, record.expiresAt + CALLBACK_GRACE_MS - Date.now()));
-      record.expiryTimer.unref?.();
-      void monitorFlyLogin(record);
-    }
-    res.status(201).json({ ...publicFlyLogin(record), viewerUrl: remote.viewerUrl });
-  } catch (error) {
-    if (record && pendingFlyLogins.get(record.id) === record && !record.finished) {
-      const cancelled = record.controller.signal.aborted;
-      await cancelFlyLogin(record);
-      if (!cancelled) {
-        record.status = 'failed';
-        record.error = 'Could not start the remote X browser. Try again.';
-      }
-    }
-    next(error.name === 'AbortError' ? new HttpError(410, 'Sign-in was cancelled') : error);
-  }
-});
-
-app.get('/api/auth/x-accounts/interactive/:requestId', async (req, res, next) => {
-  try {
-    const auth = await authenticatedUser(req);
-    const record = pendingFlyLogins.get(req.params.requestId);
-    if (!record || record.userId !== auth.user.id || !matchesSecret(auth.token, record.sessionDigest)) {
-      throw new HttpError(404, 'Pending sign-in not found');
-    }
-    res.json(publicFlyLogin(record));
-  } catch (error) {
-    next(error);
-  }
-});
-
-function assertPendingFlyLogin(record, user) {
-  if (record.controller.signal.aborted || record.generation !== authGeneration ||
-      Date.now() > record.expiresAt + CALLBACK_GRACE_MS) {
-    throw new HttpError(410, 'Sign-in was cancelled or expired');
-  }
-  if (!user || !matchesSecret(user.sessionToken, record.sessionDigest)) {
-    throw new HttpError(410, 'The app session is no longer active');
-  }
-}
-
-async function persistFlyLogin(record, username, storageState) {
-  return withWriteLock(async () => {
-    const users = await loadUserDb();
-    const current = users.find((user) => user.id === record.userId);
-    assertPendingFlyLogin(record, current);
-    normalizeUserAccounts(current);
-    if (!current.xAccounts.includes(username) && current.xAccounts.length >= MAX_X_ACCOUNTS) {
-      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-    }
-    const destination = sessionFileFor(current.id, username);
-    const previousSession = await readAuthFile(destination);
-    const previousActive = await readAuthFile(AUTH_FILE);
-    const previousUsers = structuredClone(users);
-    let sessionWritten = false;
-    let usersWritten = false;
-    let activeWritten = false;
-    try {
-      assertPendingFlyLogin(record, current);
-      await writeAuthFile(storageState, destination);
-      sessionWritten = true;
-      assertPendingFlyLogin(record, current);
-      if (!current.xAccounts.includes(username)) current.xAccounts.push(username);
-      current.preferences.defaultXAccount = username;
-      await saveUserDb(users);
-      usersWritten = true;
-      assertPendingFlyLogin(record, current);
-      await writeAuthFile(storageState, AUTH_FILE);
-      activeWritten = true;
-      const accounts = await accountSummaries(current);
-      assertPendingFlyLogin(record, current);
-      return { username, activeXAccount: username, accounts };
-    } catch (error) {
-      // Cancellation waits for this lock. Restore only this transaction's
-      // writes, so an interrupted callback cannot leave orphaned auth cookies.
+      // Reserve the runtime while staging auth.json so no browser can start
+      // with another user's partially imported session.
+      const request = new AbortController();
+      const completion = createCompletionSignal();
+      const handle = {
+        type: 'session-import',
+        userId: current.id,
+        xUsername: username,
+        done: completion.promise,
+        abort() { request.abort(); },
+      };
+      activeRun = handle;
+      attachRunCleanup(res, handle);
+      const assertOpen = () => {
+        if (request.signal.aborted || res.destroyed) throw new HttpError(410, 'Session import was cancelled');
+      };
+      const destination = sessionFileFor(current.id, username);
+      const previousUsers = structuredClone(users);
+      let previousSession;
+      let previousActive;
+      let sessionWritten = false;
+      let usersWritten = false;
+      let activeWritten = false;
       try {
-        if (activeWritten) {
-          if (previousActive) await writeAuthFile(previousActive, AUTH_FILE);
-          else await deleteAuthFile(AUTH_FILE);
+        previousSession = await readAuthFile(destination);
+        previousActive = await readAuthFile(AUTH_FILE);
+        assertOpen();
+        await writeAuthFile(storageState, destination);
+        sessionWritten = true;
+        assertOpen();
+        if (!current.xAccounts.includes(username)) current.xAccounts.push(username);
+        current.preferences.defaultXAccount = username;
+        await saveUserDb(users);
+        usersWritten = true;
+        assertOpen();
+        await writeAuthFile(storageState, AUTH_FILE);
+        activeWritten = true;
+        const accounts = await accountSummaries(current);
+        assertOpen();
+        return { username, activeXAccount: username, accounts };
+      } catch (error) {
+        // Restore only this import's writes while still holding the write lock.
+        try {
+          if (activeWritten) {
+            if (previousActive) await writeAuthFile(previousActive, AUTH_FILE);
+            else await deleteAuthFile(AUTH_FILE);
+          }
+          if (usersWritten) await saveUserDb(previousUsers);
+          if (sessionWritten) {
+            if (previousSession) await writeAuthFile(previousSession, destination);
+            else await deleteAuthFile(destination);
+          }
+        } catch {
+          throw new HttpError(503, 'Could not restore an interrupted session import. Check persistent storage before retrying.');
         }
-        if (usersWritten) await saveUserDb(previousUsers);
-        if (sessionWritten) {
-          if (previousSession) await writeAuthFile(previousSession, destination);
-          else await deleteAuthFile(destination);
-        }
-      } catch {
-        throw new HttpError(503, 'Could not restore an interrupted login save. Check persistent storage before retrying.');
+        throw error;
+      } finally {
+        if (activeRun === handle) activeRun = null;
+        completion.resolve();
       }
-      throw error;
-    }
-  });
-}
-
-app.post(INTERACTIVE_CALLBACK_PATH, async (req, res, next) => {
-  try {
-    const body = req.body ?? {};
-    const record = pendingFlyLogins.get(body.requestId);
-    if (!record) throw new HttpError(404, 'Pending sign-in not found');
-    if (!matchesSecret(bearerToken(req.headers), record.callbackDigest)) throw new HttpError(401, 'Callback authentication required');
-    if (body.sessionId !== record.id) throw new ValidationError('Callback session ID does not match');
-    if (record.finished && ['failed', 'expired'].includes(record.status) && body.status === record.status) {
-      return res.json({ ok: true });
-    }
-    if (['cancelled', 'expired', 'failed'].includes(record.status) || Date.now() > record.expiresAt + CALLBACK_GRACE_MS) {
-      throw new HttpError(410, 'This sign-in is no longer pending');
-    }
-    if (['failed', 'expired'].includes(body.status)) {
-      if (record.savePromise || record.finished) throw new HttpError(409, 'A login result was already received');
-      record.handle.closed = body.browserClosed === true;
-      finishFlyLogin(record, body.status, { error: 'Remote X sign-in did not complete. Start a new session.' });
-      return res.json({ ok: true });
-    }
-    if (body.status !== 'completed') throw new ValidationError('Invalid callback status');
-    if (body.browserClosed !== true) throw new ValidationError('Callback must confirm the remote browser is closed');
-    const username = normalizeXUsername(body.username);
-    if (record.requestedXUsername && username !== record.requestedXUsername) {
-      throw new HttpError(409, `Signed in as @${username}, but @${record.requestedXUsername} was requested`);
-    }
-    const cookies = extractXSessionCookies(body.cookies);
-    if (!cookies) throw new ValidationError('Callback must contain auth_token and ct0 from X');
-    const storageState = { ...harvestedXStorageState({ username, cookies }), source: 'fly-interactive' };
-    const material = JSON.stringify({ username, cookies: storageState.cookies });
-    if (record.payloadDigest && !matchesSecret(material, record.payloadDigest)) {
-      throw new HttpError(409, 'A different login result was already received');
-    }
-    if (record.finished && record.status === 'completed') return res.json({ ok: true });
-    record.payloadDigest ??= secretDigest(material);
-    if (!record.savePromise) {
-      const saving = persistFlyLogin(record, username, storageState);
-      record.savePromise = saving;
-      void saving.catch(() => {
-        // Retriable storage failures must not pin an already-rejected promise.
-        if (record.savePromise === saving) record.savePromise = null;
-      });
-    }
-    const result = await record.savePromise;
-    if (record.controller.signal.aborted && record.status !== 'completed') throw new HttpError(410, 'Sign-in was cancelled');
-    record.handle.closed = true;
-    finishFlyLogin(record, 'completed', { result });
-    res.json({ ok: true });
+    });
+    res.status(201).json({ ok: true, authenticated: true, cookieCount: storageState.cookieCount, ...result });
   } catch (error) {
-    next(error);
+    // Storage/parser errors can contain snippets of existing session files.
+    // Keep those details out of both the response and the shared error logger.
+    next(error instanceof HttpError ? error : new HttpError(500, 'Could not import the X session. Check persistent storage before retrying.'));
   } finally {
-    if (req.body) delete req.body.cookies;
+    if (req.body) {
+      delete req.body.auth_token;
+      delete req.body.ct0;
+    }
   }
 });
 
@@ -1275,8 +961,7 @@ app.post('/api/auth/logout', async (req, res, next) => {
         if (user) user.sessionToken = null;
         await saveUserDb(users);
       });
-      // Revocation is serialized with pending-login reservations and callbacks.
-      // No stale authenticated request can reserve a new Fly login after it.
+      // Imports recheck this token under the same lock before saving cookies.
       await stopActiveRunForUser(auth.user.id);
       clearSessionCookie(res);
       return res.json({ ok: true, authenticated: false });
@@ -1360,7 +1045,7 @@ app.post('/api/auth/login', async (req, res, next) => {
       return match;
     });
 
-    await stopActiveRunForUser(user.id, { type: 'fly-x-auth' });
+    await stopActiveRunForUser(user.id, { type: 'x-auth' });
     setSessionCookie(res, user.sessionToken);
     return res.json({ user: publicUser(user) });
   } catch (error) {
@@ -1425,105 +1110,6 @@ app.post('/api/auth/x-accounts', async (req, res, next) => {
   }
 });
 
-// Connect and link an X account using the Fly.io harvest service.
-app.post('/api/auth/x-accounts/harvest', async (req, res, next) => {
-  try {
-    const auth = await authenticatedUser(req);
-    const body = req.body ?? {};
-    const identifier = String(body.identifier ?? body.username ?? '').trim();
-    const password = body.password;
-    const twoFactorCode = body.twoFactorCode ?? body.two_factor_code ?? null;
-
-    if (!identifier || identifier.length > 254) {
-      throw new ValidationError('A valid X username, email, or phone number is required');
-    }
-    if (typeof password !== 'string' || password.length < 8 || password.length > 256) {
-      throw new ValidationError('X password must be between 8 and 256 characters');
-    }
-    if (twoFactorCode !== null && (typeof twoFactorCode !== 'string' || !/^\d{6,10}$/.test(twoFactorCode))) {
-      throw new ValidationError('Two-factor code must be 6 to 10 digits');
-    }
-
-    normalizeUserAccounts(auth.user);
-    let identifierHandle = null;
-    try {
-      identifierHandle = normalizeXUsername(identifier);
-    } catch {
-      identifierHandle = null;
-    }
-    if (
-      auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
-      (!identifierHandle || !auth.user.xAccounts.includes(identifierHandle))
-    ) {
-      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-    }
-
-    let harvested;
-    try {
-      harvested = await harvestXAccount({
-        identifier,
-        password,
-        twoFactorCode: twoFactorCode || undefined,
-        token: HARVEST_API_TOKEN || undefined,
-        apiUrl: process.env.HARVEST_API_URL || undefined,
-      });
-    } catch (error) {
-      throw new HttpError(502, error?.message || 'X harvest failed');
-    }
-
-    let xUsername;
-    try {
-      xUsername = normalizeXUsername(harvested.username);
-    } catch {
-      try {
-        xUsername = normalizeXUsername(identifier);
-      } catch {
-        throw new HttpError(502, 'The harvest service did not return a valid X username');
-      }
-    }
-
-    const storageState = harvestedXStorageState({ username: xUsername, cookies: harvested.cookies });
-    const destination = sessionFileFor(auth.user.id, xUsername);
-
-    const user = await withWriteLock(async () => {
-      const users = await loadUserDb();
-      const current = users.find((candidate) => candidate.id === auth.user.id);
-      if (!current) throw new HttpError(401, 'User account no longer exists');
-      normalizeUserAccounts(current);
-
-      const alreadyLinked = current.xAccounts.includes(xUsername);
-      if (!alreadyLinked && current.xAccounts.length >= MAX_X_ACCOUNTS) {
-        throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-      }
-
-      await writeAuthFile(storageState, destination);
-      if (!alreadyLinked) current.xAccounts.push(xUsername);
-      current.preferences.defaultXAccount = xUsername;
-      await saveUserDb(users);
-      return current;
-    });
-
-    await stageActiveSession(user);
-
-    return res.status(201).json({
-      ok: true,
-      username: xUsername,
-      activeXAccount: user.preferences.defaultXAccount,
-      accounts: await accountSummaries(user),
-    });
-  } catch (error) {
-    next(error);
-  } finally {
-    if (req.body && typeof req.body === 'object') {
-      delete req.body.identifier;
-      delete req.body.username;
-      delete req.body.password;
-      delete req.body.twoFactorCode;
-      delete req.body.two_factor_code;
-    }
-  }
-});
-
 // Switch active X account
 app.post('/api/auth/switch-account', async (req, res, next) => {
   try {
@@ -1539,6 +1125,7 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
       if (!current) throw new HttpError(401, 'User account no longer exists');
       normalizeUserAccounts(current);
       if (!current.xAccounts.includes(xUsername)) throw new HttpError(404, 'X account is not linked');
+      if (activeRun) throw new HttpError(409, 'A run is already in progress');
       const state = await readAuthFile(sessionFileFor(current.id, xUsername));
       if (!state) throw new HttpError(404, `Saved session for @${xUsername} was not found`);
       current.preferences.defaultXAccount = xUsername;
@@ -1968,87 +1555,6 @@ async function waitForRemoteSignIn(page, context, signal, send) {
   return { loggedIn: false, error: null, timedOut: true };
 }
 
-async function runAutomatedXLogin({ identifier, password, twoFactorCode = null, signal }) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: HARVEST_STEALTH_ARGS,
-    ignoreDefaultArgs: ['--enable-automation'],
-  });
-  let context;
-  let page;
-
-  try {
-    const browserIdentity = chromeIdentityForVersion(browser.version());
-    context = await browser.newContext({
-      userAgent: browserIdentity.userAgent,
-      viewport: HARVEST_VIEWPORT,
-      screen: HARVEST_VIEWPORT,
-      locale: 'en-US',
-      timezoneId: 'America/New_York',
-      colorScheme: 'light',
-      deviceScaleFactor: 1,
-      isMobile: false,
-      hasTouch: false,
-      extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-    });
-    page = await context.newPage();
-    await applyStealthProfile(context);
-    page.setDefaultTimeout(15_000);
-    page.setDefaultNavigationTimeout(45_000);
-
-    const navigation = await safeGoto(page, LOGIN_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 45_000,
-      referer: X_REFERER,
-    });
-    if (navigation.error) throw new Error(`X navigation failed: ${navigation.error.message}`);
-    if (navigation.response && navigation.response.status() >= 400) {
-      const status = navigation.response.status();
-      if (status === 429) throw new Error('X rate-limited the automated login (HTTP 429)');
-      if (status === 403) throw new Error('X blocked the automated login (HTTP 403)');
-      throw new Error(`X returned HTTP ${status}`);
-    }
-
-    await fillXLoginForm(page, { identifier, password, twoFactorCode, signal });
-
-    const login = await waitForRemoteSignIn(page, context, signal, () => {});
-    if (login.error) throw login.error;
-    if (!login.loggedIn) {
-      throw new Error(login.timedOut ? 'X login timed out' : 'X login was not verified');
-    }
-
-    const timelineReady = await waitForXHomeTimeline(page, signal, { timeoutMs: 30_000 });
-    if (!timelineReady) throw new Error('X home timeline did not load after login');
-
-    const identity = await readSignedInUsername(page, signal);
-    const username = identity?.username ?? safeXHandle(identifier);
-    if (!username) throw new Error('Could not determine the signed-in X username');
-
-    const storageState = await context.storageState();
-    if (!hasXSessionCookies(storageState?.cookies)) {
-      throw new Error(
-        `X session cookies (${X_AUTH_COOKIE}, ${X_CSRF_COOKIE}) were not both present after login`,
-      );
-    }
-    const cookies = (storageState?.cookies ?? [])
-      .filter((cookie) => cookie?.name === X_AUTH_COOKIE || cookie?.name === X_CSRF_COOKIE)
-      .map((cookie) => ({
-        name: cookie.name,
-        value: cookie.value,
-        domain: cookie.domain,
-        path: cookie.path,
-        secure: Boolean(cookie.secure),
-        httpOnly: Boolean(cookie.httpOnly),
-      }));
-
-    return { ok: true, username, cookies };
-  } finally {
-    if (page) await page.close().catch(() => {});
-    if (context) await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-}
-
 /**
  * Connects to Browserbase, reuses its default context, waits for the user to
  * finish logging in, then saves Playwright storage state for that user/X account.
@@ -2337,31 +1843,12 @@ app.post('/auth/x/cancel', async (req, res) => {
     return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not cancel X sign-in' });
   }
 
-  if (req.body?.requestId) {
-    const record = pendingFlyLogins.get(req.body.requestId);
-    if (!record || record.userId !== auth.user.id || !matchesSecret(auth.token, record.sessionDigest)) {
-      return res.status(404).json({ error: 'Pending sign-in not found' });
-    }
-    await cancelFlyLogin(record);
-    return res.json({ ok: true, cancelled: record.status === 'cancelled', closed: record.handle.closed, status: record.status });
-  }
-
   const handle = activeRun;
-  if (!handle || !['x-auth', 'fly-x-auth'].includes(handle.type)) {
+  if (!handle || handle.type !== 'x-auth') {
     return res.json({ ok: true, cancelled: false });
   }
   if (handle.userId !== auth.user.id) {
     return res.status(403).json({ error: 'This X sign-in belongs to another session' });
-  }
-
-  if (handle.type === 'fly-x-auth') {
-    try {
-      // The next tenant must not inherit an uncleared virtual desktop.
-      await stopActiveRunForUser(auth.user.id, { type: 'fly-x-auth' });
-      return res.json({ ok: true, cancelled: true, closed: handle.closed });
-    } catch (error) {
-      return res.status(error.status ?? 503).json({ error: 'Remote browser cleanup could not be confirmed' });
-    }
   }
 
   // Release the lock before cleanup so a new sign-in can start immediately.
@@ -2380,48 +1867,6 @@ app.post('/auth/x/cancel', async (req, res) => {
   clearTimeout(timer);
 
   return res.json({ ok: true, cancelled: true, closed });
-});
-
-app.post('/api/harvest-token', async (req, res) => {
-  let user = null;
-  const controller = new AbortController();
-  const harvestTimer = setTimeout(() => controller.abort(), HARVEST_RUN_TIMEOUT_MS);
-  harvestTimer.unref?.();
-
-  try {
-    user = await requireHarvestAccess(req);
-    const body = req.body ?? {};
-    const identifier = String(body.identifier ?? body.username ?? '').trim();
-    const password = body.password;
-    const twoFactorCode = body.twoFactorCode ?? body.two_factor_code ?? null;
-
-    if (!identifier || identifier.length > 254) {
-      throw new ValidationError('A valid X username or identifier is required');
-    }
-    if (typeof password !== 'string' || password.length < 8 || password.length > 256) {
-      throw new ValidationError('X password must be between 8 and 256 characters');
-    }
-    if (twoFactorCode !== null && (typeof twoFactorCode !== 'string' || !/^\d{6,10}$/.test(twoFactorCode))) {
-      throw new ValidationError('Two-factor code must be 6 to 10 digits');
-    }
-
-    const result = await runAutomatedXLogin({ identifier, password, twoFactorCode, signal: controller.signal });
-    return res.json({ ok: true, username: result.username, cookies: result.cookies });
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      return res.status(408).json({ ok: false, error: 'X login timed out or was cancelled' });
-    }
-    return res.status(error.status ?? 502).json({ ok: false, error: error.status ? error.message : 'X login failed' });
-  } finally {
-    clearTimeout(harvestTimer);
-    if (req.body && typeof req.body === 'object') {
-      delete req.body.password;
-      delete req.body.identifier;
-      delete req.body.username;
-      delete req.body.twoFactorCode;
-      delete req.body.two_factor_code;
-    }
-  }
 });
 
 app.post('/api/run', async (req, res) => {
@@ -2443,7 +1888,6 @@ app.post('/api/run', async (req, res) => {
   let selectedSession;
   try {
     appAuth = await authenticatedUser(req);
-    selectedSession = await stageActiveSession(appAuth.user);
   } catch (error) {
     return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
   }
@@ -2452,8 +1896,8 @@ app.post('/api/run', async (req, res) => {
   if (!groqConfiguration.configured) {
     return res.status(400).json({ error: 'Groq API key is not configured. Add a saved key in the dashboard.' });
   }
-  // Authentication/session staging above yields; reserve the runtime only after
-  // re-checking so two concurrent requests cannot both launch browsers.
+  // Authentication yields; reserve before staging so overlapping requests cannot
+  // replace the active cookie file, even if they never launch a browser.
   if (activeRun) {
     return res.status(409).json({ error: 'A run is already in progress' });
   }
@@ -2467,7 +1911,7 @@ app.post('/api/run', async (req, res) => {
   const batchHandle = {
     type: 'automation',
     userId: appAuth.user.id,
-    xUsername: selectedSession.xUsername,
+    xUsername: null,
     done: completion.promise,
     abort() {
       if (aborted) return;
@@ -2477,6 +1921,17 @@ app.post('/api/run', async (req, res) => {
     },
   };
   activeRun = batchHandle;
+  attachRunCleanup(res, batchHandle);
+
+  try {
+    selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
+    batchHandle.xUsername = selectedSession.xUsername;
+    if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
+  } catch (error) {
+    if (activeRun === batchHandle) activeRun = null;
+    completion.resolve();
+    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
+  }
 
   res.writeHead(200, {
     'content-type': 'application/x-ndjson; charset=utf-8',
@@ -2486,7 +1941,6 @@ app.post('/api/run', async (req, res) => {
   res.flushHeaders?.();
 
   const send = makeSend(res);
-  attachRunCleanup(res, batchHandle);
 
   const waitForCooldown = (ms) =>
     new Promise((resolve) => {
@@ -2730,11 +2184,14 @@ app.use(express.static(PUBLIC_DIR, { index: 'index.html' }));
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
 
-  if (error instanceof HttpError || error instanceof InteractiveLoginError) {
+  if (error instanceof HttpError) {
     return res.status(error.status).json({ error: error.message });
   }
   if (error instanceof SyntaxError && 'body' in error) {
     return res.status(400).json({ error: 'Body must be valid JSON' });
+  }
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ error: `JSON body must not exceed ${MAX_BODY}` });
   }
   if (error?.message === 'Origin not allowed') {
     return res.status(403).json({ error: 'Origin not allowed' });
@@ -2765,8 +2222,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/x-accounts (list saved X sessions)`);
-  console.log(`  POST ${HOST}:${PORT}/api/auth/x-accounts/harvest (harvest and link an X account)`);
-  console.log(`  POST ${HOST}:${PORT}/api/auth/x-accounts/interactive (Fly noVNC sign-in)`);
+  console.log(`  POST ${HOST}:${PORT}/api/auth/import-session (import and activate X session cookies)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/switch-account (select active X session)`);
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
@@ -2774,7 +2230,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  POST ${HOST}:${PORT}/auth/x      (interactive Browserbase sign-in -> per-user session file)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
-attachRemoteDesktopUpgrade(server, { service: interactiveLogins, config: interactiveConfig });
 
 let shuttingDown = false;
 const shutdown = async () => {
@@ -2786,8 +2241,6 @@ const shutdown = async () => {
   if (handle) {
     await Promise.race([handle.done, sleep(10_000)]).catch(() => {});
   }
-  await interactiveLogins.close();
-
   const forceExit = setTimeout(() => process.exit(1), 10_000);
   forceExit.unref?.();
   server.close(() => {
