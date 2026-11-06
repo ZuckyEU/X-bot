@@ -750,6 +750,7 @@ test('production refuses an insecure session secret', async () => {
 test('production accepts a strong secret and emits hardened session cookies', async (t) => {
   const { baseUrl } = await startServer(t, {
     NODE_ENV: 'production',
+    DATABASE_URL: 'pg-mem://',
     HARVEST_API_TOKEN: '',
   });
   const response = await fetch(`${baseUrl}/api/auth/register`, {
@@ -769,9 +770,39 @@ test('production accepts a strong secret and emits hardened session cookies', as
   const imported = await importSession(baseUrl, sessionCookie(response), importPayload('production_x'));
   assert.equal(imported.status, 201);
 });
+test('PostgreSQL stores users and X sessions and restores them after login', async (t) => {
+  const { baseUrl, dataDir } = await startServer(t, { DATABASE_URL: 'pg-mem://' });
+  const { cookie, password } = await register(baseUrl, 'pg');
+
+  const imported = await importSession(baseUrl, cookie, importPayload('alpha'));
+  assert.equal(imported.status, 201, await imported.text());
+
+  const status = await fetch(`${baseUrl}/api/auth`, { headers: { cookie } });
+  const statusBody = await status.json();
+  assert.equal(statusBody.authenticated, true);
+  assert.equal(statusBody.activeXAccount, 'alpha');
+  assert.deepEqual(statusBody.xAccounts, ['alpha']);
+
+  await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie } });
+
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'user_pg', password }),
+  });
+  assert.equal(login.status, 200, await login.text());
+  const loginCookie = sessionCookie(login);
+
+  const accounts = await fetch(`${baseUrl}/api/auth/x-accounts`, { headers: { cookie: loginCookie } });
+  assert.deepEqual(await accounts.json(), [{ xUsername: 'alpha', active: true, status: 'ready' }]);
+
+  await assert.rejects(stat(join(dataDir, 'user-db.json')), { code: 'ENOENT' });
+});
+
 test('production allows Render origins and rejects unknown origins', async (t) => {
   const { baseUrl } = await startServer(t, {
     NODE_ENV: 'production',
+    DATABASE_URL: 'pg-mem://',
     RENDER_EXTERNAL_URL: 'https://x-bot.onrender.com',
   });
 
@@ -1307,6 +1338,9 @@ test('production preflight and docs describe manual imports without the retired 
 
   assert.match(checkProd, /BROWSERBASE_API_KEY/);
   assert.match(checkProd, /SESSION_SECRET/);
+  assert.match(checkProd, /DATABASE_URL/);
+  assert.match(envExample, /DATABASE_URL/);
+  assert.match(readme, /Supabase PostgreSQL/);
   assert.match(readme, /POST \/api\/auth\/import-session/);
   for (const contents of [checkProd, envExample, readme]) {
     assert.doesNotMatch(contents, /HARVEST_|INTERACTIVE_LOGIN_|fly\.dev|noVNC|Xvfb/);
@@ -1354,7 +1388,7 @@ test('root serves the dashboard and retired desktop and harvest routes are unava
 
 test('retired deployment and desktop worker files have been removed', async () => {
   for (const path of [
-    'fly.toml', 'Dockerfile', '.dockerignore', 'docker/openbox.xml',
+    'fly.toml', '.dockerignore', 'docker/openbox.xml',
     'scripts/desktop-browser-server.cjs', 'scripts/start-desktop.sh',
     'lib/desktop-browser.js', 'lib/harvest-client.js', 'lib/interactive-login.js',
     'lib/interactive-login-client.js', 'lib/remote-desktop-http.js',

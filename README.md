@@ -16,9 +16,10 @@ GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-3.6-flash
 BROWSERBASE_API_KEY=YOUR_API_KEY
 BROWSERBASE_PROJECT_ID=YOUR_PROJECT_ID
+DATABASE_URL=your-supabase-postgres-connection-string
 ```
 
-Reply automation creates a **Browserbase** session through the official `@browserbasehq/sdk` (`sessions.create()`) and connects Playwright with `chromium.connectOverCDP(session.connectUrl)`. Manual session imports do not launch a browser or require a Browserbase key. Keep `BROWSERBASE_API_KEY` and (recommended) `BROWSERBASE_PROJECT_ID` on the automation/Render backend, never in source control. If the project ID is omitted, the SDK infers the project from the API key. Sessions use Browserbase's standard stealth defaults on the Free tier; Enterprise Verified mode is opt-in via `BROWSERBASE_VERIFIED_MODE=true` because it otherwise fails with a 403. Sessions are explicitly released with `REQUEST_RELEASE` when a run finishes, fails, or is cancelled.
+User accounts and X sessions are stored in **Supabase PostgreSQL**; the server creates the required tables on boot. Reply automation creates a **Browserbase** session through the official `@browserbasehq/sdk` (`sessions.create()`) and connects Playwright with `chromium.connectOverCDP(session.connectUrl)`. Manual session imports do not launch a browser or require a Browserbase key. Keep `BROWSERBASE_API_KEY` and (recommended) `BROWSERBASE_PROJECT_ID` on the automation/Render backend, never in source control. If the project ID is omitted, the SDK infers the project from the API key. Sessions use Browserbase's standard stealth defaults on the Free tier; Enterprise Verified mode is opt-in via `BROWSERBASE_VERIFIED_MODE=true` because it otherwise fails with a 403. Sessions are explicitly released with `REQUEST_RELEASE` when a run finishes, fails, or is cancelled.
 
 `gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
 
@@ -131,11 +132,11 @@ The authenticated dashboard calls `POST /api/auth/import-session` with:
 
 The server normalizes the handle, validates both values, and formats standard Playwright cookies with domain `.x.com`, path `/`, `secure: true`, `expires: -1`, and `sameSite: "Lax"`. `auth_token` is HttpOnly; `ct0` remains readable by X's client code for CSRF protection.
 
-The storage state is saved to `sessions/<userId>/<handle>.json`, the account is linked and selected, and the same state is staged in `auth.json` for the bot. A maximum of three X accounts can be linked per app user; importing an existing handle replaces its cookies and makes it active without adding a duplicate. Users' saved sessions remain separate even when they import the same handle.
+The credentials are upserted into PostgreSQL (`x_sessions`), the account is linked and selected, and a two-cookie Playwright state is staged in `auth.json` for the bot. A maximum of three X accounts can be linked per app user; importing an existing handle replaces its cookies and makes it active without adding a duplicate. Users' saved sessions remain separate even when they import the same handle.
 
-Imports require a current app session, reject changes while a browser run is active, and use serialized atomic writes with rollback if saving fails. Account switching is also blocked until the active run finishes. Responses contain only account metadata, never cookie values. The form uses masked inputs, does not write cookies to browser storage, and clears pasted values on submission, close, navigation, or app logout.
+Imports require a current app session, reject changes while a browser run is active, and use serialized writes with rollback if saving fails. Account switching is also blocked until the active run finishes. Responses contain only account metadata, never cookie values. The form uses masked inputs, does not write cookies to browser storage, and clears pasted values on submission, close, navigation, or app logout.
 
-**Cookies grant account access.** Use HTTPS in production and protect the persistent data directory. Session JSON files contain the raw values and are written with private file permissions (0600 on POSIX); they are not encrypted. The import checks syntax, not validity or ownership with X. Expired/revoked cookies, a mismatched handle, or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
+**Cookies grant account access.** Use HTTPS in production and protect the PostgreSQL connection string and `auth.json`. `auth_token` and `ct0` are stored as plain text in `x_sessions` and in the staged `auth.json`; they are not encrypted at the application layer. The import checks syntax, not validity or ownership with X. Expired/revoked cookies, a mismatched handle, or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
 
 Run `npm test` for API, tenant-isolation, persistence, rollback, and runner regression checks. Run `npm run test:ui` after installing local Chromium for form submission, secret cleanup, error handling, and stale-response checks. Tests use synthetic cookies and local fixtures, not a credentialed X login.
 
@@ -149,11 +150,11 @@ Flow:
 2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserbase debugger URL with `sessions.debug()`, and immediately emits it to the authenticated NDJSON client. The backend passes through the SDK's `debuggerFullscreenUrl` without rewriting or hardcoding Browserbase's debugger domain. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
 3. Clients should open the debugger URL in a native tab rather than embedding it. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
 4. Sign in to X in the remote window, including 2FA or any challenge.
-5. The server watches for navigation to X's `/home` timeline or for both `auth_token` and `ct0`. It then captures cookies and localStorage with `context.storageState()`, atomically writes `sessions/<userId>/<xUsername>.json` under persistent `DATA_DIR`, updates the user's linked accounts, and refreshes the account list automatically.
+5. The server watches for navigation to X's `/home` timeline or for both `auth_token` and `ct0`. It then captures cookies and localStorage with `context.storageState()`, upserts `auth_token` and `ct0` into PostgreSQL, updates the user's linked accounts, and refreshes the account list automatically.
 6. The browser disconnects and the Browserbase session is released with `REQUEST_RELEASE`, invalidating the debugger URL. The live link is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
 7. Call `POST /auth/x/cancel` to stop an active remote sign-in. This releases the active-run lock, aborts the Playwright flow, and releases the Browserbase session.
 
-Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keeps X guest/device cookies and X localStorage while deliberately removing `auth_token`, `ct0`, `twid`, and other account-authentication cookies, so adding another account reuses a consistent browser identity without silently opening the previously linked account. A request that explicitly supplies an already linked `xUsername` restores that account's complete storage state. Login state is checkpointed during the live session and saved atomically.
+Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keeps X guest/device cookies and X localStorage while deliberately removing `auth_token`, `ct0`, `twid`, and other account-authentication cookies, so adding another account reuses a consistent browser identity without silently opening the previously linked account. A request that explicitly supplies an already linked `xUsername` restores that account's saved two-cookie state from PostgreSQL. Login state is checkpointed during the live session and saved atomically.
 
 An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserbase session region is still important.
 
@@ -249,21 +250,28 @@ Safety rails, because this endpoint can replace your session:
 - Values are validated (`[A-Za-z0-9._~%+/-]+` with optional trailing Base64 padding, 8–512 chars); responses never include raw cookie values.
 - Writes are serialised and atomic (temp file + rename), so an interrupted save can't truncate `auth.json`.
 
-## Persistent users and sessions
+## Persistent users and X sessions
 
-`user-db.json`, `auth.json`, `sessions/`, and `history.json` all live under `DATA_DIR`. It defaults to the project directory, which is fine locally but is **ephemeral on Render unless a disk is mounted**.
+User accounts and X credentials live in **Supabase PostgreSQL**. Set `DATABASE_URL` to the pooler connection string from Supabase → **Project Settings → Database**. On boot the server connects with `pg` and automatically creates these tables when they do not exist:
 
-For durable accounts:
+- `users` — account id, username, bcrypt password hash, email, app session token, linked handles, default X handle, Groq key, and timestamps.
+- `x_sessions` — one row per app user and X handle, containing `auth_token` and `ct0`, with `ON DELETE CASCADE` from `users`.
 
-1. Mount a persistent disk on the hosting platform (for example at `/var/data`).
-2. Set `DATA_DIR=/var/data` in the deployment environment.
-3. Keep the same production `SESSION_SECRET` and restart the service. Existing app sessions and linked X sessions survive restarts because the user database, session token, and storage-state files stay on the disk. Changing `SESSION_SECRET` invalidates password verification because it is also the password-hash pepper.
+Passwords are stored as bcrypt hashes; X session cookies are stored as plain text so they can be staged for Playwright. Protect the database connection string and use Supabase network/SSL controls. The server uses TLS by default for remote databases; set `DATABASE_SSL=false` only for a local PostgreSQL server without TLS.
 
-For a native Node deployment, use **`npm ci`** as the build command and **`npm run serve`** as the start command, with the project directory as the service root. Set `NODE_ENV=production`, a strong `SESSION_SECRET`, the Browserbase credentials used by automation, and persistent `DATA_DIR`. No local browser or desktop worker is required. `npm run check:prod` checks the production environment, JavaScript syntax, and API regression suite before starting the server.
+For durable accounts and sessions:
 
-Run one server process per `DATA_DIR`: the write queue and active-run reservation are in-process locks, not distributed locks across replicas.
+1. Create a Supabase project and copy its pooler `DATABASE_URL`.
+2. Set `DATABASE_URL` and a stable `SESSION_SECRET` in the deployment environment.
+3. Restart the service. The schema and saved sessions survive Render redeploys because PostgreSQL is external. On boot the most recently active saved account is automatically staged into `auth.json`, and each run re-stages the authenticated user's selected account before launching the bot.
 
-For free/ephemeral deployments, set all three `DEFAULT_ADMIN_USERNAME`, `DEFAULT_ADMIN_EMAIL`, and `DEFAULT_ADMIN_PASSWORD` values. On boot the server creates that account when the database is empty (or when the username/email is missing). It never overwrites an existing account or its password. The server logs a warning at startup when it detects Render without `DATA_DIR`.
+`auth.json`, `history.json`, and `sessions/<userId>/_trusted-login-profile.json` remain runtime files under `DATA_DIR`. Set `DATA_DIR` to a mounted disk if you want automation history and trusted login profiles to survive restarts; user accounts and X sessions do not depend on it.
+
+For a native Node deployment, use **`npm ci`** as the build command and **`npm run serve`** as the start command, with the project directory as the service root. Set `NODE_ENV=production`, a strong `SESSION_SECRET`, `DATABASE_URL`, the Browserbase credentials used by automation, and optionally `DATA_DIR`. No local browser or desktop worker is required. `npm run check:prod` requires the production database URL, syntax-checks the project, runs the API regression suite, and then starts the server.
+
+Run one server process per deployment: the write queue and active-run reservation are in-process locks, not distributed locks across replicas.
+
+Set all three `DEFAULT_ADMIN_USERNAME`, `DEFAULT_ADMIN_EMAIL`, and `DEFAULT_ADMIN_PASSWORD` values if you want the server to create an initial account when it does not exist. It never overwrites an existing account or its password. The local JSON fallback is for development and the test suite only; production startup fails without `DATABASE_URL`.
 
 The CLI (`npm run auth` and `npm run automate`) honors the same `DATA_DIR` for `auth.json`; the server still passes an explicit `AUTH_FILE_PATH` to automation runs.
 

@@ -10,6 +10,13 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'crypto';
 import {
+  closeDatabase,
+  initializeDatabase,
+  isPostgresEnabled,
+  query,
+  withTransaction,
+} from './lib/database.js';
+import {
   closeBrowser,
   connectBrowser,
   createTrustedLoginProfile,
@@ -197,8 +204,48 @@ const mask = (value) =>
 /** User authentication and session management. */
 const MAX_USERS_PER_IP = 10;
 
-/** Load user database */
+function isoDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function splitHandles(value) {
+  return String(value ?? '')
+    .split(',')
+    .map((handle) => handle.trim())
+    .filter(Boolean);
+}
+
+function userFromDatabaseRow(row) {
+  const xAccounts = splitHandles(row.linked_handles);
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email ?? null,
+    passwordHash: row.password_hash,
+    createdAt: isoDate(row.created_at),
+    lastLogin: isoDate(row.last_login),
+    preferences: { defaultXAccount: row.default_handle ?? xAccounts[0] ?? null },
+    xAccounts,
+    sessionToken: row.session_token,
+    groqApiKey: row.groq_api_key ?? undefined,
+    ipAddress: row.ip_address ?? null,
+  };
+}
+
+/** Load user records from PostgreSQL when configured, otherwise the local test/dev file. */
 async function loadUserDb() {
+  if (isPostgresEnabled()) {
+    const { rows } = await query(`
+      SELECT id, username, email, password_hash, created_at, last_login,
+             session_token, default_handle, linked_handles, groq_api_key, ip_address
+      FROM users
+      ORDER BY id
+    `);
+    return rows.map(userFromDatabaseRow);
+  }
+
   try {
     const raw = await readFile(USER_DB_FILE, 'utf8');
     const data = JSON.parse(raw);
@@ -222,9 +269,56 @@ async function atomicWritePrivateFile(path, contents) {
   }
 }
 
-/** Save user database through a private, atomic replacement. Call under withWriteLock. */
+/** Save user records to PostgreSQL, or atomically replace the local fallback file. */
 async function saveUserDb(users) {
-  await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(users, null, 2)}\n`);
+  if (!isPostgresEnabled()) {
+    await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(users, null, 2)}\n`);
+    return;
+  }
+
+  await withTransaction(async (tx) => {
+    for (const user of users) {
+      const metadata = [
+        user.username,
+        user.email ?? null,
+        user.passwordHash,
+        user.lastLogin ?? null,
+        user.sessionToken ?? null,
+        user.preferences?.defaultXAccount ?? null,
+        (Array.isArray(user.xAccounts) ? user.xAccounts : []).join(','),
+        user.groqApiKey ?? null,
+        user.ipAddress ?? null,
+      ];
+
+      const isNewDatabaseUser =
+        user.id === undefined ||
+        user.id === null ||
+        (typeof user.id === 'string' && !/^\d+$/.test(user.id));
+      if (isNewDatabaseUser) {
+        const { rows } = await tx(
+          `INSERT INTO users
+             (username, email, password_hash, created_at, last_login, session_token,
+              default_handle, linked_handles, groq_api_key, ip_address)
+           VALUES ($1, $2, $3, COALESCE($4, CURRENT_TIMESTAMP), $5, $6, $7, $8, $9, $10)
+           RETURNING id, created_at`,
+          [user.username, user.email ?? null, user.passwordHash, user.createdAt ?? null, ...metadata.slice(3)],
+        );
+        user.id = rows[0].id;
+        user.createdAt = isoDate(rows[0].created_at) ?? user.createdAt;
+        continue;
+      }
+
+      const { rowCount } = await tx(
+        `UPDATE users
+            SET username = $2, email = $3, password_hash = $4, last_login = $5,
+                session_token = $6, default_handle = $7, linked_handles = $8,
+                groq_api_key = $9, ip_address = $10
+          WHERE id = $1`,
+        [user.id, ...metadata],
+      );
+      if (rowCount === 0) throw new Error(`User ${user.id} no longer exists`);
+    }
+  });
 }
 
 /**
@@ -451,7 +545,9 @@ function normalizeUserAccounts(user) {
 
 function sessionDirectoryFor(userId) {
   const safeUserId = String(userId ?? '');
-  if (!/^[a-f0-9-]{16,64}$/i.test(safeUserId)) throw new Error('Invalid user id in user database');
+  if (!/^(?:\d+|[a-f0-9-]{16,64})$/i.test(safeUserId)) {
+    throw new Error('Invalid user id in user database');
+  }
   return join(SESSIONS_DIR, safeUserId);
 }
 
@@ -498,6 +594,123 @@ async function deleteAuthFile(path = AUTH_FILE) {
   await unlink(path).catch((error) => {
     if (error.code !== 'ENOENT') throw error;
   });
+}
+
+/** Build a minimal Playwright storage state from an x_sessions row. */
+function sessionStateFromRecord(record) {
+  return {
+    cookies: [
+      {
+        name: 'auth_token',
+        value: record.auth_token,
+        domain: '.x.com',
+        path: '/',
+        expires: -1,
+        secure: true,
+        httpOnly: true,
+        sameSite: 'Lax',
+      },
+      {
+        name: 'ct0',
+        value: record.ct0,
+        domain: '.x.com',
+        path: '/',
+        expires: -1,
+        secure: true,
+        httpOnly: false,
+        sameSite: 'Lax',
+      },
+    ],
+    origins: [],
+    username: record.handle,
+    savedAt: isoDate(record.updated_at) ?? new Date().toISOString(),
+    loginUrl: X_LOGIN_URL,
+    cookieCount: 2,
+    source: 'postgres',
+  };
+}
+
+async function xSessionExists(userId, xUsername) {
+  if (!isPostgresEnabled()) return sessionFileExists(sessionFileFor(userId, xUsername));
+  const { rowCount } = await query(
+    'SELECT 1 FROM x_sessions WHERE user_id = $1 AND handle = $2 LIMIT 1',
+    [userId, xUsername],
+  );
+  return rowCount > 0;
+}
+
+async function readXSession(userId, xUsername) {
+  if (!isPostgresEnabled()) return readAuthFile(sessionFileFor(userId, xUsername));
+  const { rows } = await query(
+    `SELECT handle, auth_token, ct0, updated_at
+       FROM x_sessions
+      WHERE user_id = $1 AND handle = $2
+      LIMIT 1`,
+    [userId, xUsername],
+  );
+  return rows[0] ? sessionStateFromRecord(rows[0]) : null;
+}
+
+async function writeXSession(userId, xUsername, storageState) {
+  if (!isPostgresEnabled()) {
+    await writeAuthFile(storageState, sessionFileFor(userId, xUsername));
+    return storageState;
+  }
+
+  const cookies = Array.isArray(storageState?.cookies) ? storageState.cookies : [];
+  const authToken = cookies.find((cookie) => cookie.name === 'auth_token')?.value;
+  const ct0 = cookies.find((cookie) => cookie.name === 'ct0')?.value;
+  if (!authToken || !ct0) {
+    throw new ValidationError('The X session must include both auth_token and ct0');
+  }
+
+  const { rows } = await query(
+    `INSERT INTO x_sessions (user_id, handle, auth_token, ct0, updated_at)
+     VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+     ON CONFLICT (user_id, handle)
+     DO UPDATE SET auth_token = EXCLUDED.auth_token,
+                   ct0 = EXCLUDED.ct0,
+                   updated_at = CURRENT_TIMESTAMP
+     RETURNING handle, auth_token, ct0, updated_at`,
+    [userId, xUsername, authToken, ct0],
+  );
+  return sessionStateFromRecord(rows[0]);
+}
+
+async function deleteXSession(userId, xUsername) {
+  if (!isPostgresEnabled()) {
+    await deleteAuthFile(sessionFileFor(userId, xUsername));
+    return;
+  }
+  await query('DELETE FROM x_sessions WHERE user_id = $1 AND handle = $2', [userId, xUsername]);
+}
+
+/** Latest saved session across app users, used to warm auth.json after a restart. */
+async function latestXSession() {
+  if (!isPostgresEnabled()) return null;
+  const { rows } = await query(
+    `SELECT s.handle, s.auth_token, s.ct0, s.updated_at
+       FROM x_sessions s
+       JOIN users u ON u.id = s.user_id
+      ORDER BY (s.handle = u.default_handle) DESC, s.updated_at DESC, s.id DESC
+      LIMIT 1`,
+  );
+  return rows[0] ? sessionStateFromRecord(rows[0]) : null;
+}
+
+/** Re-stage the most recently active saved X account after a container restart. */
+async function hydrateActiveSessionFromDatabase() {
+  if (!isPostgresEnabled()) return;
+  const state = await latestXSession();
+  if (!state) {
+    // PostgreSQL is the source of truth; do not let a stale staged file from a
+    // previous deployment authenticate a run.
+    await deleteAuthFile(AUTH_FILE);
+    console.log('[storage] No saved X sessions to hydrate yet.');
+    return;
+  }
+  await writeAuthFile(state, AUTH_FILE);
+  console.log(`[storage] Hydrated active X session for @${state.username} from PostgreSQL.`);
 }
 
 function describe(payload) {
@@ -664,13 +877,13 @@ async function activeSessionFor(user, { required = false } = {}) {
     return null;
   }
 
-  const path = sessionFileFor(user.id, xUsername);
-  if (!(await sessionFileExists(path))) {
+  const state = await readXSession(user.id, xUsername);
+  if (!state) {
     if (required) throw new HttpError(409, `Saved session for @${xUsername} was not found`);
     return null;
   }
 
-  return { xUsername, path };
+  return { xUsername, state };
 }
 
 async function accountSummaries(user) {
@@ -679,7 +892,7 @@ async function accountSummaries(user) {
     user.xAccounts.map(async (xUsername) => ({
       xUsername,
       active: xUsername === user.preferences.defaultXAccount,
-      status: (await sessionFileExists(sessionFileFor(user.id, xUsername))) ? 'ready' : 'missing',
+      status: (await xSessionExists(user.id, xUsername)) ? 'ready' : 'missing',
     })),
   );
 }
@@ -692,8 +905,7 @@ async function stageActiveSession(user, { sessionToken = null } = {}) {
       if (!user) throw new HttpError(401, 'The app session is no longer active');
     }
     const session = await activeSessionFor(user, { required: true });
-    const payload = await readAuthFile(session.path);
-    await writeAuthFile(payload, AUTH_FILE);
+    await writeAuthFile(session.state, AUTH_FILE);
     return session;
   });
 }
@@ -718,10 +930,10 @@ async function loginBootstrapStateFor(user, requestedXUsername = null) {
   normalizeUserAccounts(user);
 
   if (requestedXUsername && user.xAccounts.includes(requestedXUsername)) {
-    const accountPath = sessionFileFor(user.id, requestedXUsername);
-    if (await sessionFileExists(accountPath)) {
+    const state = await readXSession(user.id, requestedXUsername);
+    if (state) {
       return {
-        state: await readAuthFile(accountPath),
+        state,
         source: `saved session for @${requestedXUsername}`,
       };
     }
@@ -737,10 +949,8 @@ async function loginBootstrapStateFor(user, requestedXUsername = null) {
 
   const activeSession = await activeSessionFor(user);
   if (!activeSession) return null;
-  const activeState = await readAuthFile(activeSession.path);
-  if (!activeState) return null;
   return {
-    state: createTrustedLoginProfile(activeState),
+    state: createTrustedLoginProfile(activeSession.state),
     source: `trusted device state from @${activeSession.xUsername}`,
   };
 }
@@ -820,7 +1030,6 @@ app.post('/api/auth/import-session', async (req, res, next) => {
       const assertOpen = () => {
         if (request.signal.aborted || res.destroyed) throw new HttpError(410, 'Session import was cancelled');
       };
-      const destination = sessionFileFor(current.id, username);
       const previousUsers = structuredClone(users);
       let previousSession;
       let previousActive;
@@ -828,10 +1037,10 @@ app.post('/api/auth/import-session', async (req, res, next) => {
       let usersWritten = false;
       let activeWritten = false;
       try {
-        previousSession = await readAuthFile(destination);
+        previousSession = await readXSession(current.id, username);
         previousActive = await readAuthFile(AUTH_FILE);
         assertOpen();
-        await writeAuthFile(storageState, destination);
+        const savedSession = await writeXSession(current.id, username, storageState);
         sessionWritten = true;
         assertOpen();
         if (!current.xAccounts.includes(username)) current.xAccounts.push(username);
@@ -839,7 +1048,7 @@ app.post('/api/auth/import-session', async (req, res, next) => {
         await saveUserDb(users);
         usersWritten = true;
         assertOpen();
-        await writeAuthFile(storageState, AUTH_FILE);
+        await writeAuthFile(savedSession, AUTH_FILE);
         activeWritten = true;
         const accounts = await accountSummaries(current);
         assertOpen();
@@ -853,8 +1062,8 @@ app.post('/api/auth/import-session', async (req, res, next) => {
           }
           if (usersWritten) await saveUserDb(previousUsers);
           if (sessionWritten) {
-            if (previousSession) await writeAuthFile(previousSession, destination);
-            else await deleteAuthFile(destination);
+            if (previousSession) await writeXSession(current.id, username, previousSession);
+            else await deleteXSession(current.id, username);
           }
         } catch {
           throw new HttpError(503, 'Could not restore an interrupted session import. Check persistent storage before retrying.');
@@ -886,7 +1095,7 @@ app.get('/api/auth', async (req, res, next) => {
     if (!auth) return res.json(describe(await readAuthFile()));
 
     const session = await activeSessionFor(auth.user);
-    const state = session ? await readAuthFile(session.path) : null;
+    const state = session?.state ?? null;
     return res.json({
       ...describe(state),
       userAuthenticated: true,
@@ -904,7 +1113,6 @@ app.put('/api/auth', async (req, res, next) => {
   try {
     const auth = await optionalAuthenticatedUser(req);
     const selectedSession = auth ? await activeSessionFor(auth.user, { required: true }) : null;
-    const destination = selectedSession?.path ?? AUTH_FILE;
     const body = req.body ?? {};
     const updates = Object.keys(COOKIE_SPEC).filter((name) => body[name] !== undefined);
 
@@ -915,7 +1123,9 @@ app.put('/api/auth', async (req, res, next) => {
     const values = Object.fromEntries(updates.map((name) => [name, validateValue(name, body[name])]));
 
     const saved = await withWriteLock(async () => {
-      const payload = (await readAuthFile(destination)) ?? { cookies: [] };
+      const payload = selectedSession
+        ? structuredClone(selectedSession.state)
+        : ((await readAuthFile(AUTH_FILE)) ?? { cookies: [] });
       const now = new Date().toISOString();
 
       payload.savedAt = now;
@@ -941,7 +1151,13 @@ app.put('/api/auth', async (req, res, next) => {
 
       payload.cookieCount = payload.cookies.length;
 
-      await writeAuthFile(payload, destination);
+      if (selectedSession) {
+        const savedState = await writeXSession(auth.user.id, selectedSession.xUsername, payload);
+        await writeAuthFile(savedState, AUTH_FILE);
+        return savedState;
+      }
+
+      await writeAuthFile(payload, AUTH_FILE);
       return payload;
     });
 
@@ -1086,11 +1302,10 @@ app.post('/api/auth/x-accounts', async (req, res, next) => {
         throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
       }
 
-      const destination = sessionFileFor(current.id, xUsername);
       if (storageState) {
-        await writeAuthFile({ ...storageState, username: xUsername }, destination);
+        await writeXSession(current.id, xUsername, { ...storageState, username: xUsername });
         await writeAuthFile(trustedLoginProfilePayload(storageState), loginProfileFileFor(current.id));
-      } else if (!(await sessionFileExists(destination))) {
+      } else if (!(await xSessionExists(current.id, xUsername))) {
         throw new ValidationError('storageState is required when linking a new X account');
       }
 
@@ -1115,7 +1330,7 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
   try {
     const auth = await authenticatedUser(req);
     const xUsername = normalizeXUsername(req.body?.xUsername);
-    if (!(await sessionFileExists(sessionFileFor(auth.user.id, xUsername)))) {
+    if (!(await xSessionExists(auth.user.id, xUsername))) {
       throw new HttpError(404, `No saved session for @${xUsername}`);
     }
 
@@ -1126,7 +1341,7 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
       normalizeUserAccounts(current);
       if (!current.xAccounts.includes(xUsername)) throw new HttpError(404, 'X account is not linked');
       if (activeRun) throw new HttpError(409, 'A run is already in progress');
-      const state = await readAuthFile(sessionFileFor(current.id, xUsername));
+      const state = await readXSession(current.id, xUsername);
       if (!state) throw new HttpError(404, `Saved session for @${xUsername} was not found`);
       current.preferences.defaultXAccount = xUsername;
       await saveUserDb(users);
@@ -1160,28 +1375,26 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
       if (!current) throw new HttpError(401, 'User account no longer exists');
       normalizeUserAccounts(current);
 
-      const sessionPath = sessionFileFor(current.id, xUsername);
       const linked = current.xAccounts.includes(xUsername);
-      const sessionDeleted = await sessionFileExists(sessionPath);
+      const sessionDeleted = await xSessionExists(current.id, xUsername);
       if (!linked && !sessionDeleted) throw new HttpError(404, `X account @${xUsername} is not linked`);
 
       const wasActive = current.preferences.defaultXAccount === xUsername;
       current.xAccounts = current.xAccounts.filter((account) => account !== xUsername);
       if (wasActive) current.preferences.defaultXAccount = current.xAccounts[0] ?? null;
 
-      // Persist metadata first. A failed unlink can leave only an unreachable file,
-      // never a user record that points at a deleted session.
+      // Persist metadata first. A failed unlink can leave only an unreachable
+      // session row, never a user record that points at a deleted session.
       await saveUserDb(users);
-      await deleteAuthFile(sessionPath);
+      await deleteXSession(current.id, xUsername);
 
       let activeSessionStaged = false;
       if (wasActive) {
         const nextActive = current.preferences.defaultXAccount;
         if (nextActive) {
-          const nextPath = sessionFileFor(current.id, nextActive);
           let nextState = null;
           try {
-            nextState = await readAuthFile(nextPath);
+            nextState = await readXSession(current.id, nextActive);
           } catch (error) {
             console.warn(`Could not stage @${nextActive} after unlinking @${xUsername}: ${error.message}`);
           }
@@ -1200,7 +1413,7 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
       const profileAccount = current.preferences.defaultXAccount ?? current.xAccounts[0] ?? null;
       if (profileAccount) {
         try {
-          const profileState = await readAuthFile(sessionFileFor(current.id, profileAccount));
+          const profileState = await readXSession(current.id, profileAccount);
           if (profileState) {
             await writeAuthFile(trustedLoginProfilePayload(profileState), trustedProfilePath);
           } else {
@@ -1483,7 +1696,6 @@ async function persistSignedInBrowserSession({
     cookieCount: storageState.cookies.length,
     username,
   };
-  const destination = sessionFileFor(user.id, username);
   const trustedProfile = trustedLoginProfilePayload(storageState);
 
   await withWriteLock(async () => {
@@ -1492,7 +1704,7 @@ async function persistSignedInBrowserSession({
       error.name = 'AbortError';
       throw error;
     }
-    await writeAuthFile(payload, destination);
+    await writeXSession(user.id, username, payload);
     await writeAuthFile(trustedProfile, loginProfileFileFor(user.id));
   });
   const updatedUser = await addAccountToUser(user.id, username);
@@ -2202,17 +2414,19 @@ app.use((error, req, res, next) => {
 });
 
 await mkdir(DATA_DIR, { recursive: true });
-console.log(`[storage] User, session and history data directory: ${DATA_DIR}`);
+console.log(`[storage] Runtime file directory: ${DATA_DIR}`);
 if (
   IS_PRODUCTION &&
   !process.env.DATA_DIR &&
   (process.env.RENDER || process.env.RENDER_EXTERNAL_URL)
 ) {
   console.warn(
-    '[storage] DATA_DIR is not set. Render containers have an ephemeral filesystem, so user accounts and X sessions will be lost on restart. Mount a persistent disk and set DATA_DIR (for example /var/data), or configure the DEFAULT_ADMIN_* variables to re-seed an admin account.',
+    '[storage] DATA_DIR is not set. Render containers have an ephemeral filesystem; auth.json, history, and trusted login profiles will be re-created from PostgreSQL where possible.',
   );
 }
 
+await initializeDatabase();
+await hydrateActiveSessionFromDatabase();
 await seedDefaultAdmin();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
@@ -2243,8 +2457,9 @@ const shutdown = async () => {
   }
   const forceExit = setTimeout(() => process.exit(1), 10_000);
   forceExit.unref?.();
-  server.close(() => {
+  server.close(async () => {
     clearTimeout(forceExit);
+    await closeDatabase().catch((error) => console.error('[storage] Could not close PostgreSQL:', error.message));
     process.exit(0);
   });
 };

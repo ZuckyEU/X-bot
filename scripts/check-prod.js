@@ -89,7 +89,15 @@ if (!browserbaseApiKey || browserbaseApiKey === 'YOUR_API_KEY') {
   );
 }
 
-console.log('[check:prod] Environment verified (NODE_ENV=production).');
+const databaseUrl = String(process.env.DATABASE_URL ?? '').trim();
+if (!databaseUrl || databaseUrl.startsWith('pg-mem:')) {
+  fail(
+    'DATABASE_URL must be set to the Supabase PostgreSQL connection string.\n' +
+      'Use the pooler connection string from Supabase → Project Settings → Database.',
+  );
+}
+
+console.log('[check:prod] Environment verified (NODE_ENV=production, PostgreSQL configured).');
 
 const files = (await javascriptFiles(ROOT))
   .map((file) => relative(ROOT, file))
