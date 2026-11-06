@@ -11,6 +11,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'crypto';
 import {
+  applyStealthProfile,
+  chromeIdentityForVersion,
   closeBrowser,
   connectBrowser,
   createTrustedLoginProfile,
@@ -28,6 +30,7 @@ import {
   X_REFERER,
 } from './lib/browser.js';
 import { harvestXAccount } from './lib/harvest-client.js';
+import { fillXLoginForm, safeXHandle, waitForXHomeTimeline } from './lib/x-login.js';
 
 /**
  * Local service for the X reply automation.
@@ -117,7 +120,7 @@ const HARVEST_LOGIN_TIMEOUT_MS = (() => {
   if (!Number.isFinite(configured) || configured < 30_000) return 120_000;
   return Math.min(configured, 300_000);
 })();
-const HARVEST_RUN_TIMEOUT_MS = HARVEST_LOGIN_TIMEOUT_MS + 60_000 + 5_000;
+const HARVEST_RUN_TIMEOUT_MS = HARVEST_LOGIN_TIMEOUT_MS + 120_000 + 5_000;
 const HARVEST_LOW_MEMORY_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -126,6 +129,19 @@ const HARVEST_LOW_MEMORY_ARGS = [
   '--disable-gpu',
   '--single-process',
 ];
+const HARVEST_VIEWPORT = Object.freeze({ width: 1366, height: 768 });
+const HARVEST_STEALTH_ARGS = Object.freeze([
+  ...HARVEST_LOW_MEMORY_ARGS,
+  '--disable-blink-features=AutomationControlled',
+  '--lang=en-US',
+  '--window-size=1366,768',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--disable-background-networking',
+  '--disable-sync',
+  '--metrics-recording-only',
+  '--mute-audio',
+]);
 
 const LOGIN_URL = X_LOGIN_URL;
 const HOME_URL = 'https://x.com/home';
@@ -1606,58 +1622,65 @@ async function waitForRemoteSignIn(page, context, signal, send) {
 async function runAutomatedXLogin({ identifier, password, twoFactorCode = null, signal }) {
   const browser = await chromium.launch({
     headless: true,
-    args: HARVEST_LOW_MEMORY_ARGS,
+    args: HARVEST_STEALTH_ARGS,
+    ignoreDefaultArgs: ['--enable-automation'],
   });
   let context;
   let page;
 
   try {
-    context = await browser.newContext();
+    const browserIdentity = chromeIdentityForVersion(browser.version());
+    context = await browser.newContext({
+      userAgent: browserIdentity.userAgent,
+      viewport: HARVEST_VIEWPORT,
+      screen: HARVEST_VIEWPORT,
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      colorScheme: 'light',
+      deviceScaleFactor: 1,
+      isMobile: false,
+      hasTouch: false,
+      extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+    });
     page = await context.newPage();
+    await applyStealthProfile(context);
+    page.setDefaultTimeout(15_000);
+    page.setDefaultNavigationTimeout(45_000);
 
     const navigation = await safeGoto(page, LOGIN_URL, {
-      waitUntil: 'commit',
+      waitUntil: 'domcontentloaded',
       timeout: 45_000,
       referer: X_REFERER,
     });
     if (navigation.error) throw new Error(`X navigation failed: ${navigation.error.message}`);
     if (navigation.response && navigation.response.status() >= 400) {
-      throw new Error(`X returned HTTP ${navigation.response.status()}`);
+      const status = navigation.response.status();
+      if (status === 429) throw new Error('X rate-limited the automated login (HTTP 429)');
+      if (status === 403) throw new Error('X blocked the automated login (HTTP 403)');
+      throw new Error(`X returned HTTP ${status}`);
     }
 
-    const usernameInput = page.locator('input[name="username_or_email"], input[autocomplete="username"], input[name="text"]').first();
-    const passwordInput = page.locator('input[name="password"], input[type="password"]').first();
-    await usernameInput.waitFor({ state: 'visible', timeout: 30_000 });
-    await passwordInput.waitFor({ state: 'visible', timeout: 15_000 });
-    await usernameInput.fill(identifier);
-    await passwordInput.fill(password);
+    await fillXLoginForm(page, { identifier, password, twoFactorCode, signal });
 
-    if (twoFactorCode) {
-      const otpInput = page.locator('input[name="otp"], input[inputmode="numeric"], input[type="text"]').first();
-      await otpInput.waitFor({ state: 'visible', timeout: 30_000 });
-      await otpInput.fill(String(twoFactorCode));
-      await otpInput.press('Enter');
-    }
-
-    await passwordInput.press('Enter');
     const login = await waitForRemoteSignIn(page, context, signal, () => {});
     if (login.error) throw login.error;
     if (!login.loggedIn) {
       throw new Error(login.timedOut ? 'X login timed out' : 'X login was not verified');
     }
 
+    const timelineReady = await waitForXHomeTimeline(page, signal, { timeoutMs: 30_000 });
+    if (!timelineReady) throw new Error('X home timeline did not load after login');
+
     const identity = await readSignedInUsername(page, signal);
-    let username = identity?.username ?? null;
-    if (!username) {
-      try {
-        username = normalizeXUsername(identifier);
-      } catch {
-        username = null;
-      }
-    }
+    const username = identity?.username ?? safeXHandle(identifier);
     if (!username) throw new Error('Could not determine the signed-in X username');
 
     const storageState = await context.storageState();
+    if (!hasXSessionCookies(storageState?.cookies)) {
+      throw new Error(
+        `X session cookies (${X_AUTH_COOKIE}, ${X_CSRF_COOKIE}) were not both present after login`,
+      );
+    }
     const cookies = (storageState?.cookies ?? [])
       .filter((cookie) => cookie?.name === X_AUTH_COOKIE || cookie?.name === X_CSRF_COOKIE)
       .map((cookie) => ({

@@ -186,7 +186,9 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 
 ### Fly.io X harvest API
 
-`POST /api/harvest-token` is the automated login endpoint used by the Fly.io deployment. In production it requires the internal bearer token:
+`POST /api/harvest-token` is the automated login endpoint used by the Fly.io deployment. The service launches headless Chromium with a Chrome identity and stealth init script. It completes X's identifier/password onboarding flow (including the hidden password field), optionally submits a 2FA/email code, waits for the authenticated home timeline, and returns the detected `@handle` plus `auth_token` and `ct0`.
+
+In production it requires the internal bearer token:
 
 ```
 Authorization: Bearer <HARVEST_API_TOKEN>

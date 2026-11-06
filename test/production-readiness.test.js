@@ -12,6 +12,7 @@ import bcrypt from 'bcrypt';
 import {
   browserbaseSessionParams,
   CHROME_USER_AGENT,
+  chromeIdentityForVersion,
   closeBrowser,
   connectBrowser,
   createBrowserbaseClient,
@@ -918,6 +919,23 @@ test('remote X sign-in detection recognizes home and both required cookies', () 
   assert.equal(hasXSessionCookies([{ name: 'ct0' }]), false);
 });
 
+test('Chrome identity follows the actual Chromium build and falls back safely', () => {
+  const identity = chromeIdentityForVersion('156.0.8078.4');
+  assert.equal(
+    identity.userAgent,
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+  );
+  assert.equal(identity.userAgentMetadata.fullVersion, '156.0.8078.4');
+  assert.deepEqual(identity.userAgentMetadata.brands, [
+    { brand: 'Chromium', version: '156' },
+    { brand: 'Google Chrome', version: '156' },
+    { brand: 'Not(A:Brand', version: '24' },
+  ]);
+
+  const fallback = chromeIdentityForVersion('not-a-version');
+  assert.equal(fallback.userAgent, CHROME_USER_AGENT);
+});
+
 test('Browserbase contexts and pages use a realistic Chrome identity and stealth profile', async () => {
   const page = { isClosed: () => false };
   const commands = [];
@@ -955,6 +973,11 @@ test('Browserbase contexts and pages use a realistic Chrome identity and stealth
   assert.match(stealthSource, /getParameter/);
   assert.match(stealthSource, /toDataURL/);
   assert.match(stealthSource, /toBlob/);
+  assert.match(stealthSource, /pdfViewerEnabled/);
+  assert.match(stealthSource, /outerWidth/);
+  assert.match(stealthSource, /outerHeight/);
+  assert.match(stealthSource, /PluginArray/);
+  assert.match(stealthSource, /MimeTypeArray/);
   assert.equal(commands.length, 1);
   assert.equal(commands[0].method, 'Network.setUserAgentOverride');
   assert.equal(commands[0].params.userAgent, CHROME_USER_AGENT);
@@ -1005,11 +1028,18 @@ test('remote sign-in cancellation is authenticated and idempotent', async (t) =>
 });
 
 test('container exposes the Fly.io port and starts Node directly', async () => {
-  const [dockerfile, server] = await Promise.all([
+  const [dockerfile, server, lockText] = await Promise.all([
     readFile(join(ROOT, 'Dockerfile'), 'utf8'),
     readFile(join(ROOT, 'server.js'), 'utf8'),
+    readFile(join(ROOT, 'package-lock.json'), 'utf8'),
   ]);
 
+  const playwrightVersion = JSON.parse(lockText).packages['node_modules/playwright'].version;
+  const playwrightImage = `v${playwrightVersion}-jammy`.replace(/\./g, '\\.');
+  assert.match(
+    dockerfile,
+    new RegExp(`^FROM mcr\\.microsoft\\.com/playwright:${playwrightImage}$`, 'm'),
+  );
   assert.match(dockerfile, /^ENV PORT=3000$/m);
   assert.match(dockerfile, /^EXPOSE 3000$/m);
   assert.match(dockerfile, /^CMD \["node", "server\.js"\]$/m);
