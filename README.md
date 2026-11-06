@@ -134,7 +134,9 @@ The server normalizes the handle, validates both values, and formats standard Pl
 
 The credentials are upserted into PostgreSQL (`x_sessions`), the account is linked and selected, and a two-cookie Playwright state is staged in `auth.json` for the bot. A maximum of three X accounts can be linked per app user; importing an existing handle replaces its cookies and makes it active without adding a duplicate. Users' saved sessions remain separate even when they import the same handle.
 
-Imports require a current app session, reject changes while a browser run is active, and use serialized writes with rollback if saving fails. Account switching is also blocked until the active run finishes. Responses contain only account metadata, never cookie values. The form uses masked inputs, does not write cookies to browser storage, and clears pasted values on submission, close, navigation, or app logout.
+Imports require a current app session, reject changes while a browser run is active, and use serialized writes with rollback if saving fails. Account switching is also blocked until the active run finishes. Import and switch responses contain only account metadata; raw cookie values are returned only by the authenticated `GET /api/auth/me` bootstrap response so a new device can restore its active X account. The form uses masked inputs, does not write cookies to browser storage, and clears pasted values on submission, close, navigation, or app logout.
+
+After login and on every dashboard bootstrap, `GET /api/auth/me` reads the user's active row from `x_sessions`, returns `activeXAccount` plus `xSession.auth_token`/`xSession.ct0`, and restages `auth.json` when no browser run is active. A missing or stale `auth.json` therefore no longer requires re-pasting cookies on a new device.
 
 **Cookies grant account access.** Use HTTPS in production and protect the PostgreSQL connection string and `auth.json`. `auth_token` and `ct0` are stored as plain text in `x_sessions` and in the staged `auth.json`; they are not encrypted at the application layer. The import checks syntax, not validity or ownership with X. Expired/revoked cookies, a mismatched handle, or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
 
@@ -191,6 +193,7 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 |---|---|
 | `GET /` | Dashboard UI from `public/index.html` |
 | `GET /api/auth` | Authentication status and active-account metadata; no raw cookie values |
+| `GET /api/auth/me` | App user profile plus active X account, saved `xSession.auth_token`/`ct0`, and account summaries; restages `auth.json` when idle |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
 | `POST /api/auth/import-session` | Body `{"handle": "…", "auth_token": "…", "ct0": "…"}` — save, link, and activate an X session |
 | `GET /api/auth/x-accounts` | List the authenticated user's linked accounts |
@@ -263,7 +266,7 @@ For durable accounts and sessions:
 
 1. Create a Supabase project and copy its pooler `DATABASE_URL`.
 2. Set `DATABASE_URL` and a stable `SESSION_SECRET` in the deployment environment.
-3. Restart the service. The schema and saved sessions survive Render redeploys because PostgreSQL is external. On boot the most recently active saved account is automatically staged into `auth.json`, and each run re-stages the authenticated user's selected account before launching the bot.
+3. Restart the service. The schema and saved sessions survive Render redeploys because PostgreSQL is external. On boot the most recently active saved account is automatically staged into `auth.json`; login and `GET /api/auth/me` restage the authenticated user's saved account, and each run re-stages the selected account before launching the bot.
 
 `auth.json`, `history.json`, and `sessions/<userId>/_trusted-login-profile.json` remain runtime files under `DATA_DIR`. Set `DATA_DIR` to a mounted disk if you want automation history and trusted login profiles to survive restarts; user accounts and X sessions do not depend on it.
 

@@ -60,12 +60,14 @@ async function fixture(t, options = {}) {
       state.logouts += 1;
       return json({ ok: true, authenticated: false });
     }
-    if (url.pathname === '/api/auth') {
+    if (url.pathname === '/api/auth' || url.pathname === '/api/auth/me') {
       return json(state.authenticated ? {
         userAuthenticated: true, authenticated: state.accounts.length > 0,
         user: { username: 'dashboard_user', email: 'dashboard@example.test' },
         username: activeHandle(), activeXAccount: activeHandle(),
-      } : { authenticated: false, username: null });
+        xAccounts: state.accounts.map((account) => account.xUsername),
+        accounts: state.accounts,
+      } : { authenticated: false, userAuthenticated: false, user: null, username: null, activeXAccount: null, xAccounts: [], accounts: [] });
     }
     if (url.pathname === '/api/config/groq') {
       if (req.method === 'DELETE') {

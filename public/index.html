@@ -876,6 +876,7 @@
           const response = await fetch(isSignUp ? '/api/auth/register' : '/api/auth/login', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
+            credentials: 'same-origin',
             body: JSON.stringify(isSignUp ? { email, username, password } : { username, password }),
           });
           const data = await response.json().catch(() => ({}));
@@ -890,8 +891,12 @@
             $('menu-username').textContent = currentAppUsername;
             $('menu-user-email').textContent = currentUserEmail;
             $('signin').classList.add('hidden');
-            displayActiveXAccount(data.user.activeXAccount ?? null);
-            await loadLinkedAccounts();
+            const selectedAccount = data.activeXAccount ?? data.xSession?.handle ?? data.user.activeXAccount ?? null;
+            if (Array.isArray(data.accounts)) applyLinkedAccounts(data.accounts, selectedAccount ?? undefined);
+            else {
+              displayActiveXAccount(selectedAccount);
+              await loadLinkedAccounts();
+            }
           }
           await loadGroqConfiguration();
           await loadHistory();
@@ -1001,6 +1006,7 @@
         try {
           const response = await fetch('/api/auth/x-accounts', {
             headers: appSessionHeaders(),
+            credentials: 'same-origin',
           });
           const accounts = await response.json().catch(() => []);
           if (generation !== authStateGeneration) return;
@@ -1168,10 +1174,11 @@
       }
 
       function applyAuthState(data) {
-        const appAuthenticated = Boolean(data?.userAuthenticated);
-        const handle = data?.authenticated && data?.username
-          ? String(data.username).replace(/^@/, '')
-          : null;
+        const appAuthenticated = Boolean(data?.userAuthenticated ?? data?.authenticated);
+        const selectedAccount = data?.activeXAccount
+          ?? data?.xSession?.handle
+          ?? data?.user?.activeXAccount
+          ?? (data?.authenticated && data?.username ? String(data.username).replace(/^@/, '') : null);
 
         if (!appAuthenticated) {
           resetSignedOutState();
@@ -1185,11 +1192,15 @@
           $('menu-user-email').textContent = currentUserEmail;
           applyGroqConfiguration(data.user.groq ?? data.groq ?? { configured: false });
         }
-        displayActiveXAccount(handle ?? data?.activeXAccount ?? null);
+        if (Array.isArray(data?.accounts)) {
+          applyLinkedAccounts(data.accounts, selectedAccount ?? undefined);
+        } else {
+          displayActiveXAccount(selectedAccount);
+          loadLinkedAccounts();
+        }
         $('signin').classList.add('hidden');
         $('account-chip').classList.remove('hidden');
         closeAccountMenu();
-        loadLinkedAccounts();
       }
 
       // Auth event listeners
@@ -1263,7 +1274,11 @@
         const request = new AbortController();
         const timer = setTimeout(() => request.abort(), 10_000);
         try {
-          const response = await fetch('/api/auth', { signal: request.signal });
+          const response = await fetch('/api/auth/me', {
+            headers: appSessionHeaders(),
+            credentials: 'same-origin',
+            signal: request.signal,
+          });
           clearTimeout(timer);
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const data = await response.json();
@@ -1273,7 +1288,7 @@
         } catch (error) {
           clearTimeout(timer);
           if (error?.name === 'AbortError' || generation !== authStateGeneration) return null;
-          setText('auth-msg', `Could not read auth.json: ${error.message}`, 'err');
+          setText('auth-msg', `Could not restore your session: ${error.message}`, 'err');
           return null;
         }
       }

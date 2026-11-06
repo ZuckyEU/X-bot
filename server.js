@@ -744,6 +744,22 @@ async function deleteXSession(userId, xUsername) {
   await query('DELETE FROM x_sessions WHERE user_id = $1 AND handle = $2', [userId, xUsername]);
 }
 
+/** Most recent saved account for one user, used when their default handle is empty. */
+async function latestXSessionForUser(userId) {
+  if (!isPostgresEnabled()) return null;
+  const { rows } = await query(
+    `SELECT handle, auth_token, ct0, updated_at
+       FROM x_sessions
+      WHERE user_id = $1
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1`,
+    [userId],
+  );
+  return rows[0]
+    ? { xUsername: normalizeXUsername(rows[0].handle), state: sessionStateFromRecord(rows[0]) }
+    : null;
+}
+
 /** Latest saved session across app users, used to warm auth.json after a restart. */
 async function latestXSession() {
   if (!isPostgresEnabled()) return null;
@@ -930,8 +946,18 @@ async function stopActiveRunForUser(userId, { xUsername = null, type = null } = 
 
 async function activeSessionFor(user, { required = false } = {}) {
   normalizeUserAccounts(user);
-  const xUsername = user.preferences.defaultXAccount;
+  let xUsername = user.preferences.defaultXAccount;
+
+  // Older rows can have a saved session without a default handle. Resolve the
+  // most recent database session so new devices still restore an account.
   if (!xUsername) {
+    const fallback = await latestXSessionForUser(user.id);
+    if (fallback) {
+      xUsername = fallback.xUsername;
+      user.preferences.defaultXAccount = xUsername;
+      if (!user.xAccounts.includes(xUsername)) user.xAccounts.push(xUsername);
+      return fallback;
+    }
     if (required) throw new HttpError(409, 'No active X account. Add an X account first.');
     return null;
   }
@@ -956,8 +982,11 @@ async function accountSummaries(user) {
   );
 }
 
-async function stageActiveSession(user, { sessionToken = null } = {}) {
+async function stageActiveSession(user, { sessionToken = null, onlyWhenIdle = false } = {}) {
   return withWriteLock(async () => {
+    // A bootstrap request must never replace the cookie file while an
+    // automation or sign-in run is using it.
+    if (onlyWhenIdle && activeRun) return null;
     if (sessionToken) {
       const users = await loadUserDb();
       user = users.find((candidate) => candidate.id === user.id && candidate.sessionToken === sessionToken);
@@ -967,6 +996,52 @@ async function stageActiveSession(user, { sessionToken = null } = {}) {
     await writeAuthFile(session.state, AUTH_FILE);
     return session;
   });
+}
+
+/** Read the X cookies the automation scripts need from a storage state. */
+function xSessionCredentials(storageState) {
+  const cookies = Array.isArray(storageState?.cookies) ? storageState.cookies : [];
+  const valueFor = (name) => cookies.find((cookie) => cookie.name === name)?.value ?? null;
+  return { auth_token: valueFor('auth_token'), ct0: valueFor('ct0') };
+}
+
+/**
+ * Resolve the user's saved X account, optionally restage auth.json, and return
+ * the credentials for the authenticated dashboard. PostgreSQL remains the
+ * source of truth when the local staging file is missing (for example after a
+ * new device logs in or a container restarts).
+ */
+async function hydrateUserXSession(user, { sessionToken = null } = {}) {
+  try {
+    normalizeUserAccounts(user);
+    const session = await activeSessionFor(user);
+    if (!session) return null;
+
+    const credentials = xSessionCredentials(session.state);
+    let staged = false;
+    if (credentials.auth_token && credentials.ct0) {
+      staged = Boolean(await stageActiveSession(user, { sessionToken, onlyWhenIdle: true }));
+    }
+
+    return {
+      activeXAccount: session.xUsername,
+      xSession: credentials.auth_token && credentials.ct0
+        ? {
+            handle: session.xUsername,
+            auth_token: credentials.auth_token,
+            ct0: credentials.ct0,
+            savedAt: session.state.savedAt ?? null,
+            source: session.state.source ?? (isPostgresEnabled() ? 'postgres' : 'file'),
+            staged,
+          }
+        : null,
+    };
+  } catch (error) {
+    // Account metadata and an existing app session should remain usable even
+    // if the saved X session cannot be read or staged right now.
+    console.warn(`[storage] Could not hydrate the saved X session: ${error.message}`);
+    return null;
+  }
 }
 
 function trustedLoginProfilePayload(storageState) {
@@ -1322,22 +1397,53 @@ app.post('/api/auth/login', async (req, res, next) => {
 
     await stopActiveRunForUser(user.id, { type: 'x-auth' });
     setSessionCookie(res, user.sessionToken);
-    return res.json({ user: publicUser(user) });
+    const active = await hydrateUserXSession(user, { sessionToken: user.sessionToken });
+    return res.json({
+      user: publicUser(user),
+      activeXAccount: active?.activeXAccount ?? user.preferences.defaultXAccount ?? null,
+      xAccounts: user.xAccounts,
+      accounts: await accountSummaries(user),
+    });
   } catch (error) {
     next(error);
   }
 });
 
-// Get current user
+// Get current user and restore the active X session on this device
 app.get('/api/auth/me', async (req, res, next) => {
+  const signedOut = {
+    authenticated: false,
+    userAuthenticated: false,
+    user: null,
+    activeXAccount: null,
+    xAccounts: [],
+    accounts: [],
+  };
+
   try {
-    if (!sessionTokenFromRequest(req)) return res.json({ authenticated: false, user: null });
-    const auth = await authenticatedUser(req);
+    if (!sessionTokenFromRequest(req)) return res.json(signedOut);
+
+    let auth;
+    try {
+      auth = await authenticatedUser(req);
+    } catch (error) {
+      // A stale cookie should let the dashboard show its sign-in form instead
+      // of failing the whole bootstrap with a 401.
+      if (error instanceof HttpError && error.status === 401) return res.json(signedOut);
+      throw error;
+    }
+
     normalizeUserAccounts(auth.user);
+    const active = await hydrateUserXSession(auth.user, { sessionToken: auth.token });
     return res.json({
       authenticated: true,
+      userAuthenticated: true,
       user: publicUser(auth.user),
       groq: publicGroqConfiguration(auth.user),
+      activeXAccount: active?.activeXAccount ?? auth.user.preferences.defaultXAccount ?? null,
+      xAccounts: auth.user.xAccounts,
+      accounts: await accountSummaries(auth.user),
+      ...(active?.xSession ? { xSession: active.xSession } : {}),
     });
   } catch (error) {
     next(error);

@@ -835,11 +835,53 @@ test('PostgreSQL stores users and X sessions and restores them after login', asy
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'user_pg', password }),
   });
-  assert.equal(login.status, 200, await login.text());
+  assert.equal(login.status, 200);
   const loginCookie = sessionCookie(login);
+  const loginBody = await login.json();
+  assert.equal(loginBody.activeXAccount, 'alpha');
+  assert.deepEqual(loginBody.accounts, [{ xUsername: 'alpha', active: true, status: 'ready' }]);
 
   const accounts = await fetch(`${baseUrl}/api/auth/x-accounts`, { headers: { cookie: loginCookie } });
   assert.deepEqual(await accounts.json(), [{ xUsername: 'alpha', active: true, status: 'ready' }]);
+
+  // Login restores the database session on this device.
+  let staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.equal(staged.username, 'alpha');
+  assert.equal(staged.cookies.find((cookie) => cookie.name === 'auth_token').value, 'alpha_auth_token_value');
+
+  // A new device may have no local staging file yet; /api/auth/me must restore
+  // both auth.json and the credentials from the persisted session.
+  await unlink(join(dataDir, 'auth.json'));
+  const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: loginCookie } });
+  assert.equal(me.status, 200);
+  const meBody = await me.json();
+  assert.equal(meBody.authenticated, true);
+  assert.equal(meBody.userAuthenticated, true);
+  assert.equal(meBody.activeXAccount, 'alpha');
+  assert.equal(meBody.xSession.handle, 'alpha');
+  assert.equal(meBody.xSession.auth_token, 'alpha_auth_token_value');
+  assert.equal(meBody.xSession.ct0, 'alpha_csrf_token_value');
+  assert.equal(meBody.xSession.staged, true);
+  assert.deepEqual(meBody.accounts, [{ xUsername: 'alpha', active: true, status: 'ready' }]);
+
+  staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.equal(staged.username, 'alpha');
+  assert.equal(staged.cookies.find((cookie) => cookie.name === 'ct0').value, 'alpha_csrf_token_value');
+
+  // An expired app cookie behaves like a signed-out session instead of
+  // interrupting dashboard bootstrap with a 401.
+  const stale = await fetch(`${baseUrl}/api/auth/me`, {
+    headers: { cookie: 'x_engine_session=expired-session-token' },
+  });
+  assert.equal(stale.status, 200);
+  assert.deepEqual(await stale.json(), {
+    authenticated: false,
+    userAuthenticated: false,
+    user: null,
+    activeXAccount: null,
+    xAccounts: [],
+    accounts: [],
+  });
 
   await assert.rejects(stat(join(dataDir, 'user-db.json')), { code: 'ENOENT' });
 });
