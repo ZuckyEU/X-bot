@@ -39,6 +39,7 @@ const launchPromise = chromium.launchServer({
     '--disable-dev-shm-usage',
     '--disable-gpu',
     '--disable-blink-features=AutomationControlled',
+    '--disable-infobars',
     '--lang=en-US',
     '--window-size=1366,768',
     '--window-position=0,0',
