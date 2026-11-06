@@ -19,12 +19,19 @@ function mockFetch(body, status = 200) {
 }
 
 test('harvest client resolves the Fly.io default and requires a token', () => {
-  assert.deepEqual(
-    resolveHarvestConfig({ token: 'secret-token' }),
-    { url: DEFAULT_HARVEST_API_URL, token: 'secret-token' },
-  );
-  assert.throws(() => resolveHarvestConfig({ token: '' }), /HARVEST_API_TOKEN is required/);
-  assert.throws(() => resolveHarvestConfig({ token: 'x', apiUrl: 'not-a-url' }), /http\(s\) URL/);
+  const configuredUrl = process.env.HARVEST_API_URL;
+  delete process.env.HARVEST_API_URL;
+  try {
+    assert.deepEqual(
+      resolveHarvestConfig({ token: 'secret-token' }),
+      { url: DEFAULT_HARVEST_API_URL, token: 'secret-token' },
+    );
+    assert.throws(() => resolveHarvestConfig({ token: '' }), /HARVEST_API_TOKEN is required/);
+    assert.throws(() => resolveHarvestConfig({ token: 'x', apiUrl: 'not-a-url' }), /http\(s\) URL/);
+  } finally {
+    if (configuredUrl === undefined) delete process.env.HARVEST_API_URL;
+    else process.env.HARVEST_API_URL = configuredUrl;
+  }
 });
 
 test('harvest client sends bearer auth and returns X cookies', async () => {

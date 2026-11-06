@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveInteractiveLoginConfig } from '../lib/interactive-login.js';
 
 /**
  * Deployment gate for `npm run check:prod`.
@@ -24,7 +25,6 @@ const SKIP_DIRS = new Set([
   'coverage',
   'node_modules',
   'playwright-report',
-  'public',
   'sessions',
   'test-results',
   'tmp',
@@ -52,7 +52,7 @@ async function javascriptFiles(directory) {
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
       files.push(...(await javascriptFiles(join(directory, entry.name))));
-    } else if (entry.isFile() && entry.name.endsWith('.js')) {
+    } else if (entry.isFile() && /\.(?:js|cjs)$/.test(entry.name)) {
       files.push(join(directory, entry.name));
     }
   }
@@ -89,7 +89,7 @@ if (sessionSecret.length < 32 || INSECURE_SESSION_SECRETS.has(sessionSecret.toLo
 }
 
 const browserbaseApiKey = String(process.env.BROWSERBASE_API_KEY ?? '').trim();
-if (!browserbaseApiKey || browserbaseApiKey === 'YOUR_API_KEY') {
+if (process.env.INTERACTIVE_LOGIN_ENABLED !== 'true' && (!browserbaseApiKey || browserbaseApiKey === 'YOUR_API_KEY')) {
   fail(
     'BROWSERBASE_API_KEY must be set to a real Browserbase API key.\n' +
       'Get it from https://www.browserbase.com/settings and keep it out of source control.',
@@ -104,6 +104,14 @@ if (harvestApiToken.length < 32 || INSECURE_HARVEST_TOKENS.has(harvestApiToken.t
       'Generate one with:\n' +
       'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"',
   );
+}
+
+if (process.env.INTERACTIVE_LOGIN_ENABLED === 'true') {
+  try {
+    resolveInteractiveLoginConfig();
+  } catch (error) {
+    fail(error.message);
+  }
 }
 
 console.log('[check:prod] Environment verified (NODE_ENV=production).');

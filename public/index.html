@@ -210,8 +210,7 @@
       .hidden { display: none !important; }
 
       /* --------------------------- app authentication --------------------- */
-      #auth-modal,
-      #x-credentials-modal {
+      #auth-modal {
         position: fixed;
         inset: 0;
         padding: 24px;
@@ -222,7 +221,6 @@
         overflow-y: auto;
         backdrop-filter: blur(8px);
       }
-      #x-credentials-modal { z-index: 1060; }
       .auth-modal {
         position: relative;
         width: min(430px, 100%);
@@ -294,10 +292,8 @@
         font-size: 12px;
       }
       .auth-error:empty { visibility: hidden; }
-      #auth-submit,
-      #x-credentials-submit { width: 100%; padding: 11px 18px; }
-      body.auth-open,
-      body.x-credentials-open { overflow: hidden; }
+      #auth-submit { width: 100%; padding: 11px 18px; }
+      body.auth-open { overflow: hidden; }
 
       /* --------------------------- remote X sign-in ----------------------- */
       #remote-login-modal {
@@ -414,8 +410,7 @@
         .file-row, .api-key-row { align-items: stretch; }
         .file-row button, .api-key-row button { flex: 1 1 auto; }
         .actions button { flex: 1 1 140px; }
-        #remote-login-modal,
-        #x-credentials-modal { padding: 8px; }
+        #remote-login-modal { padding: 8px; }
         .remote-login { max-height: calc(100vh - 16px); padding: 12px; }
         .remote-login-actions button, .remote-login-actions a.button { flex: 1 1 150px; }
       }
@@ -474,48 +469,21 @@
         <div class="remote-login-head">
           <div>
             <h2 id="remote-login-title">Remote X sign-in</h2>
-            <p id="remote-login-status" aria-live="polite">Connecting to Browserbase…</p>
+            <p id="remote-login-status" aria-live="polite">Preparing the Fly remote browser…</p>
           </div>
           <button id="remote-login-cancel" class="ghost" type="button">Cancel</button>
         </div>
         <div class="remote-login-body">
           <div id="remote-login-empty" class="remote-login-empty">
-            Waiting for the Browserbase remote window…
+            Waiting for the remote browser window…
           </div>
         </div>
         <div class="remote-login-actions">
           <a id="remote-login-open" class="button ghost is-disabled" href="#" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" role="button" aria-disabled="true">Open Remote Sign-In Window</a>
         </div>
         <p class="remote-login-hint">
-          Complete sign-in, 2FA, or any challenge in the remote browser. The dashboard saves the session automatically when X reaches the home timeline.
+          Enter your credentials, 2FA, or any challenge only on the official X page in the remote browser. This app stores the resulting session cookies to use your X account. Do not share the temporary sign-in URL.
         </p>
-      </div>
-    </div>
-
-    <div id="x-credentials-modal" class="hidden" aria-hidden="true">
-      <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="x-credentials-title" aria-describedby="x-credentials-subtitle">
-        <button class="auth-close" id="x-credentials-close" type="button" aria-label="Close connect X account dialog">&times;</button>
-        <div class="auth-header">
-          <div class="auth-mark" aria-hidden="true">X</div>
-          <h2 class="auth-title" id="x-credentials-title">Connect X account</h2>
-          <p class="auth-subtitle" id="x-credentials-subtitle">The harvest service signs in once and returns a reusable session. Credentials are not stored.</p>
-        </div>
-        <form id="x-credentials-form" novalidate>
-          <div class="auth-field">
-            <label class="control-label" for="x-identifier">X username, email, or phone</label>
-            <input type="text" id="x-identifier" name="identifier" placeholder="@username or email" autocomplete="username" maxlength="254" required />
-          </div>
-          <div class="auth-field">
-            <label class="control-label" for="x-password">X password</label>
-            <input type="password" id="x-password" name="password" placeholder="At least 8 characters" autocomplete="current-password" minlength="8" maxlength="256" required />
-          </div>
-          <div class="auth-field">
-            <label class="control-label" for="x-2fa">2FA code <span style="text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label>
-            <input type="text" id="x-2fa" name="twoFactorCode" inputmode="numeric" pattern="[0-9]{6,10}" minlength="6" maxlength="10" placeholder="123456" autocomplete="one-time-code" />
-          </div>
-          <div class="auth-error" id="x-credentials-error" role="alert" aria-live="polite"></div>
-          <button type="submit" class="primary" id="x-credentials-submit">Connect account</button>
-        </form>
       </div>
     </div>
 
@@ -678,6 +646,7 @@
       let elapsedMilliseconds = 0;
       let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
       let remoteLoginUrl = null;
+      let remoteLoginRequestId = null;
       let remoteCancelInFlight = false;
       const targetUrls = [];
 
@@ -770,6 +739,7 @@
       }
 
       async function clearGroqApiKey() {
+        const generation = authStateGeneration;
         $('clear-groq-key').disabled = true;
         try {
           const response = await fetch('/api/config/groq', { method: 'DELETE', headers: appSessionHeaders() });
@@ -830,7 +800,7 @@
         try {
           popup.opener = null;
           popup.document.title = 'Preparing remote X sign-in…';
-          popup.document.body.textContent = 'Preparing the secure Browserbase sign-in window…';
+          popup.document.body.textContent = 'Preparing the secure remote X sign-in window…';
           popup.document.body.style.cssText = 'margin:0;padding:32px;background:#07090d;color:#cbd5e1;font:14px system-ui,sans-serif';
         } catch {
           // Navigation may have started before the placeholder was painted.
@@ -839,15 +809,16 @@
       }
 
       function launchRemoteLoginWindow(url, preparedWindow = null) {
-        if (preparedWindow && !preparedWindow.closed) {
-          try {
-            preparedWindow.location.replace(url);
-            return true;
-          } catch {
-            // Fall through to a fresh native tab if the placeholder is unavailable.
-          }
+        const popup = preparedWindow && !preparedWindow.closed
+          ? preparedWindow : prepareRemoteLoginWindow();
+        if (!popup) return false;
+        try {
+          popup.location.replace(url);
+          return true;
+        } catch {
+          closeUnusedRemoteWindow(popup, false);
+          return false;
         }
-        return Boolean(window.open(url, '_blank', 'noopener,noreferrer'));
       }
 
       function closeUnusedRemoteWindow(preparedWindow, launched) {
@@ -888,11 +859,12 @@
         modal.setAttribute('aria-hidden', 'false');
         document.body.classList.add('remote-open');
         remoteLoginUrl = null;
+        remoteLoginRequestId = null;
 
-        $('#remote-login-empty').textContent = 'Waiting for the Browserbase remote window…';
+        $('#remote-login-empty').textContent = 'Waiting for the remote browser window…';
         setRemoteLoginOpenState(null);
         $('#remote-login-cancel').disabled = false;
-        setRemoteLoginStatus('Connecting to Browserbase…');
+        setRemoteLoginStatus('Preparing the remote browser…');
       }
 
       function closeRemoteLoginModal() {
@@ -902,6 +874,7 @@
         modal.setAttribute('aria-hidden', 'true');
         document.body.classList.remove('remote-open');
         remoteLoginUrl = null;
+        remoteLoginRequestId = null;
         setRemoteLoginOpenState(null);
         $('#remote-login-cancel').disabled = false;
       }
@@ -920,7 +893,13 @@
 
       async function cancelRemoteSignIn() {
         if (remoteCancelInFlight) return;
+        const generation = authStateGeneration;
+        const cancelledRequest = controller;
+        const requestId = remoteLoginRequestId;
         remoteCancelInFlight = true;
+        cancelledRequest?.abort();
+        let notice = 'The remote sign-in was stopped.';
+        let completed = false;
 
         const button = $('#remote-login-cancel');
         if (button) button.disabled = true;
@@ -930,19 +909,32 @@
           const response = await fetch('/auth/x/cancel', {
             method: 'POST',
             headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({}),
+            body: JSON.stringify(requestId ? { requestId } : {}),
+            signal: AbortSignal.timeout(30_000),
           });
           const data = await response.json().catch(() => ({}));
           if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          if (data.closed === false) notice = 'Close could not be confirmed. Access expires automatically; try a new login shortly.';
+          completed = data.status === 'completed';
         } catch (error) {
-          setRemoteLoginStatus(`Cancel request failed: ${error.message}. Closing the window anyway.`);
+          notice = `Cancel could not be confirmed: ${error.message}. Access still expires automatically.`;
         } finally {
           remoteCancelInFlight = false;
-          controller?.abort();
-          controller = null;
-          closeRemoteLoginModal();
-          setStatus('Sign-in cancelled', 'warn', 'The remote sign-in was stopped.');
-          setText('auth-msg', 'Remote sign-in cancelled.', 'warn');
+          if (generation === authStateGeneration && controller === cancelledRequest) {
+            controller = null;
+            closeRemoteLoginModal();
+            $('signin').disabled = false;
+            $('add-x-account').disabled = false;
+            if (completed) {
+              await loadAuth();
+              if (generation !== authStateGeneration) return;
+              setStatus('Connected', 'ok', 'The login was already saved before cancellation.');
+              setText('auth-msg', 'X account connected.', 'ok');
+            } else {
+              setStatus('Sign-in cancelled', 'warn', notice);
+              setText('auth-msg', notice, 'warn');
+            }
+          }
         }
       }
 
@@ -1174,90 +1166,95 @@
         }
       }
 
-      // Connect a new X account through the Fly.io harvest service.
+      // Credentials are entered on X itself, never into a dashboard form.
       function addXAccount() {
         closeAccountMenu();
-        openXCredentialsModal();
+        if (controller) return;
+        void connectInteractiveX({ preparedWindow: prepareRemoteLoginWindow() });
       }
 
-      function openXCredentialsModal() {
-        const modal = $('#x-credentials-modal');
-        modal.classList.remove('hidden');
-        modal.setAttribute('aria-hidden', 'false');
-        document.body.classList.add('x-credentials-open');
-        $('#x-credentials-form').reset();
-        $('#x-credentials-error').textContent = '';
-        $('#x-credentials-submit').disabled = false;
-        $('#x-credentials-submit').textContent = 'Connect account';
-        $('#x-identifier').focus();
-      }
-
-      function closeXCredentialsModal() {
-        const modal = $('#x-credentials-modal');
-        modal.classList.add('hidden');
-        modal.setAttribute('aria-hidden', 'true');
-        document.body.classList.remove('x-credentials-open');
-        $('#x-password').value = '';
-        $('#x-2fa').value = '';
-        $('#x-credentials-error').textContent = '';
-      }
-
-      async function submitXCredentials(event) {
-        event.preventDefault();
-        const identifier = $('#x-identifier').value.trim();
-        const password = $('#x-password').value;
-        const twoFactorCode = $('#x-2fa').value.trim();
-        const errorBox = $('#x-credentials-error');
-        const submit = $('#x-credentials-submit');
-
-        if (!identifier) {
-          errorBox.textContent = 'Enter your X username, email, or phone number.';
-          $('#x-identifier').focus();
-          return;
-        }
-        if (password.length < 8) {
-          errorBox.textContent = 'X password must be between 8 and 256 characters.';
-          $('#x-password').focus();
-          return;
-        }
-        if (twoFactorCode && !/^\d{6,10}$/.test(twoFactorCode)) {
-          errorBox.textContent = '2FA code must be 6 to 10 digits.';
-          $('#x-2fa').focus();
-          return;
-        }
-
+      async function connectInteractiveX({ preparedWindow = null } = {}) {
         const generation = authStateGeneration;
-        errorBox.textContent = '';
-        submit.disabled = true;
-        submit.textContent = 'Connecting…';
-        setStatus('Running', 'info', 'Signing in to X and harvesting a reusable session…');
-
+        const request = new AbortController();
+        const requestId = crypto.randomUUID();
+        controller = request;
+        let launched = false;
+        let completed = false;
+        $('signin').disabled = true;
+        $('add-x-account').disabled = true;
+        openRemoteLoginModal();
+        remoteLoginRequestId = requestId;
+        setStatus('Running', 'info', 'Preparing the Fly noVNC sign-in window…');
         try {
-          const response = await fetch('/api/auth/x-accounts/harvest', {
+          const response = await fetch('/api/auth/x-accounts/interactive', {
             method: 'POST',
             headers: appSessionHeaders({ 'content-type': 'application/json' }),
-            body: JSON.stringify({
-              identifier,
-              password,
-              ...(twoFactorCode ? { twoFactorCode } : {}),
-            }),
+            body: JSON.stringify({ requestId }),
+            signal: request.signal,
           });
           const data = await response.json().catch(() => ({}));
           if (generation !== authStateGeneration) return;
+          request.signal.throwIfAborted();
           if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-
-          closeXCredentialsModal();
-          setText('auth-msg', `Connected @${data.username ?? data.activeXAccount ?? 'X account'}.`, 'ok');
-          setStatus('Connected', 'ok', 'X session harvested and saved.');
-          await loadAuth();
+          setRemoteLoginUrl(data.viewerUrl, data.expiresAt);
+          launched = launchRemoteLoginWindow(data.viewerUrl, preparedWindow);
+          if (!launched) setRemoteLoginStatus('Popup blocked. Click Open Remote Sign-In Window to continue.');
+          const messages = {
+            starting: 'Starting headed Chromium on Fly…',
+            waiting: 'Sign in on the official X page in the remote window. 2FA and challenges are interactive.',
+            capturing: 'X login detected. Verifying the account and capturing its session…',
+            delivering: 'Saving the X session to your Render account…',
+          };
+          while (!request.signal.aborted && generation === authStateGeneration) {
+            const poll = await fetch(`/api/auth/x-accounts/interactive/${encodeURIComponent(data.requestId)}`, {
+              headers: appSessionHeaders(),
+              signal: AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]),
+            });
+            const state = await poll.json().catch(() => ({}));
+            if (generation !== authStateGeneration) return;
+            request.signal.throwIfAborted();
+            if (!poll.ok) throw new Error(state.error ?? `HTTP ${poll.status}`);
+            if (state.status === 'completed') {
+              completed = true;
+              applyLinkedAccounts(state.accounts, state.activeXAccount);
+              setText('auth-msg', `Connected @${state.username}.`, 'ok');
+              setStatus('Connected', 'ok', 'X session saved securely to your account.');
+              await loadAuth();
+              return;
+            }
+            if (['failed', 'cancelled', 'expired'].includes(state.status)) {
+              throw new Error(state.error ?? 'Remote sign-in ended. Start a new session.');
+            }
+            if (launched) setRemoteLoginStatus(messages[state.status] ?? 'Waiting for remote sign-in…');
+            await new Promise((resolve) => {
+              const done = () => { clearTimeout(timer); request.signal.removeEventListener('abort', done); resolve(); };
+              const timer = setTimeout(done, 2_000);
+              request.signal.addEventListener('abort', done, { once: true });
+              if (request.signal.aborted) done();
+            });
+          }
         } catch (error) {
           if (generation !== authStateGeneration) return;
-          errorBox.textContent = error.message;
-          setStatus('Connection failed', 'err', error.message);
+          if (error.name !== 'AbortError') {
+            setText('auth-msg', `Could not connect X: ${error.message}`, 'err');
+            setStatus('Connection failed', 'err', error.message);
+          }
         } finally {
-          if (generation === authStateGeneration) {
-            submit.disabled = false;
-            submit.textContent = 'Connect account';
+          closeUnusedRemoteWindow(preparedWindow, launched);
+          if (generation === authStateGeneration && controller === request && !remoteCancelInFlight) {
+            if (!completed && !request.signal.aborted) {
+              await fetch('/auth/x/cancel', {
+                method: 'POST',
+                headers: appSessionHeaders({ 'content-type': 'application/json' }),
+                body: JSON.stringify({ requestId }),
+                signal: AbortSignal.timeout(30_000),
+              }).catch(() => {});
+            }
+            if (generation !== authStateGeneration || controller !== request) return;
+            if (controller === request) controller = null;
+            closeRemoteLoginModal();
+            $('signin').disabled = false;
+            $('add-x-account').disabled = false;
           }
         }
       }
@@ -1269,7 +1266,6 @@
         controller?.abort();
         controller = null;
         closeRemoteLoginModal();
-        closeXCredentialsModal();
         stopElapsedTimer();
         batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
         targetUrls.length = 0;
@@ -1294,6 +1290,8 @@
         $('linked-accounts-list').replaceChildren();
         $('history-list').innerHTML = '<div class="history-empty">Sign in to view execution history.</div>';
         $('signin').classList.remove('hidden');
+        $('signin').disabled = false;
+        $('add-x-account').disabled = false;
         $('account-chip').classList.remove('hidden');
         applyGroqConfiguration({ configured: false, source: 'none' });
         $('groq-key-status').textContent = 'Sign in to configure an API key.';
@@ -1344,9 +1342,6 @@
         const clearGroqKeyBtn = $('#clear-groq-key');
         const remoteLoginOpenBtn = $('#remote-login-open');
         const remoteLoginCancelBtn = $('#remote-login-cancel');
-        const xCredentialsOverlay = $('#x-credentials-modal');
-        const xCredentialsClose = $('#x-credentials-close');
-        const xCredentialsForm = $('#x-credentials-form');
 
         signinBtn.addEventListener('click', (event) => {
           event.stopPropagation();
@@ -1364,15 +1359,8 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
-        xCredentialsClose.addEventListener('click', closeXCredentialsModal);
-        xCredentialsOverlay.addEventListener('click', (event) => {
-          if (event.target === xCredentialsOverlay) closeXCredentialsModal();
-        });
-        xCredentialsForm.addEventListener('submit', submitXCredentials);
         document.addEventListener('keydown', (event) => {
-          if (event.key === 'Escape' && !xCredentialsOverlay.classList.contains('hidden')) {
-            closeXCredentialsModal();
-          }
+          if (event.key === 'Escape' && !$('#remote-login-modal').classList.contains('hidden')) void cancelRemoteSignIn();
         });
         remoteLoginOpenBtn.addEventListener('click', (event) => {
           event.preventDefault();
@@ -1395,6 +1383,7 @@
       });
 
       async function loadAuth() {
+        const generation = authStateGeneration;
         const request = new AbortController();
         const timer = setTimeout(() => request.abort(), 10_000);
         try {
@@ -1402,12 +1391,12 @@
           clearTimeout(timer);
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const data = await response.json();
-
+          if (generation !== authStateGeneration) return null;
           applyAuthState(data);
           return data;
         } catch (error) {
           clearTimeout(timer);
-          if (error?.name === 'AbortError') return null;
+          if (error?.name === 'AbortError' || generation !== authStateGeneration) return null;
           setText('auth-msg', `Could not read auth.json: ${error.message}`, 'err');
           return null;
         }
@@ -1539,8 +1528,11 @@
 
       $('signout').addEventListener('click', async () => {
         $('signout').disabled = true;
+        authStateGeneration += 1;
+        controller?.abort();
+        controller = null;
+        closeRemoteLoginModal();
         try {
-          controller?.abort();
           const response = await fetch('/api/auth/logout', {
             method: 'POST',
             headers: appSessionHeaders(),
@@ -1557,6 +1549,8 @@
           setStatus('Sign out failed', 'err', error.message);
         } finally {
           $('signout').disabled = false;
+          $('signin').disabled = false;
+          $('add-x-account').disabled = false;
         }
       });
 

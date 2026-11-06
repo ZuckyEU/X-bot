@@ -2,13 +2,15 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import bcrypt from 'bcrypt';
+import { INTERACTIVE_CALLBACK_PATH, INTERACTIVE_LOGIN_PATH } from '../lib/interactive-login.js';
 import {
   browserbaseSessionParams,
   CHROME_USER_AGENT,
@@ -36,6 +38,7 @@ import {
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
+const INTERACTIVE_SERVICE_TOKEN = 'test-interactive-service-token-with-more-than-32-characters';
 
 async function availablePort() {
   const probe = createServer();
@@ -52,7 +55,7 @@ async function startServer(t, extraEnv = {}, options = {}) {
   const dataDir = options.dataDir ?? (await mkdtemp(join(tmpdir(), 'x-engine-test-')));
   const cleanupData = options.cleanupData ?? !options.dataDir;
   const port = await availablePort();
-  const child = spawn(process.execPath, ['server.js'], {
+  const child = spawn(process.execPath, [...(options.nodeArgs ?? []), 'server.js'], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -62,6 +65,11 @@ async function startServer(t, extraEnv = {}, options = {}) {
       PORT: String(port),
       SESSION_SECRET,
       BCRYPT_ROUNDS: '10',
+      INTERACTIVE_LOGIN_ENABLED: 'false',
+      ...(options.callbackToSelf ? {
+        RENDER_EXTERNAL_URL: `http://127.0.0.1:${port}`,
+        HARVEST_CALLBACK_URL: '',
+      } : {}),
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -89,14 +97,19 @@ async function startServer(t, extraEnv = {}, options = {}) {
   });
   await ready;
 
-  const stop = async () => {
-    if (child.exitCode === null) {
+  let stopping;
+  const stop = () => stopping ??= (async () => {
+    if (child.exitCode === null && child.signalCode === null) {
       const exited = new Promise((resolve) => child.once('exit', resolve));
       child.kill('SIGTERM');
-      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+      const stopped = await Promise.race([exited.then(() => true), delay(5_000, false, { ref: false })]);
+      if (!stopped) {
+        child.kill('SIGKILL');
+        await exited;
+      }
     }
     if (cleanupData) await rm(dataDir, { recursive: true, force: true });
-  };
+  })();
   t.after(stop);
 
   return { baseUrl: `http://127.0.0.1:${port}`, dataDir, child, output: () => output, stop };
@@ -170,6 +183,112 @@ async function startHarvestService(t, { status = 200, body } = {}) {
   t.after(() => new Promise((resolve) => server.close(resolve)));
 
   return { calls, url: `http://127.0.0.1:${port}/api/harvest-token` };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function until(check, message = 'condition did not become true') {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await delay(10);
+  }
+  assert.fail(message);
+}
+
+async function startInteractiveService(t, options = {}) {
+  const calls = [];
+  const sessions = new Map();
+  let origin;
+  const server = createHttpServer(async (req, res) => {
+    const respond = (status, body) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    try {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const call = { method: req.method, url: req.url, headers: req.headers, body: raw ? JSON.parse(raw) : null };
+      calls.push(call);
+      if (req.headers.authorization !== `Bearer ${INTERACTIVE_SERVICE_TOKEN}`) {
+        return respond(401, { error: 'Service token required' });
+      }
+      const url = new URL(req.url, origin);
+      if (req.method === 'POST' && url.pathname === INTERACTIVE_LOGIN_PATH) {
+        const id = call.body.requestId;
+        if (sessions.has(id)) return respond(409, { error: 'Request already used' });
+        const session = {
+          sessionId: id,
+          machineId: 'test-machine-a',
+          status: options.status ?? 'waiting',
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          browserClosed: false,
+        };
+        sessions.set(id, session);
+        await options.onStart?.(call, session);
+        return respond(201, {
+          ...session,
+          viewerUrl: `${origin}/remote-login/${id}?machine=${session.machineId}#token=${'v'.repeat(43)}`,
+        });
+      }
+      const id = url.pathname.slice(`${INTERACTIVE_LOGIN_PATH}/`.length);
+      const session = sessions.get(id);
+      if (!session) return respond(404, { error: 'Session not found' });
+      if (req.method === 'DELETE') {
+        await options.onCancel?.(call, session);
+        session.status = 'cancelled';
+        session.browserClosed = options.cancelClosed !== false;
+      }
+      return respond(200, session);
+    } catch {
+      respond(503, { error: 'Simulated Fly failure' });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  const callback = (id, overrides = {}, token) => {
+    const call = calls.find((request) => request.method === 'POST' && request.body.requestId === id);
+    assert.ok(call, 'Fly START was not received');
+    return fetch(call.body.callbackUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token ?? call.body.callbackToken}` },
+      body: JSON.stringify({
+        requestId: id, sessionId: id, status: 'completed', browserClosed: true,
+        username: 'alice', cookies: xStorageState('alice').cookies, ...overrides,
+      }),
+    });
+  };
+  return { calls, sessions, callback, url: `${origin}/api/harvest-token` };
+}
+
+async function startInteractiveRender(t, { flyOptions, environment, ...options } = {}) {
+  const fly = await startInteractiveService(t, flyOptions);
+  const render = await startServer(t, {
+    HARVEST_API_URL: fly.url,
+    HARVEST_API_TOKEN: INTERACTIVE_SERVICE_TOKEN,
+    ...environment,
+  }, { callbackToSelf: true, ...options });
+  return { ...render, fly };
+}
+
+async function startInteractiveLogin(baseUrl, cookie, body = {}) {
+  const response = await fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
+    method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify(body),
+  });
+  const result = await response.json();
+  assert.equal(response.status, 201, JSON.stringify(result));
+  return result;
 }
 
 test('registration writes remain valid under concurrency and passwords use bcrypt', async (t) => {
@@ -420,6 +539,397 @@ test('Connect X Account harvests cookies through the Fly service and links the a
   assert.equal(statusBody.authenticated, true);
   assert.equal(statusBody.username, 'carol');
   assert.deepEqual(statusBody.xAccounts, ['carol']);
+});
+
+test('interactive Render starts require app authentication and keep pending logins session-owned', { timeout: 20_000 }, async (t) => {
+  const { baseUrl, fly } = await startInteractiveRender(t, { flyOptions: { status: 'completed' } });
+  const owner = await register(baseUrl, 'interactive_owner');
+  const other = await register(baseUrl, 'interactive_other');
+  const endpoint = `${baseUrl}/api/auth/x-accounts/interactive`;
+  const unauthenticated = await fetch(endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(unauthenticated.status, 401);
+  const malformed = await fetch(endpoint, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: [crypto.randomUUID()] }),
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal(fly.calls.length, 0);
+
+  const id = crypto.randomUUID();
+  const login = await startInteractiveLogin(baseUrl, owner.cookie, {
+    requestId: id, userId: other.body.user.id,
+    callbackUrl: 'http://169.254.169.254/', callbackToken: 'browser-supplied-token',
+  });
+  assert.equal(login.requestId, id);
+  const start = fly.calls.find((call) => call.method === 'POST');
+  assert.equal(start.body.callbackUrl, `${baseUrl}${INTERACTIVE_CALLBACK_PATH}`);
+  assert.match(start.body.callbackToken, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(start.headers.authorization, `Bearer ${INTERACTIVE_SERVICE_TOKEN}`);
+  assert.equal(Object.hasOwn(start.body, 'userId'), false);
+  assert.equal(JSON.stringify(login).includes(INTERACTIVE_SERVICE_TOKEN), false);
+  assert.equal(JSON.stringify(login).includes(start.body.callbackToken), false);
+  await until(() => fly.calls.some((call) => call.method === 'GET'));
+  assert.equal(new URL(fly.calls.find((call) => call.method === 'GET').url, fly.url).searchParams.get('machine'), 'test-machine-a');
+  const status = await fetch(`${endpoint}/${id}`, { headers: { cookie: owner.cookie } });
+  const state = await status.json();
+  assert.notEqual(state.status, 'completed', 'Fly status alone must not link an account');
+  assert.equal(Object.hasOwn(state, 'viewerUrl'), false);
+  assert.equal(Object.hasOwn(state, 'cookies'), false);
+
+  const foreignStatus = await fetch(`${endpoint}/${id}`, { headers: { cookie: other.cookie } });
+  assert.equal(foreignStatus.status, 404);
+  const foreignCancel = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: JSON.stringify({ requestId: id }),
+  });
+  assert.equal(foreignCancel.status, 404);
+  const foreignGenericCancel = await fetch(`${baseUrl}/auth/x/cancel`, { method: 'POST', headers: jsonHeaders(other.cookie), body: '{}' });
+  assert.equal(foreignGenericCancel.status, 403);
+  const overlaps = await Promise.all([owner.cookie, other.cookie].map((cookie) => fetch(endpoint, {
+    method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify({ requestId: id }),
+  })));
+  assert.deepEqual(overlaps.map((response) => response.status), [409, 409]);
+  assert.equal(fly.calls.filter((call) => call.method === 'POST').length, 1);
+  assert.equal(fly.calls.some((call) => call.method === 'DELETE'), false, 'A duplicate START must not cancel the real owner');
+  const cancelled = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: id }),
+  });
+  assert.equal(cancelled.status, 200);
+  assert.equal((await cancelled.json()).closed, true);
+});
+
+test('interactive callbacks validate identity and cookies, persist per tenant, and acknowledge identical retries', { timeout: 20_000 }, async (t) => {
+  const { baseUrl, dataDir, fly, output } = await startInteractiveRender(t);
+  const owner = await register(baseUrl, 'callback_owner');
+  const other = await register(baseUrl, 'callback_other');
+  const login = await startInteractiveLogin(baseUrl, owner.cookie);
+  const id = login.requestId;
+  const wrongToken = await fly.callback(id, {}, INTERACTIVE_SERVICE_TOKEN);
+  assert.equal(wrongToken.status, 401, 'The shared service token is not a callback credential');
+  for (const [body, expected] of [
+    [{ sessionId: crypto.randomUUID() }, 400],
+    [{ username: '../escape' }, 400],
+    [{ cookies: [xStorageState('alice').cookies[0]] }, 400],
+    [{ cookies: xStorageState('alice').cookies.map((cookie) => ({ ...cookie, domain: '.evilx.com' })) }, 400],
+    [{ cookies: xStorageState('alice').cookies.map((cookie) => ({ ...cookie, secure: false })) }, 400],
+    [{ browserClosed: false }, 400],
+  ]) {
+    const rejected = await fly.callback(id, body);
+    assert.equal(rejected.status, expected, await rejected.text());
+  }
+  await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
+  const acknowledgements = await Promise.all([fly.callback(id), fly.callback(id)]);
+  assert.deepEqual(acknowledgements.map((response) => response.status), [200, 200]);
+  const destination = join(dataDir, 'sessions', owner.body.user.id, 'alice.json');
+  const firstSave = await readFile(destination, 'utf8');
+  const saved = JSON.parse(firstSave);
+  assert.equal(saved.username, 'alice');
+  assert.equal(saved.source, 'fly-interactive');
+  assert.deepEqual(saved.cookies.map((cookie) => cookie.name), ['auth_token', 'ct0']);
+  assert.deepEqual(saved.origins, []);
+  assert.equal(saved.cookies[0].httpOnly, true);
+  assert.equal(saved.cookies[1].httpOnly, false);
+  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.deepEqual(staged.cookies, saved.cookies);
+  if (process.platform !== 'win32') assert.equal((await stat(destination)).mode & 0o777, 0o600);
+
+  const retry = await fly.callback(id);
+  assert.equal(retry.status, 200);
+  assert.equal(await readFile(destination, 'utf8'), firstSave, 'An acknowledged retry must not rewrite the session');
+  const conflicting = await fly.callback(id, { cookies: xStorageState('conflict').cookies });
+  assert.equal(conflicting.status, 409);
+  const status = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${id}`, { headers: { cookie: owner.cookie } });
+  const statusText = await status.text();
+  const state = JSON.parse(statusText);
+  assert.equal(state.status, 'completed');
+  assert.equal(state.username, 'alice');
+  assert.deepEqual(state.accounts, [{ xUsername: 'alice', active: true, status: 'ready' }]);
+  assert.equal(statusText.includes(saved.cookies[0].value), false);
+  const cancelledAfterSave = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: id }),
+  });
+  assert.deepEqual(await cancelledAfterSave.json(), { ok: true, cancelled: false, closed: true, status: 'completed' });
+
+  const otherLogin = await startInteractiveLogin(baseUrl, other.cookie);
+  const otherCookies = xStorageState('other_tenant').cookies;
+  const secondCallback = await fly.callback(otherLogin.requestId, { username: 'alice', cookies: otherCookies });
+  assert.equal(secondCallback.status, 200);
+  assert.equal(await readFile(destination, 'utf8'), firstSave);
+  const otherSave = JSON.parse(await readFile(join(dataDir, 'sessions', other.body.user.id, 'alice.json'), 'utf8'));
+  assert.equal(otherSave.cookies[0].value, otherCookies[0].value);
+  const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  for (const user of users) {
+    assert.deepEqual(user.xAccounts, ['alice']);
+    assert.equal(user.preferences.defaultXAccount, 'alice');
+  }
+  for (const secret of [INTERACTIVE_SERVICE_TOKEN, saved.cookies[0].value, otherCookies[0].value]) {
+    assert.equal(output().includes(secret), false, 'Login credentials must not appear in server logs');
+  }
+});
+
+test('interactive starts and callbacks enforce requested handles and recheck the three-account limit', { timeout: 20_000 }, async (t) => {
+  const { baseUrl, dataDir, fly } = await startInteractiveRender(t);
+  const full = await register(baseUrl, 'interactive_full');
+  const link = async (cookie, username) => {
+    const response = await fetch(`${baseUrl}/api/auth/x-accounts`, {
+      method: 'POST', headers: jsonHeaders(cookie),
+      body: JSON.stringify({ xUsername: username, storageState: xStorageState(username) }),
+    });
+    assert.equal(response.status, 201, await response.text());
+  };
+  for (const username of ['alpha', 'beta', 'gamma']) await link(full.cookie, username);
+  const refused = await fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
+    method: 'POST', headers: jsonHeaders(full.cookie), body: '{}',
+  });
+  assert.equal(refused.status, 409);
+  assert.equal(fly.calls.length, 0);
+  const refresh = await startInteractiveLogin(baseUrl, full.cookie, { xUsername: '@beta' });
+  const wrongIdentity = await fly.callback(refresh.requestId);
+  assert.equal(wrongIdentity.status, 409);
+  const refreshed = await fly.callback(refresh.requestId, { username: 'beta', cookies: xStorageState('beta').cookies });
+  assert.equal(refreshed.status, 200);
+
+  const growing = await register(baseUrl, 'interactive_growing');
+  await link(growing.cookie, 'alpha');
+  await link(growing.cookie, 'beta');
+  const pending = await startInteractiveLogin(baseUrl, growing.cookie);
+  await link(growing.cookie, 'gamma');
+  const overLimit = await fly.callback(pending.requestId, { username: 'delta', cookies: xStorageState('delta').cookies });
+  assert.equal(overLimit.status, 409);
+  await assert.rejects(stat(join(dataDir, 'sessions', growing.body.user.id, 'delta.json')), { code: 'ENOENT' });
+  const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  assert.deepEqual(users.find((user) => user.id === growing.body.user.id).xAccounts, ['alpha', 'beta', 'gamma']);
+  await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(growing.cookie), body: JSON.stringify({ requestId: pending.requestId }),
+  });
+});
+
+test('cancel, logout, session rotation, and unlink reject late interactive callbacks', { timeout: 30_000 }, async (t) => {
+  const { baseUrl, dataDir, fly } = await startInteractiveRender(t);
+  for (const action of ['request', 'generic', 'logout', 'rotation', 'unlink']) {
+    const owner = await register(baseUrl, `late_${action}`);
+    if (action === 'unlink') {
+      const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
+        method: 'POST', headers: jsonHeaders(owner.cookie),
+        body: JSON.stringify({ xUsername: 'alice', storageState: xStorageState('alice') }),
+      });
+      assert.equal(linked.status, 201);
+    }
+    const login = await startInteractiveLogin(baseUrl, owner.cookie, action === 'unlink' ? { xUsername: 'alice' } : {});
+    let response;
+    if (action === 'logout') {
+      response = await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie: owner.cookie } });
+    } else if (action === 'rotation') {
+      response = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
+      });
+    } else if (action === 'unlink') {
+      response = await fetch(`${baseUrl}/api/auth/x-accounts/alice`, { method: 'DELETE', headers: { cookie: owner.cookie } });
+    } else {
+      response = await fetch(`${baseUrl}/auth/x/cancel`, {
+        method: 'POST', headers: jsonHeaders(owner.cookie),
+        body: JSON.stringify(action === 'request' ? { requestId: login.requestId } : {}),
+      });
+    }
+    assert.equal(response.status, 200, `${action}: ${await response.text()}`);
+    const late = await fly.callback(login.requestId);
+    assert.equal(late.status, 410, `${action}: ${await late.text()}`);
+    await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
+    const deletion = fly.calls.find((call) => call.method === 'DELETE' && call.url.includes(login.requestId));
+    assert.ok(deletion, `${action} must cancel the Fly browser`);
+    assert.equal(new URL(deletion.url, fly.url).searchParams.get('machine'), 'test-machine-a');
+    const status = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${login.requestId}`, { headers: { cookie: owner.cookie } });
+    assert.equal(status.status, ['logout', 'rotation'].includes(action) ? 401 : 200);
+  }
+  const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  assert.ok(users.every((user) => user.xAccounts.length === 0));
+});
+
+test('cancelling a delayed Fly START waits for its Machine affinity before closing the desktop', { timeout: 20_000 }, async (t) => {
+  const acknowledgement = deferred();
+  t.after(() => acknowledgement.resolve());
+  const { baseUrl, fly } = await startInteractiveRender(t, { flyOptions: { onStart: () => acknowledgement.promise } });
+  const owner = await register(baseUrl, 'delayed_start');
+  const requestId = crypto.randomUUID();
+  const starting = fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId }),
+  });
+  await until(() => fly.calls.some((call) => call.method === 'POST'));
+  const cancelling = fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId }),
+  });
+  await until(async () => {
+    const response = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${requestId}`, { headers: { cookie: owner.cookie } });
+    return (await response.json()).status === 'cancelled';
+  });
+  assert.equal(fly.calls.some((call) => call.method === 'DELETE'), false);
+  const overlap = await fetch(`${baseUrl}/api/auth/x-accounts/interactive`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
+  });
+  assert.equal(overlap.status, 409, 'The pending desktop cleanup must keep the reservation');
+  acknowledgement.resolve();
+  assert.equal((await starting).status, 410);
+  const cancelled = await cancelling;
+  assert.equal(cancelled.status, 200);
+  assert.equal((await cancelled.json()).closed, true);
+  const deletion = fly.calls.find((call) => call.method === 'DELETE');
+  assert.equal(new URL(deletion.url, fly.url).searchParams.get('machine'), 'test-machine-a');
+  const next = await startInteractiveLogin(baseUrl, owner.cookie);
+  await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: next.requestId }),
+  });
+});
+
+test('interactive terminal callbacks are idempotent and unconfirmed cleanup is never reported as closed', { timeout: 20_000 }, async (t) => {
+  const { baseUrl, fly } = await startInteractiveRender(t, { flyOptions: { cancelClosed: false } });
+  const owner = await register(baseUrl, 'terminal_callbacks');
+  for (const status of ['failed', 'expired']) {
+    const login = await startInteractiveLogin(baseUrl, owner.cookie);
+    for (let retry = 0; retry < 2; retry += 1) {
+      const response = await fly.callback(login.requestId, { status, cookies: undefined, username: undefined });
+      assert.equal(response.status, 200);
+    }
+    assert.equal((await fly.callback(login.requestId)).status, 410);
+  }
+  const login = await startInteractiveLogin(baseUrl, owner.cookie);
+  const cancel = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: login.requestId }),
+  });
+  assert.equal(cancel.status, 200);
+  assert.equal((await cancel.json()).closed, false);
+  const state = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${login.requestId}`, { headers: { cookie: owner.cookie } });
+  assert.match((await state.json()).error, /close could not be confirmed/);
+  assert.equal((await fly.callback(login.requestId)).status, 410);
+});
+
+test('Fly interactive APIs require the backend service token, not an app session', { timeout: 20_000 }, async (t) => {
+  const { baseUrl } = await startServer(t, {
+    HARVEST_API_TOKEN: INTERACTIVE_SERVICE_TOKEN,
+    INTERACTIVE_LOGIN_ENABLED: 'true',
+    INTERACTIVE_LOGIN_PUBLIC_ORIGIN: 'https://fly.example.test',
+    HARVEST_CALLBACK_URL: `https://render.example.test${INTERACTIVE_CALLBACK_PATH}`,
+  });
+  const owner = await register(baseUrl, 'fly_access');
+  const requestId = crypto.randomUUID();
+  for (const method of ['POST', 'GET', 'DELETE']) {
+    const path = method === 'POST' ? INTERACTIVE_LOGIN_PATH : `${INTERACTIVE_LOGIN_PATH}/${requestId}`;
+    const denied = await fetch(`${baseUrl}${path}`, {
+      method, headers: jsonHeaders(owner.cookie), ...(method === 'POST' ? { body: '{}' } : {}),
+    });
+    assert.equal(denied.status, 401);
+  }
+  const internalHeaders = { 'content-type': 'application/json', authorization: `Bearer ${INTERACTIVE_SERVICE_TOKEN}` };
+  const deleted = await fetch(`${baseUrl}${INTERACTIVE_LOGIN_PATH}/${requestId}`, { method: 'DELETE', headers: internalHeaders });
+  assert.equal(deleted.status, 200);
+  assert.equal((await deleted.json()).browserClosed, true);
+  const delayed = await fetch(`${baseUrl}${INTERACTIVE_LOGIN_PATH}`, {
+    method: 'POST', headers: internalHeaders,
+    body: JSON.stringify({ requestId, callbackUrl: `https://render.example.test${INTERACTIVE_CALLBACK_PATH}`, callbackToken: 't'.repeat(43) }),
+  });
+  assert.equal(delayed.status, 409, 'Cancellation must reject a later START with the same ID');
+  const override = await fetch(`${baseUrl}${INTERACTIVE_LOGIN_PATH}`, {
+    method: 'POST', headers: internalHeaders,
+    body: JSON.stringify({ requestId: crypto.randomUUID(), callbackUrl: 'http://169.254.169.254/', callbackToken: 't'.repeat(43) }),
+  });
+  assert.equal(override.status, 400);
+});
+
+test('a failed interactive save rolls back tenant metadata and permits an identical callback retry', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-write-retry-'));
+  const marker = join(dataDir, 'stage-write-gate');
+  const { baseUrl, fly } = await startInteractiveRender(t, {
+    dataDir, cleanupData: true,
+    environment: { INTERACTIVE_TEST_WRITE_GATE: marker },
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-write-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'storage_retry');
+  const previousUsers = await readFile(join(dataDir, 'user-db.json'), 'utf8');
+  const previousActive = `${JSON.stringify({ ...xStorageState('previous'), username: 'previous' })}\n`;
+  await writeFile(join(dataDir, 'auth.json'), previousActive);
+  const login = await startInteractiveLogin(baseUrl, owner.cookie);
+  await writeFile(marker, 'fail');
+  const failure = await fly.callback(login.requestId);
+  assert.equal(failure.status, 500);
+  assert.equal(await readFile(join(dataDir, 'user-db.json'), 'utf8'), previousUsers);
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), previousActive);
+  await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id, 'alice.json')), { code: 'ENOENT' });
+  const changedPayload = await fly.callback(login.requestId, { cookies: xStorageState('different').cookies });
+  assert.equal(changedPayload.status, 409, 'A retriable save must remain bound to the original cookie payload');
+  const retry = await fly.callback(login.requestId);
+  assert.equal(retry.status, 200, await retry.text());
+  const saved = JSON.parse(await readFile(join(dataDir, 'sessions', owner.body.user.id, 'alice.json'), 'utf8'));
+  assert.equal(saved.cookies[0].value, xStorageState('alice').cookies[0].value);
+  const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  assert.deepEqual(users.find((user) => user.id === owner.body.user.id).xAccounts, ['alice']);
+});
+
+test('cancellation during an interactive save restores the prior session before acknowledging cleanup', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-write-cancel-'));
+  const marker = join(dataDir, 'stage-write-gate');
+  t.after(() => unlink(marker).catch(() => {}));
+  const { baseUrl, fly } = await startInteractiveRender(t, {
+    dataDir, cleanupData: true,
+    environment: { INTERACTIVE_TEST_WRITE_GATE: marker },
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-write-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'storage_cancel');
+  const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ xUsername: 'alice', storageState: xStorageState('alice') }),
+  });
+  assert.equal(linked.status, 201);
+  const switched = await fetch(`${baseUrl}/api/auth/switch-account`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ xUsername: 'alice' }),
+  });
+  assert.equal(switched.status, 200);
+  const paths = [join(dataDir, 'user-db.json'), join(dataDir, 'auth.json'), join(dataDir, 'sessions', owner.body.user.id, 'alice.json')];
+  const previous = await Promise.all(paths.map((path) => readFile(path, 'utf8')));
+  const login = await startInteractiveLogin(baseUrl, owner.cookie, { xUsername: 'alice' });
+  await writeFile(marker, 'pause');
+  const saving = fly.callback(login.requestId, { cookies: xStorageState('updated').cookies });
+  await until(() => stat(`${marker}.entered`).then(() => true, () => false), 'The callback did not reach session staging');
+  const cancelling = fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ requestId: login.requestId }),
+  });
+  await until(async () => {
+    const response = await fetch(`${baseUrl}/api/auth/x-accounts/interactive/${login.requestId}`, { headers: { cookie: owner.cookie } });
+    return (await response.json()).status === 'cancelled';
+  });
+  assert.equal(fly.calls.some((call) => call.method === 'DELETE'), false, 'Cancellation must wait for the interrupted write to roll back');
+  await unlink(marker);
+  assert.equal((await saving).status, 410);
+  const cancelled = await cancelling;
+  assert.equal(cancelled.status, 200);
+  assert.equal((await cancelled.json()).closed, true);
+  assert.deepEqual(await Promise.all(paths.map((path) => readFile(path, 'utf8'))), previous);
+  assert.equal((await fly.callback(login.requestId)).status, 410);
+});
+
+test('a Render restart preserves saved users but discards pending interactive callback ownership', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-pending-restart-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const first = await startInteractiveRender(t, { dataDir });
+  const owner = await register(first.baseUrl, 'pending_restart');
+  const pending = await startInteractiveLogin(first.baseUrl, owner.cookie);
+  const start = first.fly.calls.find((call) => call.method === 'POST');
+  await first.stop();
+  const second = await startServer(t, {
+    HARVEST_API_URL: first.fly.url, HARVEST_API_TOKEN: INTERACTIVE_SERVICE_TOKEN,
+  }, { dataDir, callbackToSelf: true });
+  const status = await fetch(`${second.baseUrl}/api/auth/x-accounts/interactive/${pending.requestId}`, { headers: { cookie: owner.cookie } });
+  assert.equal(status.status, 404);
+  const late = await fetch(`${second.baseUrl}${INTERACTIVE_CALLBACK_PATH}`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${start.body.callbackToken}` },
+    body: JSON.stringify({ requestId: pending.requestId, sessionId: pending.requestId, status: 'completed', browserClosed: true, username: 'alice', cookies: xStorageState('alice').cookies }),
+  });
+  assert.equal(late.status, 404);
+  const me = await fetch(`${second.baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } });
+  assert.equal(me.status, 200);
+  const fresh = await startInteractiveLogin(second.baseUrl, owner.cookie);
+  assert.notEqual(fresh.requestId, pending.requestId);
+  const completed = await first.fly.callback(fresh.requestId);
+  assert.equal(completed.status, 200);
 });
 
 test('Groq status is masked and explicit deletion purges persisted state', async (t) => {
@@ -1027,7 +1537,7 @@ test('remote sign-in cancellation is authenticated and idempotent', async (t) =>
   assert.deepEqual(await noRun.json(), { ok: true, cancelled: false });
 });
 
-test('container exposes the Fly.io port and starts Node directly', async () => {
+test('container exposes only the Fly.io app port and starts the supervised desktop stack', async () => {
   const [dockerfile, server, lockText] = await Promise.all([
     readFile(join(ROOT, 'Dockerfile'), 'utf8'),
     readFile(join(ROOT, 'server.js'), 'utf8'),
@@ -1042,7 +1552,10 @@ test('container exposes the Fly.io port and starts Node directly', async () => {
   );
   assert.match(dockerfile, /^ENV PORT=3000$/m);
   assert.match(dockerfile, /^EXPOSE 3000$/m);
-  assert.match(dockerfile, /^CMD \["node", "server\.js"\]$/m);
+  assert.match(dockerfile, /^CMD \["\/usr\/local\/bin\/start-x-login"\]$/m);
+  assert.match(dockerfile, /xvfb x11vnc novnc websockify openbox/);
+  assert.match(dockerfile, /ENTRYPOINT \["\/usr\/bin\/tini", "--"\]/);
+  assert.equal((dockerfile.match(/^EXPOSE /gm) || []).length, 1);
   assert.match(server, /process\.env\.PORT \|\| 3000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
   assert.match(server, /Server listening on port/);
@@ -1069,11 +1582,13 @@ test('production preflight and docs include the harvest API token', async () => 
   assert.match(readme, /lib\/harvest-client\.js/);
 });
 
-test('dashboard connects X accounts through the harvest endpoint', async () => {
+test('dashboard connects X accounts through interactive Fly login without asking for X credentials', async () => {
   const html = await readFile(join(ROOT, 'public', 'index.html'), 'utf8');
-  assert.match(html, /id="x-credentials-form"/);
-  assert.match(html, /\/api\/auth\/x-accounts\/harvest/);
-  assert.match(html, /twoFactorCode/);
+  assert.equal(html.includes('id="x-credentials-form"'), false);
+  assert.equal(html.includes('id="x-password"'), false);
+  assert.match(html, /\/api\/auth\/x-accounts\/interactive/);
+  assert.match(html, /launchRemoteLoginWindow\(data\.viewerUrl, preparedWindow\)/);
+  assert.match(html, /state\.status === 'completed'/);
 });
 
 test('root serves the dashboard and X harvest authentication is enforced', async (t) => {

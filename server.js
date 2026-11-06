@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'crypto';
+import { setTimeout as waitForPoll } from 'node:timers/promises';
 import {
   applyStealthProfile,
   chromeIdentityForVersion,
@@ -31,6 +32,21 @@ import {
 } from './lib/browser.js';
 import { harvestXAccount } from './lib/harvest-client.js';
 import { fillXLoginForm, safeXHandle, waitForXHomeTimeline } from './lib/x-login.js';
+import { openDesktopBrowser } from './lib/desktop-browser.js';
+import { createInteractiveLoginClient } from './lib/interactive-login-client.js';
+import {
+  CALLBACK_GRACE_MS,
+  createInteractiveLoginService,
+  extractXSessionCookies,
+  INTERACTIVE_CALLBACK_PATH,
+  INTERACTIVE_LOGIN_PATH,
+  InteractiveLoginError,
+  matchesSecret,
+  resolveInteractiveLoginConfig,
+  secretDigest,
+  SESSION_ID_PATTERN,
+} from './lib/interactive-login.js';
+import { attachRemoteDesktopUpgrade, bearerToken, flySessionRouting, installRemoteViewer } from './lib/remote-desktop-http.js';
 
 /**
  * Local service for the X reply automation.
@@ -38,6 +54,7 @@ import { fillXLoginForm, safeXHandle, waitForXHomeTimeline } from './lib/x-login
  *   POST /api/auth/register, /api/auth/login -> persisted local user authentication
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
  *   POST /api/auth/x-accounts/harvest -> Fly.io harvest sign-in -> sessions/<userId>/<xUsername>.json
+ *   POST /api/auth/x-accounts/interactive -> Fly noVNC sign-in, callback -> per-tenant state
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
  *   POST /auth/x     -> optional Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
@@ -45,8 +62,8 @@ import { fillXLoginForm, safeXHandle, waitForXHomeTimeline } from './lib/x-login
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
- * Anyone who can reach this port can swap your X session or trigger the sign-in
- * browser, so terminate TLS and configure access controls before public exposure.
+ * Terminate TLS before public exposure. Fly desktop APIs require the internal
+ * service token; desktop viewers receive only short-lived, per-login access.
  * Set HOST=127.0.0.1 for local-only use.
  */
 
@@ -181,7 +198,7 @@ function toOrigin(value) {
 }
 
 const allowedOrigins = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
-for (const value of [process.env.PUBLIC_ORIGIN, process.env.RENDER_EXTERNAL_URL, process.env.ALLOWED_ORIGINS]) {
+for (const value of [process.env.PUBLIC_ORIGIN, process.env.RENDER_EXTERNAL_URL, process.env.ALLOWED_ORIGINS, process.env.INTERACTIVE_LOGIN_PUBLIC_ORIGIN]) {
   for (const candidate of String(value || '').split(',')) {
     if (!candidate.trim()) continue;
     const origin = toOrigin(candidate);
@@ -636,6 +653,48 @@ class ValidationError extends HttpError {
   }
 }
 
+const interactiveConfig = resolveInteractiveLoginConfig();
+const interactiveLogins = createInteractiveLoginService({
+  config: interactiveConfig,
+  openBrowser: openDesktopBrowser,
+  readIdentity: readSignedInUsername,
+});
+installRemoteViewer(app, { service: interactiveLogins, config: interactiveConfig, publicDir: PUBLIC_DIR });
+
+const internalHarvestDigest = secretDigest(HARVEST_API_TOKEN);
+function requireInternalHarvestAccess(req) {
+  if (!HARVEST_API_TOKEN || !matchesSecret(bearerToken(req.headers), internalHarvestDigest)) {
+    throw new HttpError(401, 'Harvest token required');
+  }
+}
+
+app.post(INTERACTIVE_LOGIN_PATH, (req, res, next) => {
+  try {
+    requireInternalHarvestAccess(req);
+    res.status(201).json(interactiveLogins.start(req.body ?? {}));
+  } catch (error) {
+    next(error);
+  } finally {
+    if (req.body) delete req.body.callbackToken;
+  }
+});
+app.get(`${INTERACTIVE_LOGIN_PATH}/:sessionId`, flySessionRouting(interactiveConfig), (req, res, next) => {
+  try {
+    requireInternalHarvestAccess(req);
+    res.json(interactiveLogins.status(req.params.sessionId));
+  } catch (error) {
+    next(error);
+  }
+});
+app.delete(`${INTERACTIVE_LOGIN_PATH}/:sessionId`, flySessionRouting(interactiveConfig), async (req, res, next) => {
+  try {
+    requireInternalHarvestAccess(req);
+    res.json(await interactiveLogins.cancel(req.params.sessionId));
+  } catch (error) {
+    next(error);
+  }
+});
+
 function getGroqConfiguration(user) {
   const apiKey = String(user?.groqApiKey ?? '').trim() || null;
   return {
@@ -736,7 +795,7 @@ async function stopActiveRunForUser(userId, { xUsername = null, type = null } = 
   const stopped = await Promise.race([
     handle.done.then(() => true),
     new Promise((resolveTimeout) => {
-      timer = setTimeout(() => resolveTimeout(false), 10_000);
+      timer = setTimeout(() => resolveTimeout(false), handle.type === 'fly-x-auth' ? 25_000 : 10_000);
       timer.unref?.();
     }),
   ]);
@@ -846,6 +905,293 @@ async function addAccountToUser(userId, xUsername) {
   });
 }
 
+/* ------------------------ Render's pending Fly sign-ins ------------------- */
+
+// Pending logins are intentionally ephemeral. A restart requires a new login;
+// cookie state is persisted only after a valid, tenant-bound callback.
+const pendingFlyLogins = new Map();
+
+function publicFlyLogin(record) {
+  return {
+    requestId: record.id,
+    status: record.status,
+    expiresAt: new Date(record.expiresAt).toISOString(),
+    ...(record.error ? { error: record.error } : {}),
+    ...(record.result || {}),
+  };
+}
+
+function finishFlyLogin(record, status, { error, result } = {}) {
+  if (record.finished) return;
+  record.finished = true;
+  record.status = status;
+  record.error = error;
+  record.result = result;
+  clearTimeout(record.expiryTimer);
+  record.controller.abort();
+  if (activeRun === record.handle) activeRun = null;
+  record.completion.resolve();
+  const retentionTimer = setTimeout(() => pendingFlyLogins.delete(record.id), 60_000);
+  retentionTimer.unref?.();
+}
+
+function cancelFlyLogin(record, status = 'cancelled') {
+  if (record.finished) return Promise.resolve();
+  if (record.cancelPromise) return record.cancelPromise;
+  record.status = status;
+  record.controller.abort();
+  record.cancelPromise = (async () => {
+    // Unlink/logout must wait for any callback already writing under the lock.
+    await record.savePromise?.catch(() => {});
+    // Keep the short START request alive long enough to learn Machine affinity.
+    // Aborting it could hide an accepted login on a different Fly Machine.
+    await record.startPromise?.catch(() => {});
+    let error;
+    try {
+      const remote = await record.client.cancel(record.id, { machineId: record.machineId });
+      record.handle.closed = remote.browserClosed === true;
+      if (!record.handle.closed) throw new Error('Desktop cleanup was not confirmed');
+    } catch {
+      error = 'The remote close could not be confirmed; its access still expires automatically.';
+    }
+    finishFlyLogin(record, status, { error });
+  })();
+  return record.cancelPromise;
+}
+
+async function monitorFlyLogin(record) {
+  while (!record.finished && !record.controller.signal.aborted) {
+    try {
+      const remote = await record.client.status(record.id, { machineId: record.machineId, signal: record.controller.signal });
+      if (record.finished || record.controller.signal.aborted) return;
+      if (['failed', 'expired', 'cancelled'].includes(remote.status)) {
+        record.handle.closed = remote.browserClosed === true;
+        finishFlyLogin(record, remote.status, { error: remote.error || 'Remote sign-in did not complete. Try again.' });
+        return;
+      }
+      if (['starting', 'waiting', 'capturing', 'delivering'].includes(remote.status)) record.status = remote.status;
+      // "completed" alone is never proof of a login: only the authenticated
+      // cookie callback can link an account or mark this record completed.
+    } catch {
+      // Transient Fly outages do not erase the pending login or link an account.
+    }
+    await waitForPoll(2_000, undefined, { signal: record.controller.signal, ref: false }).catch(() => {});
+  }
+}
+
+app.post('/api/auth/x-accounts/interactive', async (req, res, next) => {
+  let record;
+  try {
+    const auth = await authenticatedUser(req);
+    normalizeUserAccounts(auth.user);
+    if (req.body?.requestId !== undefined &&
+        (typeof req.body.requestId !== 'string' || !SESSION_ID_PATTERN.test(req.body.requestId))) {
+      throw new ValidationError('Invalid remote sign-in request ID');
+    }
+    const requestedXUsername = req.body?.xUsername ? normalizeXUsername(req.body.xUsername) : null;
+    if (auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
+        (!requestedXUsername || !auth.user.xAccounts.includes(requestedXUsername))) {
+      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+    }
+    const client = createInteractiveLoginClient();
+    const callbackToken = crypto.randomBytes(32).toString('base64url');
+    record = {
+      id: req.body?.requestId ?? crypto.randomUUID(),
+      userId: auth.user.id,
+      sessionDigest: secretDigest(auth.token),
+      callbackDigest: secretDigest(callbackToken),
+      requestedXUsername,
+      generation: authGeneration,
+      status: 'starting',
+      expiresAt: Date.now() + 900_000,
+      machineId: null,
+      controller: new AbortController(),
+      completion: createCompletionSignal(),
+      client,
+    };
+    record.handle = {
+      type: 'fly-x-auth',
+      userId: record.userId,
+      xUsername: requestedXUsername,
+      closed: false,
+      done: record.completion.promise,
+      abort() { void cancelFlyLogin(record); },
+    };
+    await withWriteLock(async () => {
+      const users = await loadUserDb();
+      const current = users.find((candidate) => candidate.id === record.userId);
+      assertPendingFlyLogin(record, current);
+      normalizeUserAccounts(current);
+      if (current.xAccounts.length >= MAX_X_ACCOUNTS &&
+          (!requestedXUsername || !current.xAccounts.includes(requestedXUsername))) {
+        throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+      }
+      if (activeRun) throw new HttpError(409, 'A run is already in progress');
+      if (pendingFlyLogins.has(record.id)) throw new HttpError(409, 'This sign-in request ID was already used');
+      pendingFlyLogins.set(record.id, record);
+      activeRun = record.handle;
+    });
+    res.on('close', () => {
+      if (!res.writableEnded && !record.finished) record.handle.abort();
+    });
+    if (res.destroyed) throw new HttpError(410, 'Sign-in was cancelled');
+
+    record.startPromise = client.start({ requestId: record.id, callbackToken }).then((remote) => {
+      record.machineId = remote.machineId;
+      record.expiresAt = Date.parse(remote.expiresAt);
+      return remote;
+    });
+    const remote = await record.startPromise;
+    if (record.controller.signal.aborted && record.status !== 'completed') throw new HttpError(410, 'Sign-in was cancelled');
+    if (!record.finished) {
+      record.expiryTimer = setTimeout(() => void cancelFlyLogin(record, 'expired'),
+        Math.max(1, record.expiresAt + CALLBACK_GRACE_MS - Date.now()));
+      record.expiryTimer.unref?.();
+      void monitorFlyLogin(record);
+    }
+    res.status(201).json({ ...publicFlyLogin(record), viewerUrl: remote.viewerUrl });
+  } catch (error) {
+    if (record && pendingFlyLogins.get(record.id) === record && !record.finished) {
+      const cancelled = record.controller.signal.aborted;
+      await cancelFlyLogin(record);
+      if (!cancelled) {
+        record.status = 'failed';
+        record.error = 'Could not start the remote X browser. Try again.';
+      }
+    }
+    next(error.name === 'AbortError' ? new HttpError(410, 'Sign-in was cancelled') : error);
+  }
+});
+
+app.get('/api/auth/x-accounts/interactive/:requestId', async (req, res, next) => {
+  try {
+    const auth = await authenticatedUser(req);
+    const record = pendingFlyLogins.get(req.params.requestId);
+    if (!record || record.userId !== auth.user.id || !matchesSecret(auth.token, record.sessionDigest)) {
+      throw new HttpError(404, 'Pending sign-in not found');
+    }
+    res.json(publicFlyLogin(record));
+  } catch (error) {
+    next(error);
+  }
+});
+
+function assertPendingFlyLogin(record, user) {
+  if (record.controller.signal.aborted || record.generation !== authGeneration ||
+      Date.now() > record.expiresAt + CALLBACK_GRACE_MS) {
+    throw new HttpError(410, 'Sign-in was cancelled or expired');
+  }
+  if (!user || !matchesSecret(user.sessionToken, record.sessionDigest)) {
+    throw new HttpError(410, 'The app session is no longer active');
+  }
+}
+
+async function persistFlyLogin(record, username, storageState) {
+  return withWriteLock(async () => {
+    const users = await loadUserDb();
+    const current = users.find((user) => user.id === record.userId);
+    assertPendingFlyLogin(record, current);
+    normalizeUserAccounts(current);
+    if (!current.xAccounts.includes(username) && current.xAccounts.length >= MAX_X_ACCOUNTS) {
+      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+    }
+    const destination = sessionFileFor(current.id, username);
+    const previousSession = await readAuthFile(destination);
+    const previousActive = await readAuthFile(AUTH_FILE);
+    const previousUsers = structuredClone(users);
+    let sessionWritten = false;
+    let usersWritten = false;
+    let activeWritten = false;
+    try {
+      assertPendingFlyLogin(record, current);
+      await writeAuthFile(storageState, destination);
+      sessionWritten = true;
+      assertPendingFlyLogin(record, current);
+      if (!current.xAccounts.includes(username)) current.xAccounts.push(username);
+      current.preferences.defaultXAccount = username;
+      await saveUserDb(users);
+      usersWritten = true;
+      assertPendingFlyLogin(record, current);
+      await writeAuthFile(storageState, AUTH_FILE);
+      activeWritten = true;
+      const accounts = await accountSummaries(current);
+      assertPendingFlyLogin(record, current);
+      return { username, activeXAccount: username, accounts };
+    } catch (error) {
+      // Cancellation waits for this lock. Restore only this transaction's
+      // writes, so an interrupted callback cannot leave orphaned auth cookies.
+      try {
+        if (activeWritten) {
+          if (previousActive) await writeAuthFile(previousActive, AUTH_FILE);
+          else await deleteAuthFile(AUTH_FILE);
+        }
+        if (usersWritten) await saveUserDb(previousUsers);
+        if (sessionWritten) {
+          if (previousSession) await writeAuthFile(previousSession, destination);
+          else await deleteAuthFile(destination);
+        }
+      } catch {
+        throw new HttpError(503, 'Could not restore an interrupted login save. Check persistent storage before retrying.');
+      }
+      throw error;
+    }
+  });
+}
+
+app.post(INTERACTIVE_CALLBACK_PATH, async (req, res, next) => {
+  try {
+    const body = req.body ?? {};
+    const record = pendingFlyLogins.get(body.requestId);
+    if (!record) throw new HttpError(404, 'Pending sign-in not found');
+    if (!matchesSecret(bearerToken(req.headers), record.callbackDigest)) throw new HttpError(401, 'Callback authentication required');
+    if (body.sessionId !== record.id) throw new ValidationError('Callback session ID does not match');
+    if (record.finished && ['failed', 'expired'].includes(record.status) && body.status === record.status) {
+      return res.json({ ok: true });
+    }
+    if (['cancelled', 'expired', 'failed'].includes(record.status) || Date.now() > record.expiresAt + CALLBACK_GRACE_MS) {
+      throw new HttpError(410, 'This sign-in is no longer pending');
+    }
+    if (['failed', 'expired'].includes(body.status)) {
+      if (record.savePromise || record.finished) throw new HttpError(409, 'A login result was already received');
+      record.handle.closed = body.browserClosed === true;
+      finishFlyLogin(record, body.status, { error: 'Remote X sign-in did not complete. Start a new session.' });
+      return res.json({ ok: true });
+    }
+    if (body.status !== 'completed') throw new ValidationError('Invalid callback status');
+    if (body.browserClosed !== true) throw new ValidationError('Callback must confirm the remote browser is closed');
+    const username = normalizeXUsername(body.username);
+    if (record.requestedXUsername && username !== record.requestedXUsername) {
+      throw new HttpError(409, `Signed in as @${username}, but @${record.requestedXUsername} was requested`);
+    }
+    const cookies = extractXSessionCookies(body.cookies);
+    if (!cookies) throw new ValidationError('Callback must contain auth_token and ct0 from X');
+    const storageState = { ...harvestedXStorageState({ username, cookies }), source: 'fly-interactive' };
+    const material = JSON.stringify({ username, cookies: storageState.cookies });
+    if (record.payloadDigest && !matchesSecret(material, record.payloadDigest)) {
+      throw new HttpError(409, 'A different login result was already received');
+    }
+    if (record.finished && record.status === 'completed') return res.json({ ok: true });
+    record.payloadDigest ??= secretDigest(material);
+    if (!record.savePromise) {
+      const saving = persistFlyLogin(record, username, storageState);
+      record.savePromise = saving;
+      void saving.catch(() => {
+        // Retriable storage failures must not pin an already-rejected promise.
+        if (record.savePromise === saving) record.savePromise = null;
+      });
+    }
+    const result = await record.savePromise;
+    if (record.controller.signal.aborted && record.status !== 'completed') throw new HttpError(410, 'Sign-in was cancelled');
+    record.handle.closed = true;
+    finishFlyLogin(record, 'completed', { result });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  } finally {
+    if (req.body) delete req.body.cookies;
+  }
+});
+
 /* --------------------------------- auth ---------------------------------- */
 
 app.get('/api/auth', async (req, res, next) => {
@@ -923,13 +1269,15 @@ app.post('/api/auth/logout', async (req, res, next) => {
   try {
     const auth = await optionalAuthenticatedUser(req);
     if (auth) {
-      await stopActiveRunForUser(auth.user.id);
       await withWriteLock(async () => {
         const users = await loadUserDb();
         const user = users.find((candidate) => candidate.id === auth.user.id);
         if (user) user.sessionToken = null;
         await saveUserDb(users);
       });
+      // Revocation is serialized with pending-login reservations and callbacks.
+      // No stale authenticated request can reserve a new Fly login after it.
+      await stopActiveRunForUser(auth.user.id);
       clearSessionCookie(res);
       return res.json({ ok: true, authenticated: false });
     }
@@ -1012,6 +1360,7 @@ app.post('/api/auth/login', async (req, res, next) => {
       return match;
     });
 
+    await stopActiveRunForUser(user.id, { type: 'fly-x-auth' });
     setSessionCookie(res, user.sessionToken);
     return res.json({ user: publicUser(user) });
   } catch (error) {
@@ -1988,12 +2337,31 @@ app.post('/auth/x/cancel', async (req, res) => {
     return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not cancel X sign-in' });
   }
 
+  if (req.body?.requestId) {
+    const record = pendingFlyLogins.get(req.body.requestId);
+    if (!record || record.userId !== auth.user.id || !matchesSecret(auth.token, record.sessionDigest)) {
+      return res.status(404).json({ error: 'Pending sign-in not found' });
+    }
+    await cancelFlyLogin(record);
+    return res.json({ ok: true, cancelled: record.status === 'cancelled', closed: record.handle.closed, status: record.status });
+  }
+
   const handle = activeRun;
-  if (!handle || handle.type !== 'x-auth') {
+  if (!handle || !['x-auth', 'fly-x-auth'].includes(handle.type)) {
     return res.json({ ok: true, cancelled: false });
   }
   if (handle.userId !== auth.user.id) {
     return res.status(403).json({ error: 'This X sign-in belongs to another session' });
+  }
+
+  if (handle.type === 'fly-x-auth') {
+    try {
+      // The next tenant must not inherit an uncleared virtual desktop.
+      await stopActiveRunForUser(auth.user.id, { type: 'fly-x-auth' });
+      return res.json({ ok: true, cancelled: true, closed: handle.closed });
+    } catch (error) {
+      return res.status(error.status ?? 503).json({ error: 'Remote browser cleanup could not be confirmed' });
+    }
   }
 
   // Release the lock before cleanup so a new sign-in can start immediately.
@@ -2362,7 +2730,7 @@ app.use(express.static(PUBLIC_DIR, { index: 'index.html' }));
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
 
-  if (error instanceof HttpError) {
+  if (error instanceof HttpError || error instanceof InteractiveLoginError) {
     return res.status(error.status).json({ error: error.message });
   }
   if (error instanceof SyntaxError && 'body' in error) {
@@ -2398,6 +2766,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/x-accounts (list saved X sessions)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/x-accounts/harvest (harvest and link an X account)`);
+  console.log(`  POST ${HOST}:${PORT}/api/auth/x-accounts/interactive (Fly noVNC sign-in)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/switch-account (select active X session)`);
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
@@ -2405,6 +2774,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  POST ${HOST}:${PORT}/auth/x      (interactive Browserbase sign-in -> per-user session file)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
+attachRemoteDesktopUpgrade(server, { service: interactiveLogins, config: interactiveConfig });
 
 let shuttingDown = false;
 const shutdown = async () => {
@@ -2416,6 +2786,7 @@ const shutdown = async () => {
   if (handle) {
     await Promise.race([handle.done, sleep(10_000)]).catch(() => {});
   }
+  await interactiveLogins.close();
 
   const forceExit = setTimeout(() => process.exit(1), 10_000);
   forceExit.unref?.();

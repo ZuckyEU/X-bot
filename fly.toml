@@ -6,14 +6,18 @@ app = "x-auth-bot-free"
 [env]
   NODE_ENV = "production"
   PORT = "3000"
+  DISPLAY = ":99"
+  INTERACTIVE_LOGIN_ENABLED = "true"
+  INTERACTIVE_LOGIN_PUBLIC_ORIGIN = "https://x-auth-bot-free.fly.dev"
 
 [http_service]
   internal_port = 3000
   force_https = true
-  auto_stop_machines = true
+  # Keep the cookie watcher/callback alive even when the viewer disconnects.
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  memory = "1gb"

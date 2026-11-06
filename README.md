@@ -18,7 +18,7 @@ BROWSERBASE_API_KEY=YOUR_API_KEY
 BROWSERBASE_PROJECT_ID=YOUR_PROJECT_ID
 ```
 
-All application browser automation creates a **Browserbase** session through the official `@browserbasehq/sdk` (`sessions.create()`) and connects Playwright with `chromium.connectOverCDP(session.connectUrl)`. Keep `BROWSERBASE_API_KEY` and (recommended) `BROWSERBASE_PROJECT_ID` in `.env` or the deployment environment, never in source control. If the project ID is omitted, the SDK infers the project from the API key. Sessions use Browserbase's standard stealth defaults on the Free tier; Enterprise Verified mode is opt-in via `BROWSERBASE_VERIFIED_MODE=true` because it otherwise fails with a 403. Sessions are explicitly released with `REQUEST_RELEASE` when a run finishes, fails, or is cancelled.
+Reply automation creates a **Browserbase** session through the official `@browserbasehq/sdk` (`sessions.create()`) and connects Playwright with `chromium.connectOverCDP(session.connectUrl)`. Fly's login microservice instead runs its own Chromium and does not need a Browserbase key. Keep `BROWSERBASE_API_KEY` and (recommended) `BROWSERBASE_PROJECT_ID` on the automation/Render backend, never in source control. If the project ID is omitted, the SDK infers the project from the API key. Sessions use Browserbase's standard stealth defaults on the Free tier; Enterprise Verified mode is opt-in via `BROWSERBASE_VERIFIED_MODE=true` because it otherwise fails with a 403. Sessions are explicitly released with `REQUEST_RELEASE` when a run finishes, fails, or is cancelled.
 
 `gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
 
@@ -115,24 +115,76 @@ Notes:
 
 ## X sign-in via the web UI (Connect X Account)
 
-**Connect X Account** opens a credential dialog in the dashboard. Enter the X username, email, or phone number, the X password, and an optional 2FA code. The dashboard sends them to `POST /api/auth/x-accounts/harvest`; the backend calls the Fly.io harvest service through `lib/harvest-client.js`, receives `auth_token` and `ct0`, writes `sessions/<userId>/<xUsername>.json`, links the account, and stages it as the active X session. The credentials are not persisted.
+**Connect X Account** opens a temporary **noVNC browser window on Fly.io**. Type credentials, 2FA codes, and challenges directly into the official X login page there; the dashboard no longer asks for an X password. The app stores the resulting session cookies, which grant account access, so use this only with accounts you own or are authorized to manage.
 
 Flow:
 
-1. The dashboard validates the form and posts `{ identifier, password, twoFactorCode? }` to `POST /api/auth/x-accounts/harvest`.
-2. The Render backend calls the Fly.io harvest service with the internal `HARVEST_API_TOKEN`; the service runs headless Playwright, signs in to X, and returns the two cookies.
-3. The backend validates the cookies, saves the account storage state under persistent `DATA_DIR`, updates `user-db.json`, and writes the active session to `auth.json`.
-4. The dashboard reloads `/api/auth` and shows the new account as connected.
+1. The authenticated dashboard posts `{ requestId }` to `POST /api/auth/x-accounts/interactive`. The client-generated UUID lets cancellation target this login even while its start response is pending. Render reserves a pending login bound to the app user **and current app session**, then calls Fly through `lib/interactive-login-client.js` using `HARVEST_API_TOKEN` and a separate one-time callback token.
+2. Fly opens headed Chromium at **`https://x.com/login`** on `DISPLAY=:99`. Xvfb supplies the display, Openbox manages the window, x11vnc streams it, and websockify/noVNC provide keyboard/mouse access over the app's HTTPS port.
+3. Render returns a private `viewerUrl`. The dashboard pre-opens a native tab and navigates it to the viewer. If popups are blocked, click **Open Remote Sign-In Window**. Do not share the URL.
+4. Fly polls cookies once a second. Only `auth_token` **and** `ct0` scoped to X qualify. It waits for X's home timeline, detects the actual handle, revokes viewer input, and closes Chromium before posting the result to the configured Render callback.
+5. Render authenticates the callback, validates the account/cookies, atomically writes `sessions/<userId>/<xUsername>.json`, links the account (maximum three), and stages it as the active session. Identical callback retries are idempotent. Raw cookies are never returned to dashboard JavaScript.
+6. The dashboard polls its own authenticated status endpoint and updates the connected account automatically. Cancel, account unlink, app logout, expiry, or shutdown abort the pending login. Late callbacks cannot resurrect an unlinked or cleared session.
+
+### Fly desktop deployment
+
+The Docker image installs **Xvfb, x11vnc, noVNC, websockify, Openbox, X authority tools, and tini**. `scripts/start-desktop.sh` waits for the display/transports, starts Node, monitors every service, and tears down the stack if a service fails. Playwright's image version matches `package-lock.json`.
+
+| Service | Setting | Value |
+|---|---|---|
+| Both | `HARVEST_API_TOKEN` | The same random secret of at least 32 characters |
+| Both | `SESSION_SECRET` | A separate strong app-session secret for each backend |
+| Fly | `HARVEST_CALLBACK_URL` | `https://YOUR-RENDER-SERVICE.onrender.com/api/auth/x-accounts/interactive/callback` |
+| Fly | `INTERACTIVE_LOGIN_ENABLED` | `true` (already in `fly.toml`) |
+| Fly | `INTERACTIVE_LOGIN_PUBLIC_ORIGIN` | `https://x-auth-bot-free.fly.dev` (already in `fly.toml`; change for another app/domain) |
+| Render | `HARVEST_API_URL` | Optional; defaults to `https://x-auth-bot-free.fly.dev/api/harvest-token` |
+| Render | `HARVEST_CALLBACK_URL` | Optional when `RENDER_EXTERNAL_URL` is set automatically; otherwise use the same exact callback URL as Fly |
+| Render | `INTERACTIVE_LOGIN_ENABLED` | Leave unset/`false`; Render does not host the desktop |
+| Render | `DATA_DIR` | Your persistent disk directory, for example `/var/data` |
+
+Replace all placeholders before running:
+
+```sh
+fly secrets set --app x-auth-bot-free \
+  SESSION_SECRET='<fly-session-secret>' \
+  HARVEST_API_TOKEN='<shared-service-secret>' \
+  HARVEST_CALLBACK_URL='https://YOUR-RENDER-SERVICE.onrender.com/api/auth/x-accounts/interactive/callback'
+fly deploy --remote-only --app x-auth-bot-free
+fly scale count 1 --app x-auth-bot-free
+```
+
+Set the matching shared token on Render and deploy its updated backend/dashboard too. `fly.toml` now requests **1 GB RAM and one always-on Machine** instead of 256 MB/autostop: a headed browser plus the desktop needs more memory, and the watcher/callback must survive viewer disconnection. This increases hosting usage/cost. Start with one Fly Machine and one Render process; pending Render logins are in memory and require a fresh login after a restart. Viewer/status/cancel requests include Fly Machine affinity and use `fly-replay` when routed elsewhere.
+
+Only **port 3000** is exposed. **5900 and 6080 bind to `127.0.0.1`**, not the public/private Fly interfaces. Node serves noVNC's static modules and authenticates the WebSocket tunnel before forwarding to websockify. The viewer capability is carried in a URL **fragment**, exchanged for a session-path-scoped HttpOnly, SameSite=Strict cookie, and removed from the address bar. Transport access is revoked immediately on capture/cancel/expiry; old connections cannot observe a subsequent tenant's desktop. The default login window is ten minutes (`INTERACTIVE_LOGIN_TIMEOUT_MS`, 30–900 seconds).
+
+Chromium runs as the unprivileged `xbrowser` user (UID 1001); the window manager/transports use `xdesktop` (UID 1002). Both get whitelisted environments. Backend code/data remain private to the backend user; each browser gets a fresh HOME/TMPDIR that is deleted before desktop reuse. Cleanup verifies that no live UID-1001 processes remain, including Chromium's separate process group; an unconfirmed cleanup blocks desktop reuse until the Fly Machine is restarted. Clipboard/file-transfer inputs and desktop shell shortcuts are disabled. This limits exposure but is **not** a hardened general-purpose sandbox: do not offer an unrestricted public desktop. The service token stays on trusted backends, and callbacks go only to Fly's fixed `HARVEST_CALLBACK_URL` with redirects disabled.
+
+### Interactive API reference
+
+| Endpoint | Access | Purpose |
+|---|---|---|
+| Render `POST /api/auth/x-accounts/interactive` | App session | Start login; returns `requestId`, private `viewerUrl`, `expiresAt` |
+| Render `GET /api/auth/x-accounts/interactive/:requestId` | Owning app session | Status and connected-account metadata; no raw cookies |
+| Render `POST /auth/x/cancel` | Owning app session | Revoke pending login and close the Fly browser; `{ requestId }` scopes it to one login |
+| Render `POST /api/auth/x-accounts/interactive/callback` | One-time callback bearer | Receive `{ requestId, sessionId, status, browserClosed, username, cookies }` from Fly; completion requires `browserClosed: true` |
+| Fly `POST /api/interactive-login/sessions` | `HARVEST_API_TOKEN` | Start with `{ requestId, callbackUrl, callbackToken }`; destination must match configuration |
+| Fly `GET /api/interactive-login/sessions/:sessionId` | `HARVEST_API_TOKEN` | Inspect status only |
+| Fly `DELETE /api/interactive-login/sessions/:sessionId` | `HARVEST_API_TOKEN` | Close/revoke session |
+| Fly `/remote-login/:sessionId?...#token=...` | Private viewer capability | Interactive noVNC URL; not a public/shared desktop |
+
+Each Fly instance permits **one desktop login at a time** and returns 409 when busy. Closing the viewer alone does not cancel login; use the dashboard's Cancel button. A fresh session is required after callback delivery failure. Headed streaming does not remove X's IP reputation checks, rate limits, or challenges.
+
+Run `npm test` for the regression gate. Tests use fake browser/transport targets and local Render↔Fly HTTP services without credentials, including cancellation, tenant ownership, callback retries, and interrupted-write rollback. Run `npm run test:ui` after installing local Chromium for browser checks of popup isolation/fallback, automatic completion, cancellation, and stale-response cleanup. Those UI tests use a stub viewer, not a real noVNC desktop. The full Linux desktop image, real noVNC rendering/input, credentialed X login/2FA, and deployed Fly→Render callbacks still require deployment verification.
 
 ### Optional interactive Browserbase sign-in (`POST /auth/x`)
 
-The original interactive handoff remains available for cases where the automated harvest cannot complete (captcha, unusual challenge, etc.). `POST /auth/x` streams a Browserbase live URL plus status events to the authenticated dashboard, and the user finishes sign-in directly in the remote browser.
+The original Browserbase API remains available as an alternative. `POST /auth/x` streams a Browserbase live URL plus status events to an authenticated NDJSON client, and the user finishes sign-in directly in that remote browser. The default dashboard button now uses Fly/noVNC instead.
 
 Flow:
 
 1. The server creates a **Browserbase** session with `sessions.create()` using standard Free-tier-compatible stealth defaults (`browserSettings.verified` is not requested unless `BROWSERBASE_VERIFIED_MODE=true`), connects with `chromium.connectOverCDP(session.connectUrl)`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
 2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserbase debugger URL with `sessions.debug()`, and immediately emits it to the authenticated NDJSON client. The backend passes through the SDK's `debuggerFullscreenUrl` without rewriting or hardcoding Browserbase's debugger domain. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
-3. The dashboard intentionally does **not** embed the live stream. Clicking **Connect X Account** pre-opens a native tab and routes it to the debugger URL as soon as the event arrives; **Open Remote Sign-In Window** remains an explicit `window.open(liveUrl, '_blank')` fallback. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
+3. Clients should open the debugger URL in a native tab rather than embedding it. The existing Browserbase dashboard helper can consume these events; the default **Connect X Account** button uses Fly above. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
 4. Sign in to X in the remote window, including 2FA or any challenge.
 5. The server watches for navigation to X's `/home` timeline or for both `auth_token` and `ct0`. It then captures cookies and localStorage with `context.storageState()`, atomically writes `sessions/<userId>/<xUsername>.json` under persistent `DATA_DIR`, updates the user's linked accounts, and refreshes the account list automatically.
 6. The browser disconnects and the Browserbase session is released with `REQUEST_RELEASE`, invalidating the debugger URL. The live link is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
