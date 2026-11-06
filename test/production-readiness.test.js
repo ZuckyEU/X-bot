@@ -371,8 +371,32 @@ test('production refuses an insecure session secret', async () => {
   assert.match(output, /SESSION_SECRET must be a unique value/);
 });
 
+test('production refuses an insecure harvest token', async () => {
+  const port = await availablePort();
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      SESSION_SECRET: 'test-only-session-secret-with-more-than-32-characters',
+      HARVEST_API_TOKEN: 'change-me',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stderr.on('data', (chunk) => { output += String(chunk); });
+  child.stdout.on('data', (chunk) => { output += String(chunk); });
+  const code = await new Promise((resolve) => child.once('exit', resolve));
+  assert.notEqual(code, 0);
+  assert.match(output, /HARVEST_API_TOKEN must be a unique value/);
+});
+
 test('production accepts a strong secret and emits hardened session cookies', async (t) => {
-  const { baseUrl } = await startServer(t, { NODE_ENV: 'production' });
+  const { baseUrl } = await startServer(t, {
+    NODE_ENV: 'production',
+    HARVEST_API_TOKEN: 'test-harvest-token-1234567890abcdef',
+  });
   const response = await fetch(`${baseUrl}/api/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -393,6 +417,7 @@ test('production allows Render origins and rejects unknown origins', async (t) =
   const { baseUrl } = await startServer(t, {
     NODE_ENV: 'production',
     RENDER_EXTERNAL_URL: 'https://x-bot.onrender.com',
+    HARVEST_API_TOKEN: 'test-harvest-token-1234567890abcdef',
   });
 
   const registerFrom = (origin, suffix) => fetch(`${baseUrl}/api/auth/register`, {
@@ -900,6 +925,19 @@ test('container exposes the Fly.io port and starts Node directly', async () => {
   assert.ok(loginFlow.indexOf('createLiveInspection(page') < loginFlow.indexOf('safeGoto(page, LOGIN_URL'));
   assert.match(loginFlow, /waitForRemoteSignIn\(page, context, signal, send\)/);
   assert.equal(server.includes('/auth/x/credentials'), false);
+});
+
+test('production preflight and docs include the harvest API token', async () => {
+  const [checkProd, envExample, readme] = await Promise.all([
+    readFile(join(ROOT, 'scripts', 'check-prod.js'), 'utf8'),
+    readFile(join(ROOT, '.env.example'), 'utf8'),
+    readFile(join(ROOT, 'README.md'), 'utf8'),
+  ]);
+
+  assert.match(checkProd, /HARVEST_API_TOKEN/);
+  assert.match(envExample, /^HARVEST_API_TOKEN=/m);
+  assert.match(readme, /POST \/api\/harvest-token/);
+  assert.match(readme, /lib\/harvest-client\.js/);
 });
 
 test('API-only root and X harvest authentication are enforced', async (t) => {

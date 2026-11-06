@@ -153,18 +153,18 @@ The optional `BROWSERBASE_LIVE_TIMEOUT_MS` environment variable controls how lon
 
 The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, writes `auth.json`).
 
-## Session admin UI (server.js)
+## Session API (server.js)
 
 ```powershell
-npm run serve            # http://127.0.0.1:10000
+npm run serve            # API on http://127.0.0.1:10000
 $env:PORT=4000; npm run serve
 ```
 
-The UI has three parts: the **X account** profile card (session status + handle + **Connect X Account** / **Sign out**), the **Run automation** panel with a status card, and the **Automation History** list.
+The server is API-only. `GET /` returns `404`; `public/index.html` is retained for reference but is not served.
 
 | Route | Purpose |
 |---|---|
-| `GET /` | UI: X account card, run controls, status card, history panel |
+| `GET /` | `404` — API-only service (no HTML dashboard) |
 | `GET /api/auth` | JSON status: presence, masked preview, length, domain, flags (browser session) |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
 | `POST /api/auth/logout` | Clear `auth.json` |
@@ -173,6 +173,64 @@ The UI has three parts: the **X account** profile card (session status + handle 
 | `POST /auth/x` | NDJSON: start → live → auto-detect X session → save → exit (interactive Browserbase sign-in) |
 | `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and release the Browserbase session |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
+
+### Fly.io X harvest API
+
+`POST /api/harvest-token` is the automated login endpoint used by the Fly.io deployment. In production it requires the internal bearer token:
+
+```
+Authorization: Bearer <HARVEST_API_TOKEN>
+```
+
+Request body:
+
+```json
+{
+  "identifier": "alice@example.com",
+  "password": "…",
+  "twoFactorCode": "123456"
+}
+```
+
+`twoFactorCode` is optional. A successful response contains the harvested X cookies:
+
+```json
+{
+  "ok": true,
+  "username": "alice",
+  "cookies": [
+    { "name": "auth_token", "value": "…" },
+    { "name": "ct0", "value": "…" }
+  ]
+}
+```
+
+Errors use `{ "ok": false, "error": "…" }` with a non-2xx status. The request time is bounded by `HARVEST_LOGIN_TIMEOUT_MS` plus cleanup headroom.
+
+Trusted backends should use `lib/harvest-client.js`:
+
+```js
+import { harvestXAccount } from './lib/harvest-client.js';
+
+const { username, authToken, ct0 } = await harvestXAccount({
+  identifier,
+  password,
+  twoFactorCode,
+});
+
+// Persist authToken/ct0 in the caller's account store before marking the
+// X account connected. This service's own account API accepts:
+await fetch(`${appBaseUrl}/api/auth`, {
+  method: 'PUT',
+  headers: {
+    'Content-Type': 'application/json',
+    Cookie: appSessionCookie,
+  },
+  body: JSON.stringify({ auth_token: authToken, ct0 }),
+});
+```
+
+The helper reads `HARVEST_API_TOKEN` and optional `HARVEST_API_URL` from the environment. Do not expose the token to browser code; call the helper from the Render bot's backend when an X account is added.
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:
 
@@ -185,11 +243,11 @@ The UI has three parts: the **X account** profile card (session status + handle 
 
 `POST /auth/x` responds the same way; the final event carries the sign-in result (`{"type":"exit","code":0,"result":{"ok":true,"cookieCount":2}}`).
 
-The UI consumes the stream for events but renders only a **status notification** (`Idle` / `Running…` / `Completed successfully` / `Run failed` / sign-in equivalents) — raw log lines stay off the dashboard.
+Consumers should render only a **status notification** (`Idle` / `Running…` / `Completed successfully` / `Run failed` / sign-in equivalents) — raw log lines stay off the dashboard.
 
 ### Run actions
 
-The run form exposes checkboxes for the actions to perform; they map to `main.js` flags:
+The run request accepts action flags; they map to `main.js` flags:
 
 - `reply` → `--reply` (posts the generated reply; writes it to `--reply-out=<path>` for history)
 - `like` → `--like`

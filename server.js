@@ -82,12 +82,24 @@ const INSECURE_SESSION_SECRETS = new Set([
   'your-session-secret',
   'replace-with-at-least-32-random-characters',
 ]);
+const INSECURE_HARVEST_TOKENS = new Set([
+  'change-me',
+  'changeme',
+  'harvest-token',
+  'replace-with-at-least-32-random-characters',
+]);
 
 if (!Number.isInteger(BCRYPT_ROUNDS) || BCRYPT_ROUNDS < 10 || BCRYPT_ROUNDS > 15) {
   throw new Error('BCRYPT_ROUNDS must be an integer between 10 and 15');
 }
 if (IS_PRODUCTION && (SESSION_SECRET.length < 32 || INSECURE_SESSION_SECRETS.has(SESSION_SECRET.toLowerCase()))) {
   throw new Error('SESSION_SECRET must be a unique value of at least 32 characters in production');
+}
+if (
+  IS_PRODUCTION &&
+  (HARVEST_API_TOKEN.length < 32 || INSECURE_HARVEST_TOKENS.has(HARVEST_API_TOKEN.toLowerCase()))
+) {
+  throw new Error('HARVEST_API_TOKEN must be a unique value of at least 32 characters in production');
 }
 if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
   console.warn('[security] SESSION_SECRET is using the development fallback; set a unique 32+ character value before deployment.');
