@@ -2200,282 +2200,284 @@ app.post('/api/run', async (req, res) => {
       finishCooldown?.();
     },
   };
-  activeRun = batchHandle;
-  attachRunCleanup(res, batchHandle);
-
+  // Keep the single-flight lock inside one outer try/finally so every exit
+  // path, including staging failures and unexpected throws, releases it.
   try {
-    selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
-    batchHandle.xUsername = selectedSession.xUsername;
-    if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
-  } catch (error) {
-    if (activeRun === batchHandle) activeRun = null;
-    completion.resolve();
-    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
-  }
+    activeRun = batchHandle;
+    attachRunCleanup(res, batchHandle);
 
-  res.writeHead(200, {
-    'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store',
-    'x-accel-buffering': 'no',
-  });
-  res.flushHeaders?.();
+    try {
+      selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
+      batchHandle.xUsername = selectedSession.xUsername;
+      if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
+    } catch (error) {
+      return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
+    }
 
-  const send = makeSend(res);
+    res.writeHead(200, {
+      'content-type': 'application/x-ndjson; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-accel-buffering': 'no',
+    });
+    res.flushHeaders?.();
 
-  const waitForCooldown = (ms) =>
-    new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(cooldownTimer);
-        cooldownTimer = null;
-        finishCooldown = null;
-        resolve();
+    const send = makeSend(res);
+
+    const waitForCooldown = (ms) =>
+      new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(cooldownTimer);
+          cooldownTimer = null;
+          finishCooldown = null;
+          resolve();
+        };
+        finishCooldown = finish;
+        cooldownTimer = setTimeout(finish, ms);
+      });
+
+    const runOne = async (targetUrl) => {
+      if (aborted) {
+        const error = new Error('Batch stopped');
+        error.name = 'AbortError';
+        throw error;
+      }
+
+      const args = ['main.js', targetUrl, '--yes'];
+      if (dryRun) args.push('--dry-run');
+      if (headless) args.push('--headless');
+      if (reply) args.push('--reply');
+      if (like) args.push('--like');
+      if (repost) args.push('--repost');
+      if (audit) args.push('--audit');
+      if (tone) args.push('--tone=' + tone);
+      if (reply) args.push('--reply-out=' + REPLY_OUT_FILE);
+
+      if (reply) {
+        await unlink(REPLY_OUT_FILE).catch((error) => {
+          if (error.code !== 'ENOENT') throw error;
+        });
+      }
+
+      const child = spawn(process.execPath, args, {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          GROQ_API_KEY: groqConfiguration.apiKey,
+          GROQ_API_KEY_SOURCE: groqConfiguration.source,
+          X_ACCOUNT_USERNAME: selectedSession.xUsername,
+          AUTH_FILE_PATH: AUTH_FILE,
+        },
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      currentChild = child;
+
+      const timer = setTimeout(() => {
+        killTree(child);
+      }, RUN_TIMEOUT_MS);
+
+      let lastError = null;
+      let lastTopic = 'other';
+      let auditResult = null;
+      let spawnError = null;
+      const stderrLines = [];
+
+      const recordStderr = (line) => {
+        lastError = line;
+        stderrLines.push(line);
+        if (stderrLines.length > 50) stderrLines.shift();
+        console.log(line);
       };
-      finishCooldown = finish;
-      cooldownTimer = setTimeout(finish, ms);
-    });
 
-  const runOne = async (targetUrl) => {
-    if (aborted) {
-      const error = new Error('Batch stopped');
-      error.name = 'AbortError';
-      throw error;
-    }
-
-    const args = ['main.js', targetUrl, '--yes'];
-    if (dryRun) args.push('--dry-run');
-    if (headless) args.push('--headless');
-    if (reply) args.push('--reply');
-    if (like) args.push('--like');
-    if (repost) args.push('--repost');
-    if (audit) args.push('--audit');
-    if (tone) args.push('--tone=' + tone);
-    if (reply) args.push('--reply-out=' + REPLY_OUT_FILE);
-
-    if (reply) {
-      await unlink(REPLY_OUT_FILE).catch((error) => {
-        if (error.code !== 'ENOENT') throw error;
-      });
-    }
-
-    const child = spawn(process.execPath, args, {
-      cwd: ROOT,
-      env: {
-        ...process.env,
-        GROQ_API_KEY: groqConfiguration.apiKey,
-        GROQ_API_KEY_SOURCE: groqConfiguration.source,
-        X_ACCOUNT_USERNAME: selectedSession.xUsername,
-        AUTH_FILE_PATH: AUTH_FILE,
-      },
-      windowsHide: true,
-      detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    currentChild = child;
-
-    const timer = setTimeout(() => {
-      killTree(child);
-    }, RUN_TIMEOUT_MS);
-
-    let lastError = null;
-    let lastTopic = 'other';
-    let auditResult = null;
-    let spawnError = null;
-    const stderrLines = [];
-
-    const recordStderr = (line) => {
-      lastError = line;
-      stderrLines.push(line);
-      if (stderrLines.length > 50) stderrLines.shift();
-      console.log(line);
-    };
-
-    const forward = (stream, type) => {
-      let pending = '';
-      stream.setEncoding('utf8');
-      stream.on('data', (chunk) => {
-        pending += chunk;
-        const lines = pending.split(/\r?\n/);
-        pending = lines.pop() ?? '';
-        for (const line of lines) {
-          if (type === 'stderr') {
-            recordStderr(line);
-          } else if (type === 'stdout') {
-            const topicMatch = line.match(/Detected topic: (\w+)/);
-            if (topicMatch) lastTopic = topicMatch[1];
-            if (line.startsWith('[AUDIT_EVENT] ')) {
-              try {
-                auditResult = JSON.parse(line.slice('[AUDIT_EVENT] '.length));
-                send({ type: 'audit', ...auditResult });
-              } catch {
-                /* malformed child audit events remain ordinary stdout */
+      const forward = (stream, type) => {
+        let pending = '';
+        stream.setEncoding('utf8');
+        stream.on('data', (chunk) => {
+          pending += chunk;
+          const lines = pending.split(/\r?\n/);
+          pending = lines.pop() ?? '';
+          for (const line of lines) {
+            if (type === 'stderr') {
+              recordStderr(line);
+            } else if (type === 'stdout') {
+              const topicMatch = line.match(/Detected topic: (\w+)/);
+              if (topicMatch) lastTopic = topicMatch[1];
+              if (line.startsWith('[AUDIT_EVENT] ')) {
+                try {
+                  auditResult = JSON.parse(line.slice('[AUDIT_EVENT] '.length));
+                  send({ type: 'audit', ...auditResult });
+                } catch {
+                  /* malformed child audit events remain ordinary stdout */
+                }
               }
             }
+            send({ type, data: line });
           }
-          send({ type, data: line });
-        }
-      });
-      stream.on('end', () => {
-        if (pending) {
-          if (type === 'stderr') {
-            recordStderr(pending);
-          } else if (type === 'stdout') {
-            const topicMatch = pending.match(/Detected topic: (\w+)/);
-            if (topicMatch) lastTopic = topicMatch[1];
-            if (pending.startsWith('[AUDIT_EVENT] ')) {
-              try {
-                auditResult = JSON.parse(pending.slice('[AUDIT_EVENT] '.length));
-                send({ type: 'audit', ...auditResult });
-              } catch {
-                /* malformed child audit events remain ordinary stdout */
+        });
+        stream.on('end', () => {
+          if (pending) {
+            if (type === 'stderr') {
+              recordStderr(pending);
+            } else if (type === 'stdout') {
+              const topicMatch = pending.match(/Detected topic: (\w+)/);
+              if (topicMatch) lastTopic = topicMatch[1];
+              if (pending.startsWith('[AUDIT_EVENT] ')) {
+                try {
+                  auditResult = JSON.parse(pending.slice('[AUDIT_EVENT] '.length));
+                  send({ type: 'audit', ...auditResult });
+                } catch {
+                  /* malformed child audit events remain ordinary stdout */
+                }
               }
             }
+            send({ type, data: pending });
           }
-          send({ type, data: pending });
-        }
+        });
+      };
+
+      forward(child.stdout, 'stdout');
+      forward(child.stderr, 'stderr');
+      child.on('error', (error) => {
+        spawnError = error;
+        send({ type: 'stderr', data: `[server] could not start main.js: ${error.message}` });
       });
-    };
 
-    forward(child.stdout, 'stdout');
-    forward(child.stderr, 'stderr');
-    child.on('error', (error) => {
-      spawnError = error;
-      send({ type: 'stderr', data: `[server] could not start main.js: ${error.message}` });
-    });
+      send({ type: 'start', command: args.join(' '), pid: child.pid, url: targetUrl });
 
-    send({ type: 'start', command: args.join(' '), pid: child.pid, url: targetUrl });
-
-    const exitInfo = await new Promise((resolve) => {
-      child.on('close', (code, signal) => {
-        clearTimeout(timer);
-        if (currentChild === child) currentChild = null;
-        resolve({ code, signal });
+      const exitInfo = await new Promise((resolve) => {
+        child.on('close', (code, signal) => {
+          clearTimeout(timer);
+          if (currentChild === child) currentChild = null;
+          resolve({ code, signal });
+        });
       });
-    });
 
-    const skipped = auditResult?.status === 'engaged';
-    const draftReply = reply && !dryRun && !skipped ? await readReplyForHistory(reply, dryRun) : null;
-    if (draftReply) send({ type: 'reply', data: draftReply });
+      const skipped = auditResult?.status === 'engaged';
+      const draftReply = reply && !dryRun && !skipped ? await readReplyForHistory(reply, dryRun) : null;
+      if (draftReply) send({ type: 'reply', data: draftReply });
 
-    const historyEntry = {
-      id: new Date().toISOString(),
-      at: new Date().toISOString(),
-      url: targetUrl,
-      dryRun: Boolean(dryRun),
-      actions: skipped ? [] : buildActions({ reply, like, repost, dryRun }),
-      reply: draftReply,
-      topic: lastTopic,
-      userId: appAuth.user.id,
-      xUsername: selectedSession.xUsername,
-      ...(auditResult ? { audit: auditResult } : {}),
-      ok: exitInfo.code === 0,
-      error: exitInfo.code === 0 ? null : `exit ${exitInfo.code}`,
+      const historyEntry = {
+        id: new Date().toISOString(),
+        at: new Date().toISOString(),
+        url: targetUrl,
+        dryRun: Boolean(dryRun),
+        actions: skipped ? [] : buildActions({ reply, like, repost, dryRun }),
+        reply: draftReply,
+        topic: lastTopic,
+        userId: appAuth.user.id,
+        xUsername: selectedSession.xUsername,
+        ...(auditResult ? { audit: auditResult } : {}),
+        ok: exitInfo.code === 0,
+        error: exitInfo.code === 0 ? null : `exit ${exitInfo.code}`,
+      };
+
+      return {
+        code: exitInfo.code,
+        signal: exitInfo.signal,
+        error: lastError,
+        stderr: stderrLines,
+        spawnError: spawnError?.message ?? null,
+        audit: auditResult,
+        historyEntry,
+      };
     };
 
-    return {
-      code: exitInfo.code,
-      signal: exitInfo.signal,
-      error: lastError,
-      stderr: stderrLines,
-      spawnError: spawnError?.message ?? null,
-      audit: auditResult,
-      historyEntry,
-    };
-  };
+    let completed = 0;
+    let succeeded = 0;
+    let failed = 0;
+    let skipped = 0;
 
-  let completed = 0;
-  let succeeded = 0;
-  let failed = 0;
-  let skipped = 0;
+    send({ type: 'batch-start', total: targets.length, percent: 0, xUsername: selectedSession.xUsername });
 
-  send({ type: 'batch-start', total: targets.length, percent: 0, xUsername: selectedSession.xUsername });
-
-  try {
-    for (let i = 0; i < targets.length; i += 1) {
-      if (aborted) break;
-
-      const seq = i + 1;
-      const targetUrl = targets[i];
-      const processingPercent = Math.round((completed / targets.length) * 100);
-      console.error(`[QUEUE] Processing ${seq}/${targets.length}: ${targetUrl}`);
-      send({ type: 'progress', index: seq, completed, total: targets.length, percent: processingPercent, url: targetUrl });
-
-      let itemStatus = 'succeeded';
-      let itemError = null;
-      try {
-        const result = await executeWithRetry(
-          async () => {
-            const attemptResult = await runOne(targetUrl);
-            if (!aborted && attemptResult.code !== 0 && isTransientNetworkError({ result: attemptResult })) {
-              const retryError = new Error(
-                attemptResult.error || attemptResult.spawnError || `transient network failure (exit ${attemptResult.code})`,
-              );
-              retryError.name = 'TransientNetworkError';
-              retryError.result = attemptResult;
-              throw retryError;
-            }
-            return attemptResult;
-          },
-          {
-            retries: 2,
-            delayMs: 5_000,
-            label: `tweet ${seq}/${targets.length} (${targetUrl})`,
-            shouldRetry: isTransientNetworkError,
-            wait: waitForCooldown,
-          },
-        );
-
-        await recordRunHistory(result.historyEntry);
+    try {
+      for (let i = 0; i < targets.length; i += 1) {
         if (aborted) break;
-        if (result.code !== 0) {
+
+        const seq = i + 1;
+        const targetUrl = targets[i];
+        const processingPercent = Math.round((completed / targets.length) * 100);
+        console.error(`[QUEUE] Processing ${seq}/${targets.length}: ${targetUrl}`);
+        send({ type: 'progress', index: seq, completed, total: targets.length, percent: processingPercent, url: targetUrl });
+
+        let itemStatus = 'succeeded';
+        let itemError = null;
+        try {
+          const result = await executeWithRetry(
+            async () => {
+              const attemptResult = await runOne(targetUrl);
+              if (!aborted && attemptResult.code !== 0 && isTransientNetworkError({ result: attemptResult })) {
+                const retryError = new Error(
+                  attemptResult.error || attemptResult.spawnError || `transient network failure (exit ${attemptResult.code})`,
+                );
+                retryError.name = 'TransientNetworkError';
+                retryError.result = attemptResult;
+                throw retryError;
+              }
+              return attemptResult;
+            },
+            {
+              retries: 2,
+              delayMs: 5_000,
+              label: `tweet ${seq}/${targets.length} (${targetUrl})`,
+              shouldRetry: isTransientNetworkError,
+              wait: waitForCooldown,
+            },
+          );
+
+          await recordRunHistory(result.historyEntry);
+          if (aborted) break;
+          if (result.code !== 0) {
+            itemStatus = 'failed';
+            itemError = result.error || `exit ${result.code}`;
+            failed += 1;
+            send({ type: 'failed', index: seq, url: targetUrl, error: itemError });
+          } else if (result.audit?.status === 'engaged') {
+            itemStatus = 'skipped';
+            skipped += 1;
+          } else {
+            succeeded += 1;
+          }
+        } catch (error) {
+          if (aborted || error?.name === 'AbortError') break;
+          await recordRunHistory(error?.result?.historyEntry);
           itemStatus = 'failed';
-          itemError = result.error || `exit ${result.code}`;
+          itemError = error?.message ?? 'unknown error';
           failed += 1;
           send({ type: 'failed', index: seq, url: targetUrl, error: itemError });
-        } else if (result.audit?.status === 'engaged') {
-          itemStatus = 'skipped';
-          skipped += 1;
-        } else {
-          succeeded += 1;
         }
-      } catch (error) {
-        if (aborted || error?.name === 'AbortError') break;
-        await recordRunHistory(error?.result?.historyEntry);
-        itemStatus = 'failed';
-        itemError = error?.message ?? 'unknown error';
-        failed += 1;
-        send({ type: 'failed', index: seq, url: targetUrl, error: itemError });
+
+        completed = seq;
+        const completedPercent = Math.round((completed / targets.length) * 100);
+        send({
+          type: 'item-complete',
+          index: seq,
+          completed,
+          total: targets.length,
+          percent: completedPercent,
+          url: targetUrl,
+          status: itemStatus,
+          error: itemError,
+        });
+
+        if (i < targets.length - 1 && !aborted) {
+          const waitMs = 15_000 + Math.random() * 15_000;
+          const waitSeconds = Math.round(waitMs / 1000);
+          console.error(`[COOLDOWN] Waiting ${waitSeconds} seconds before next tweet...`);
+          send({ type: 'cooldown', completed, total: targets.length, percent: completedPercent, seconds: waitSeconds });
+          await waitForCooldown(waitMs);
+        }
       }
 
-      completed = seq;
-      const completedPercent = Math.round((completed / targets.length) * 100);
-      send({
-        type: 'item-complete',
-        index: seq,
-        completed,
-        total: targets.length,
-        percent: completedPercent,
-        url: targetUrl,
-        status: itemStatus,
-        error: itemError,
-      });
-
-      if (i < targets.length - 1 && !aborted) {
-        const waitMs = 15_000 + Math.random() * 15_000;
-        const waitSeconds = Math.round(waitMs / 1000);
-        console.error(`[COOLDOWN] Waiting ${waitSeconds} seconds before next tweet...`);
-        send({ type: 'cooldown', completed, total: targets.length, percent: completedPercent, seconds: waitSeconds });
-        await waitForCooldown(waitMs);
+      if (!aborted) {
+        send({ type: 'batch-complete', completed, total: targets.length, percent: 100, succeeded, failed, skipped });
       }
+    } catch (error) {
+      if (!aborted) send({ type: 'batch-error', error: error?.message ?? 'unknown batch error' });
     }
-
-    if (!aborted) {
-      send({ type: 'batch-complete', completed, total: targets.length, percent: 100, succeeded, failed, skipped });
-    }
-  } catch (error) {
-    if (!aborted) send({ type: 'batch-error', error: error?.message ?? 'unknown batch error' });
   } finally {
     clearTimeout(cooldownTimer);
     finishCooldown = null;
