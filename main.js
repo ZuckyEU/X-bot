@@ -58,6 +58,9 @@ const SEL = {
   toast: '[data-testid="toast"]',
 };
 
+const LIKE_TIMEOUT_MS = 5_000;
+const LIKE_SKIPPED_MESSAGE = '[LIKE] Skipping like action (element not found or already liked)';
+
 /* ------------------------------- helpers -------------------------------- */
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -324,28 +327,29 @@ async function auditEngagement(page, currentHandle, tweetUrl) {
 async function likeTweet(page) {
   const tweet = page.locator(SEL.tweet).first();
   const unlikeButton = tweet.locator(SEL.unlike).first();
-  const alreadyLiked = await unlikeButton.isVisible().catch(() => false);
-
-  if (alreadyLiked) {
-    console.log('[LIKE] Already liked. Skipping.');
-    return 'already liked';
-  }
-
-  const likeButton = tweet.locator(SEL.like).first();
-  const likeFallback = tweet.locator('button[aria-label*="Like"]').first();
-  const likeTarget = (await likeButton.count()) > 0 ? likeButton : likeFallback;
 
   try {
-    await tweet.scrollIntoViewIfNeeded();
-    await likeTarget.waitFor({ state: 'visible', timeout: 30_000 });
-    await likeTarget.click();
-    await tweet.locator(SEL.unlike).first().waitFor({ state: 'visible', timeout: 10_000 });
-  } catch (error) {
-    console.warn(`[LIKE] Like interaction failed: ${error?.message ?? error}`);
-    return 'like failed';
-  }
+    // Never toggle an already-liked tweet back to unliked.
+    if (await unlikeButton.isVisible().catch(() => false)) {
+      console.log(LIKE_SKIPPED_MESSAGE);
+      return 'already liked';
+    }
 
-  return 'liked';
+    const likeButton = tweet.locator(SEL.like).first();
+    const likeFallback = tweet.locator('button[aria-label*="Like"]').first();
+    const likeTarget = (await likeButton.count()) > 0 ? likeButton : likeFallback;
+
+    await tweet.scrollIntoViewIfNeeded({ timeout: LIKE_TIMEOUT_MS });
+    await likeTarget.waitFor({ state: 'visible', timeout: LIKE_TIMEOUT_MS });
+    await likeTarget.click({ timeout: LIKE_TIMEOUT_MS });
+    await tweet.locator(SEL.unlike).first().waitFor({ state: 'visible', timeout: LIKE_TIMEOUT_MS });
+    return 'liked';
+  } catch {
+    // Liking is optional per tweet. A missing or already-toggled selector must
+    // not fail the reply workflow or the rest of the batch.
+    console.log(LIKE_SKIPPED_MESSAGE);
+    return 'skipped';
+  }
 }
 
 /* --------------------------------- main --------------------------------- */
@@ -457,10 +461,10 @@ async function main() {
 
     if (options.like) {
       try {
-        console.log(`Like: ${await likeTweet(page)}.`);
-      } catch (error) {
-        console.error(`Like failed: ${error.message}`);
-        process.exitCode = 1;
+        const result = await likeTweet(page);
+        if (result === 'liked') console.log('Like: liked.');
+      } catch {
+        console.log(LIKE_SKIPPED_MESSAGE);
       }
     }
 
