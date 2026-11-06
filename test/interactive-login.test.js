@@ -429,6 +429,7 @@ test('container privacy and lifetime settings are explicit, and the dashboard sc
     readFile(join(ROOT, 'scripts', 'desktop-browser-server.cjs'), 'utf8'), readFile(join(ROOT, 'fly.toml'), 'utf8'),
     readFile(join(ROOT, 'public', 'index.html'), 'utf8'), readFile(join(ROOT, 'public', 'remote-login', 'viewer.js'), 'utf8'),
   ]);
+  assert.match(dockerfile, /DEBIAN_FRONTEND=noninteractive TZ=Etc\/UTC apt-get install -y --no-install-recommends/);
   assert.match(dockerfile, /chmod -R go-rwx \/usr\/src\/app/);
   assert.match(startup, /-listen 127\.0\.0\.1 -no6/);
   assert.match(startup, /127\.0\.0\.1:6080 127\.0\.0\.1:5900/);

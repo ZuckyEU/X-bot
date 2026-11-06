@@ -1,7 +1,8 @@
 FROM mcr.microsoft.com/playwright:v1.64.1-jammy
 
+# Desktop dependencies include tzdata; remote builds have no interactive terminal.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends \
        xvfb x11vnc novnc websockify openbox xauth x11-utils x11-xserver-utils tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1001 xbrowser \
