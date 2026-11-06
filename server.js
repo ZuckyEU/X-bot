@@ -198,6 +198,65 @@ const withWriteLock = (task) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const RETRYABLE_NETWORK_ERROR =
+  /(?:net::ERR_(?:ABORTED|CONNECTION_(?:ABORTED|CLOSED|REFUSED|RESET|TIMED_OUT)|INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|NETWORK_CHANGED|PROXY_CONNECTION_FAILED|TIMED_OUT|TUNNEL_CONNECTION_FAILED)|ECONN(?:ABORTED|REFUSED|RESET)|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|fetch failed|network (?:error|is unreachable)|temporary failure in name resolution|navigation timeout|browser has disconnected|browser has been closed|websocket (?:error|closed))/i;
+
+/** Detects transient network failures from child stderr, spawn errors, or thrown errors. */
+function isTransientNetworkError(error) {
+  const stderr = Array.isArray(error?.result?.stderr)
+    ? error.result.stderr
+    : Array.isArray(error?.stderr)
+      ? error.stderr
+      : error?.stderr
+        ? [error.stderr]
+        : [];
+  const detail = [
+    error?.message,
+    error?.code,
+    error?.result?.error,
+    error?.result?.spawnError,
+    ...stderr,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return RETRYABLE_NETWORK_ERROR.test(detail);
+}
+
+/**
+ * Runs an action and retries transient failures. By default an action is
+ * attempted three times with a five-second pause between attempts.
+ */
+async function executeWithRetry(
+  action,
+  { retries = 2, delayMs = 5_000, label = 'operation', shouldRetry = () => true, wait = sleep } = {},
+) {
+  const retryCount = Number.isInteger(retries) && retries >= 0 ? retries : 2;
+  const attempts = retryCount + 1;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await action(attempt);
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+
+      const canRetry = attempt < attempts && shouldRetry(error);
+      if (!canRetry) {
+        console.error(
+          `[retry] ${label}: attempt ${attempt}/${attempts} failed${attempt < attempts ? ' (not retryable)' : ''}: ${error?.message ?? error}`,
+        );
+        throw error;
+      }
+
+      console.warn(
+        `[retry] ${label}: attempt ${attempt}/${attempts} failed: ${error?.message ?? error}. Retrying in ${delayMs / 1000}s...`,
+      );
+      await wait(delayMs);
+    }
+  }
+
+  throw new Error(`[retry] ${label}: exhausted all attempts`);
+}
+
 const mask = (value) =>
   value.length <= 8 ? '•'.repeat(value.length) : `${value.slice(0, 4)}…${value.slice(-4)} (${value.length} chars)`;
 
@@ -1530,6 +1589,15 @@ async function appendHistory(entry) {
   });
 }
 
+async function recordRunHistory(entry) {
+  if (!entry) return;
+  try {
+    await appendHistory(entry);
+  } catch (error) {
+    console.error(`Could not write automation history: ${error.message}`);
+  }
+}
+
 async function clearHistoryForUser(userId) {
   return withWriteLock(async () => {
     const history = await readHistoryFile();
@@ -2214,6 +2282,15 @@ app.post('/api/run', async (req, res) => {
     let lastError = null;
     let lastTopic = 'other';
     let auditResult = null;
+    let spawnError = null;
+    const stderrLines = [];
+
+    const recordStderr = (line) => {
+      lastError = line;
+      stderrLines.push(line);
+      if (stderrLines.length > 50) stderrLines.shift();
+      console.log(line);
+    };
 
     const forward = (stream, type) => {
       let pending = '';
@@ -2224,8 +2301,7 @@ app.post('/api/run', async (req, res) => {
         pending = lines.pop() ?? '';
         for (const line of lines) {
           if (type === 'stderr') {
-            lastError = line;
-            console.log(line);
+            recordStderr(line);
           } else if (type === 'stdout') {
             const topicMatch = line.match(/Detected topic: (\w+)/);
             if (topicMatch) lastTopic = topicMatch[1];
@@ -2244,8 +2320,7 @@ app.post('/api/run', async (req, res) => {
       stream.on('end', () => {
         if (pending) {
           if (type === 'stderr') {
-            lastError = pending;
-            console.log(pending);
+            recordStderr(pending);
           } else if (type === 'stdout') {
             const topicMatch = pending.match(/Detected topic: (\w+)/);
             if (topicMatch) lastTopic = topicMatch[1];
@@ -2265,7 +2340,10 @@ app.post('/api/run', async (req, res) => {
 
     forward(child.stdout, 'stdout');
     forward(child.stderr, 'stderr');
-    child.on('error', (error) => send({ type: 'stderr', data: `[server] could not start main.js: ${error.message}` }));
+    child.on('error', (error) => {
+      spawnError = error;
+      send({ type: 'stderr', data: `[server] could not start main.js: ${error.message}` });
+    });
 
     send({ type: 'start', command: args.join(' '), pid: child.pid, url: targetUrl });
 
@@ -2277,31 +2355,34 @@ app.post('/api/run', async (req, res) => {
       });
     });
 
-    try {
-      const skipped = auditResult?.status === 'engaged';
-      const draftReply = reply && !dryRun && !skipped ? await readReplyForHistory(reply, dryRun) : null;
-      if (draftReply) send({ type: 'reply', data: draftReply });
+    const skipped = auditResult?.status === 'engaged';
+    const draftReply = reply && !dryRun && !skipped ? await readReplyForHistory(reply, dryRun) : null;
+    if (draftReply) send({ type: 'reply', data: draftReply });
 
-      const entry = {
-        id: new Date().toISOString(),
-        at: new Date().toISOString(),
-        url: targetUrl,
-        dryRun: Boolean(dryRun),
-        actions: skipped ? [] : buildActions({ reply, like, repost, dryRun }),
-        reply: draftReply,
-        topic: lastTopic,
-        userId: appAuth.user.id,
-        xUsername: selectedSession.xUsername,
-        ...(auditResult ? { audit: auditResult } : {}),
-        ok: exitInfo.code === 0,
-        error: exitInfo.code === 0 ? null : `exit ${exitInfo.code}`,
-      };
-      await appendHistory(entry);
-    } catch (error) {
-      console.error(`Could not write automation history: ${error.message}`);
-    }
+    const historyEntry = {
+      id: new Date().toISOString(),
+      at: new Date().toISOString(),
+      url: targetUrl,
+      dryRun: Boolean(dryRun),
+      actions: skipped ? [] : buildActions({ reply, like, repost, dryRun }),
+      reply: draftReply,
+      topic: lastTopic,
+      userId: appAuth.user.id,
+      xUsername: selectedSession.xUsername,
+      ...(auditResult ? { audit: auditResult } : {}),
+      ok: exitInfo.code === 0,
+      error: exitInfo.code === 0 ? null : `exit ${exitInfo.code}`,
+    };
 
-    return { code: exitInfo.code, signal: exitInfo.signal, error: lastError, audit: auditResult };
+    return {
+      code: exitInfo.code,
+      signal: exitInfo.signal,
+      error: lastError,
+      stderr: stderrLines,
+      spawnError: spawnError?.message ?? null,
+      audit: auditResult,
+      historyEntry,
+    };
   };
 
   let completed = 0;
@@ -2324,7 +2405,29 @@ app.post('/api/run', async (req, res) => {
       let itemStatus = 'succeeded';
       let itemError = null;
       try {
-        const result = await runOne(targetUrl);
+        const result = await executeWithRetry(
+          async () => {
+            const attemptResult = await runOne(targetUrl);
+            if (!aborted && attemptResult.code !== 0 && isTransientNetworkError({ result: attemptResult })) {
+              const retryError = new Error(
+                attemptResult.error || attemptResult.spawnError || `transient network failure (exit ${attemptResult.code})`,
+              );
+              retryError.name = 'TransientNetworkError';
+              retryError.result = attemptResult;
+              throw retryError;
+            }
+            return attemptResult;
+          },
+          {
+            retries: 2,
+            delayMs: 5_000,
+            label: `tweet ${seq}/${targets.length} (${targetUrl})`,
+            shouldRetry: isTransientNetworkError,
+            wait: waitForCooldown,
+          },
+        );
+
+        await recordRunHistory(result.historyEntry);
         if (aborted) break;
         if (result.code !== 0) {
           itemStatus = 'failed';
@@ -2339,6 +2442,7 @@ app.post('/api/run', async (req, res) => {
         }
       } catch (error) {
         if (aborted || error?.name === 'AbortError') break;
+        await recordRunHistory(error?.result?.historyEntry);
         itemStatus = 'failed';
         itemError = error?.message ?? 'unknown error';
         failed += 1;

@@ -160,8 +160,8 @@ function importSession(baseUrl, cookie, body) {
   });
 }
 
-async function until(check, message = 'condition did not become true') {
-  const deadline = Date.now() + 5_000;
+async function until(check, message = 'condition did not become true', timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await check()) return;
     await delay(10);
@@ -639,6 +639,51 @@ test('automation restores imported cookies and rejects imports while the bot is 
   await unlink(marker);
   await running.text();
   assert.equal((await importSession(baseUrl, owner.cookie, importPayload('bob'))).status, 201);
+});
+
+test('automation retries a transient network failure before failing a target', { timeout: 25_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-retry-run-'));
+  const runGate = join(dataDir, 'automation-gate');
+  const retryState = join(dataDir, 'retry-state');
+  const { baseUrl } = await startServer(t, {
+    SESSION_TEST_RUN_GATE: runGate,
+    SESSION_TEST_RETRY_STATE: retryState,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'retry_run');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  const key = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'test-only-groq-key-no-external-requests' }),
+  });
+  assert.equal(key.status, 200);
+
+  await writeFile(runGate, 'pause');
+  const running = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true }),
+  });
+  assert.equal(running.status, 200);
+
+  await until(
+    () => readFile(retryState, 'utf8').then((value) => value === '2', () => false),
+    'The runner did not retry the transient network failure',
+    10_000,
+  );
+  await until(
+    () => stat(`${runGate}.entered`).then(() => true, () => false),
+    'The retried run did not reach the automation process',
+  );
+  await unlink(runGate);
+  const output = await running.text();
+  assert.match(output, /"type":"batch-complete"/);
+  assert.doesNotMatch(output, /"type":"failed"/);
+
+  const history = await (await fetch(`${baseUrl}/api/history`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(history.history.length, 1);
+  assert.equal(history.history[0].ok, true);
+  assert.equal(history.history[0].url, 'https://x.com/alice/status/1');
 });
 
 test('runner startup reserves its session before staging and blocks conflicting account changes', { timeout: 20_000 }, async (t) => {
