@@ -686,6 +686,77 @@ test('automation retries a transient network failure before failing a target', {
   assert.equal(history.history[0].url, 'https://x.com/alice/status/1');
 });
 
+test('unconfirmed replies stop after three attempts and the queue continues to the next URL', { timeout: 90_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-reply-retry-'));
+  const attemptsFile = join(dataDir, 'reply-attempts');
+  const targetUrl = 'https://x.com/alice/status/1';
+  const nextUrl = 'https://x.com/alice/status/2';
+  const server = await startServer(t, {
+    SESSION_TEST_RUN_GATE: join(dataDir, 'unused-run-gate'),
+    SESSION_TEST_UNCONFIRMED_REPLY_STATE: attemptsFile,
+    SESSION_TEST_UNCONFIRMED_REPLY_URL: targetUrl,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(server.baseUrl, 'reply_retry');
+  assert.equal((await importSession(server.baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  const key = await fetch(`${server.baseUrl}/api/config/groq`, {
+    method: 'PUT',
+    headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ apiKey: 'test-only-groq-key-no-external-requests' }),
+  });
+  assert.equal(key.status, 200);
+
+  const running = await fetch(`${server.baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ urls: [targetUrl, nextUrl], reply: true }),
+  });
+  assert.equal(running.status, 200);
+  const output = await running.text();
+  assert.equal(await readFile(attemptsFile, 'utf8'), '3');
+
+  const events = output.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  const starts = events.filter((event) => event.type === 'start');
+  assert.equal(starts.filter((event) => event.url === targetUrl).length, 3);
+  assert.equal(starts.filter((event) => event.url === nextUrl).length, 1);
+  const failures = events.filter((event) => event.type === 'failed');
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].attempts, 3);
+
+  const items = events.filter((event) => event.type === 'item-complete');
+  const item = items[0];
+  assert.equal(item.status, 'failed');
+  assert.equal(item.url, targetUrl);
+  assert.equal(item.failed, 1);
+  assert.equal(item.succeeded, 0);
+  assert.match(item.error, /Reply verification failed: Post was not confirmed on X/);
+  assert.equal(items[1].url, nextUrl);
+  assert.equal(items[1].status, 'succeeded');
+  const nextProgress = events.find((event) => event.type === 'progress' && event.url === nextUrl);
+  assert.equal(nextProgress.failed, 1);
+
+  const batch = events.find((event) => event.type === 'batch-complete');
+  assert.equal(batch.total, 2);
+  assert.equal(batch.completed, 2);
+  assert.equal(batch.succeeded, 1);
+  assert.equal(batch.failed, 1);
+
+  assert.match(
+    server.output(),
+    /\[QUEUE\] Hard failure for URL, skipping to next target/,
+  );
+
+  const history = await (await fetch(`${server.baseUrl}/api/history`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(history.history.length, 2);
+  assert.equal(history.history[0].url, targetUrl);
+  assert.equal(history.history[0].ok, false);
+  assert.equal(history.history[0].error, 'Reply verification failed: Post was not confirmed on X');
+  assert.deepEqual(history.history[0].actions, []);
+  assert.equal(history.history[1].url, nextUrl);
+  assert.equal(history.history[1].ok, true);
+});
+
 test('runner startup reserves its session before staging and blocks conflicting account changes', { timeout: 20_000 }, async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-startup-reservation-'));
   const writeMarker = join(dataDir, 'write-gate');

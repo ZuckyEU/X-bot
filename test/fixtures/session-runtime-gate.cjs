@@ -10,7 +10,7 @@ const { spawn } = childProcess;
 
 childProcess.spawn = (command, args, options) => {
   if (process.env.SESSION_TEST_RUN_GATE && args?.[0] === 'main.js') {
-    return spawn(command, [join(__dirname, 'automation-stub.cjs')], options);
+    return spawn(command, [join(__dirname, 'automation-stub.cjs'), ...args.slice(1)], options);
   }
   return spawn(command, args, options);
 };

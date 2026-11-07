@@ -227,12 +227,16 @@ The run request accepts action flags; they map to `main.js` flags:
 - `like` → `--like`
 - `repost` → `--repost`
 
+Replies are confirmed within a five-second verification window by a successful X `CreateTweet` response containing the created tweet ID, or by a newly rendered matching tweet. A toast or a closed composer alone is not proof. Missing confirmation throws `Reply verification failed: Post was not confirmed on X`.
+
+Each URL gets at most **two retries (three total attempts)** for transient network errors or an unconfirmed reply. The legacy `Warning: could not confirm the reply was sent` is also a failed attempt, even if the child exits zero. Exhausted retries log `[QUEUE] Hard failure for URL, skipping to next target`, emit a failed `item-complete` with updated success/failure counts, and continue to the next URL after the normal cooldown. Only the final attempt is recorded in history, and an unconfirmed reply is never recorded as a successful `replied` action. Missing confirmation does not prove X rejected the post, so check the thread before manually restarting a failed target to avoid duplicate replies.
+
 ### Automation history
 
 Every completed run appends an entry to `history.json` (capped at the last 50 runs):
 
 ```json
-{ "id": "…", "at": "…", "url": "…", "dryRun": false, "actions": ["replied", "liked", "reposted"], "reply": "…", "ok": false, "error": "exit 1" }
+{ "id": "…", "at": "…", "url": "…", "dryRun": false, "actions": [], "reply": "…", "ok": false, "error": "Reply verification failed: Post was not confirmed on X" }
 ```
 
 `GET /api/history` reads it; `DELETE /api/history` clears it; the UI lists entries and offers **Clear History**.

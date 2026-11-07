@@ -197,12 +197,15 @@ const withWriteLock = (task) => {
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const MAX_TARGET_RETRIES = 2;
+const REPLY_VERIFICATION_ERROR_MESSAGE = 'Reply verification failed: Post was not confirmed on X';
 
 const RETRYABLE_NETWORK_ERROR =
   /(?:net::ERR_(?:ABORTED|CONNECTION_(?:ABORTED|CLOSED|REFUSED|RESET|TIMED_OUT)|INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|NETWORK_CHANGED|PROXY_CONNECTION_FAILED|TIMED_OUT|TUNNEL_CONNECTION_FAILED)|ECONN(?:ABORTED|REFUSED|RESET)|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|fetch failed|network (?:error|is unreachable)|temporary failure in name resolution|navigation timeout|browser has disconnected|browser has been closed|websocket (?:error|closed))/i;
+const REPLY_VERIFICATION_ERROR =
+  /(?:Reply verification failed: Post was not confirmed on X|Warning: could not confirm the reply was sent)/i;
 
-/** Detects transient network failures from child stderr, spawn errors, or thrown errors. */
-function isTransientNetworkError(error) {
+function errorDetail(error) {
   const stderr = Array.isArray(error?.result?.stderr)
     ? error.result.stderr
     : Array.isArray(error?.stderr)
@@ -210,7 +213,7 @@ function isTransientNetworkError(error) {
       : error?.stderr
         ? [error.stderr]
         : [];
-  const detail = [
+  return [
     error?.message,
     error?.code,
     error?.result?.error,
@@ -219,18 +222,33 @@ function isTransientNetworkError(error) {
   ]
     .filter(Boolean)
     .join('\n');
-  return RETRYABLE_NETWORK_ERROR.test(detail);
+}
+
+/** Detects transient network failures from child stderr, spawn errors, or thrown errors. */
+function isTransientNetworkError(error) {
+  return RETRYABLE_NETWORK_ERROR.test(errorDetail(error));
+}
+
+/** An unconfirmed reply is retryable, but still bounded by executeWithRetry. */
+function isReplyVerificationError(error) {
+  return REPLY_VERIFICATION_ERROR.test(errorDetail(error));
+}
+
+function isRetryableTargetError(error) {
+  return isTransientNetworkError(error) || isReplyVerificationError(error);
 }
 
 /**
- * Runs an action and retries transient failures. By default an action is
- * attempted three times with a five-second pause between attempts.
+ * Retries an action at most twice (three total attempts). Cancellation and
+ * permanent failures stop immediately; exhausted retries stay with this URL.
  */
 async function executeWithRetry(
   action,
-  { retries = 2, delayMs = 5_000, label = 'operation', shouldRetry = () => true, wait = sleep } = {},
+  { retries = MAX_TARGET_RETRIES, delayMs = 5_000, label = 'operation', shouldRetry = () => true, wait = sleep } = {},
 ) {
-  const retryCount = Number.isInteger(retries) && retries >= 0 ? retries : 2;
+  const retryCount = Number.isInteger(retries) && retries >= 0
+    ? Math.min(retries, MAX_TARGET_RETRIES)
+    : MAX_TARGET_RETRIES;
   const attempts = retryCount + 1;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -244,6 +262,13 @@ async function executeWithRetry(
         console.error(
           `[retry] ${label}: attempt ${attempt}/${attempts} failed${attempt < attempts ? ' (not retryable)' : ''}: ${error?.message ?? error}`,
         );
+        if (attempt === attempts) {
+          const permanentError = new Error(error?.message ?? String(error), { cause: error });
+          permanentError.name = 'RetryExhaustedError';
+          permanentError.attempts = attempt;
+          permanentError.result = error?.result;
+          throw permanentError;
+        }
         throw error;
       }
 
@@ -2387,12 +2412,14 @@ app.post('/api/run', async (req, res) => {
       }, RUN_TIMEOUT_MS);
 
       let lastError = null;
+      let replyVerificationError = null;
       let lastTopic = 'other';
       let auditResult = null;
       let spawnError = null;
       const stderrLines = [];
 
       const recordStderr = (line) => {
+        if (REPLY_VERIFICATION_ERROR.test(line)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
         lastError = line;
         stderrLines.push(line);
         if (stderrLines.length > 50) stderrLines.shift();
@@ -2412,6 +2439,7 @@ app.post('/api/run', async (req, res) => {
             } else if (type === 'stdout') {
               const topicMatch = line.match(/Detected topic: (\w+)/);
               if (topicMatch) lastTopic = topicMatch[1];
+              if (REPLY_VERIFICATION_ERROR.test(line)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
               if (line.startsWith('[AUDIT_EVENT] ')) {
                 try {
                   auditResult = JSON.parse(line.slice('[AUDIT_EVENT] '.length));
@@ -2431,6 +2459,7 @@ app.post('/api/run', async (req, res) => {
             } else if (type === 'stdout') {
               const topicMatch = pending.match(/Detected topic: (\w+)/);
               if (topicMatch) lastTopic = topicMatch[1];
+              if (REPLY_VERIFICATION_ERROR.test(pending)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
               if (pending.startsWith('[AUDIT_EVENT] ')) {
                 try {
                   auditResult = JSON.parse(pending.slice('[AUDIT_EVENT] '.length));
@@ -2462,29 +2491,34 @@ app.post('/api/run', async (req, res) => {
         });
       });
 
+      // Older runners may emit a confirmation warning and still exit zero.
+      // Treat that as a failed attempt, regardless of the child exit status.
+      const code = replyVerificationError && exitInfo.code === 0 ? 1 : exitInfo.code;
+      const ok = code === 0 && !spawnError;
+      const runError = replyVerificationError || lastError || spawnError?.message || `exit ${code}`;
       const skipped = auditResult?.status === 'engaged';
       const draftReply = reply && !dryRun && !skipped ? await readReplyForHistory(reply, dryRun) : null;
-      if (draftReply) send({ type: 'reply', data: draftReply });
+      if (ok && draftReply) send({ type: 'reply', data: draftReply });
 
       const historyEntry = {
         id: new Date().toISOString(),
         at: new Date().toISOString(),
         url: targetUrl,
         dryRun: Boolean(dryRun),
-        actions: skipped ? [] : buildActions({ reply, like, repost, dryRun }),
+        actions: skipped || !ok ? [] : buildActions({ reply, like, repost, dryRun }),
         reply: draftReply,
         topic: lastTopic,
         userId: appAuth.user.id,
         xUsername: selectedSession.xUsername,
         ...(auditResult ? { audit: auditResult } : {}),
-        ok: exitInfo.code === 0,
-        error: exitInfo.code === 0 ? null : `exit ${exitInfo.code}`,
+        ok,
+        error: ok ? null : runError,
       };
 
       return {
-        code: exitInfo.code,
+        code,
         signal: exitInfo.signal,
-        error: lastError,
+        error: ok ? null : runError,
         stderr: stderrLines,
         spawnError: spawnError?.message ?? null,
         audit: auditResult,
@@ -2497,7 +2531,7 @@ app.post('/api/run', async (req, res) => {
     let failed = 0;
     let skipped = 0;
 
-    send({ type: 'batch-start', total: targets.length, percent: 0, xUsername: selectedSession.xUsername });
+    send({ type: 'batch-start', total: targets.length, percent: 0, succeeded, failed, skipped, xUsername: selectedSession.xUsername });
 
     try {
       for (let i = 0; i < targets.length; i += 1) {
@@ -2507,7 +2541,7 @@ app.post('/api/run', async (req, res) => {
         const targetUrl = targets[i];
         const processingPercent = Math.round((completed / targets.length) * 100);
         console.error(`[QUEUE] Processing ${seq}/${targets.length}: ${targetUrl}`);
-        send({ type: 'progress', index: seq, completed, total: targets.length, percent: processingPercent, url: targetUrl });
+        send({ type: 'progress', index: seq, completed, total: targets.length, percent: processingPercent, url: targetUrl, succeeded, failed, skipped });
 
         let itemStatus = 'succeeded';
         let itemError = null;
@@ -2515,21 +2549,29 @@ app.post('/api/run', async (req, res) => {
           const result = await executeWithRetry(
             async () => {
               const attemptResult = await runOne(targetUrl);
-              if (!aborted && attemptResult.code !== 0 && isTransientNetworkError({ result: attemptResult })) {
+              const replyUnconfirmed = isReplyVerificationError({ result: attemptResult });
+              const transientNetworkFailure =
+                attemptResult.code !== 0 && isTransientNetworkError({ result: attemptResult });
+              if (!aborted && (replyUnconfirmed || transientNetworkFailure)) {
                 const retryError = new Error(
-                  attemptResult.error || attemptResult.spawnError || `transient network failure (exit ${attemptResult.code})`,
+                  attemptResult.error
+                    || attemptResult.spawnError
+                    || (replyUnconfirmed
+                      ? REPLY_VERIFICATION_ERROR_MESSAGE
+                      : `transient network failure (exit ${attemptResult.code})`),
                 );
-                retryError.name = 'TransientNetworkError';
+                retryError.name = replyUnconfirmed ? 'ReplyVerificationError' : 'TransientNetworkError';
                 retryError.result = attemptResult;
                 throw retryError;
               }
               return attemptResult;
             },
             {
-              retries: 2,
+              // Two retries means at most three total attempts per target URL.
+              retries: MAX_TARGET_RETRIES,
               delayMs: 5_000,
               label: `tweet ${seq}/${targets.length} (${targetUrl})`,
-              shouldRetry: isTransientNetworkError,
+              shouldRetry: isRetryableTargetError,
               wait: waitForCooldown,
             },
           );
@@ -2540,7 +2582,7 @@ app.post('/api/run', async (req, res) => {
             itemStatus = 'failed';
             itemError = result.error || `exit ${result.code}`;
             failed += 1;
-            send({ type: 'failed', index: seq, url: targetUrl, error: itemError });
+            send({ type: 'failed', index: seq, url: targetUrl, error: itemError, succeeded, failed, skipped });
           } else if (result.audit?.status === 'engaged') {
             itemStatus = 'skipped';
             skipped += 1;
@@ -2553,7 +2595,10 @@ app.post('/api/run', async (req, res) => {
           itemStatus = 'failed';
           itemError = error?.message ?? 'unknown error';
           failed += 1;
-          send({ type: 'failed', index: seq, url: targetUrl, error: itemError });
+          const hardFailure = `[QUEUE] Hard failure for URL, skipping to next target (${targetUrl}): ${itemError}`;
+          console.error(hardFailure);
+          send({ type: 'stderr', data: hardFailure });
+          send({ type: 'failed', index: seq, url: targetUrl, error: itemError, attempts: error?.attempts, succeeded, failed, skipped });
         }
 
         completed = seq;
@@ -2567,13 +2612,16 @@ app.post('/api/run', async (req, res) => {
           url: targetUrl,
           status: itemStatus,
           error: itemError,
+          succeeded,
+          failed,
+          skipped,
         });
 
         if (i < targets.length - 1 && !aborted) {
           const waitMs = 15_000 + Math.random() * 15_000;
           const waitSeconds = Math.round(waitMs / 1000);
           console.error(`[COOLDOWN] Waiting ${waitSeconds} seconds before next tweet...`);
-          send({ type: 'cooldown', completed, total: targets.length, percent: completedPercent, seconds: waitSeconds });
+          send({ type: 'cooldown', completed, total: targets.length, percent: completedPercent, seconds: waitSeconds, succeeded, failed, skipped });
           await waitForCooldown(waitMs);
         }
       }

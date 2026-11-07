@@ -60,6 +60,8 @@ const SEL = {
 
 const LIKE_TIMEOUT_MS = 5_000;
 const LIKE_SKIPPED_MESSAGE = '[LIKE] Skipping like action (element not found or already liked)';
+const REPLY_VERIFY_TIMEOUT_MS = 5_000;
+const REPLY_VERIFY_ERROR_MESSAGE = 'Reply verification failed: Post was not confirmed on X';
 
 /* ------------------------------- helpers -------------------------------- */
 
@@ -188,7 +190,7 @@ async function extractTweet(page) {
   return { text, author };
 }
 
-async function postReply(page, reply) {
+export async function postReply(page, reply) {
   const tweet = page.locator(SEL.tweet).first();
   await tweet.locator(SEL.reply).first().click();
 
@@ -233,12 +235,46 @@ async function postReply(page, reply) {
   const postButton = scope.locator(SEL.postButton).first();
   await waitUntilEnabled(postButton, 30_000);
   await page.waitForTimeout(500);
+
+  const matchingReplies = page.locator(SEL.tweet).filter({
+    has: page.locator(SEL.tweetText).filter({ hasText: reply }),
+  });
+  const existingReplyCount = await matchingReplies.count();
+
+  // Start listening before the click so a fast CreateTweet response cannot be
+  // missed. A successful GraphQL response or a newly rendered reply both count
+  // as proof that X accepted the post.
+  const createTweetConfirmed = page.waitForResponse(async (response) => {
+    if (response.request().method() !== 'POST' || !response.ok()) return false;
+    try {
+      const url = new URL(response.url());
+      if (!/(?:^|\.)(?:x|twitter)\.com$/i.test(url.hostname)
+        || !/\/i\/api\/graphql\/[^/]+\/CreateTweet\/?$/i.test(url.pathname)) return false;
+      const payload = await response.json();
+      const result = payload?.data?.create_tweet?.tweet_results?.result;
+      return !(Array.isArray(payload?.errors) && payload.errors.length > 0)
+        && Boolean(result?.rest_id || result?.tweet?.rest_id);
+    } catch {
+      return false;
+    }
+  }, { timeout: REPLY_VERIFY_TIMEOUT_MS }).then(() => true).catch(() => false);
+
   await postButton.click({ timeout: 30_000, force: true });
 
-  await Promise.race([
-    composer.waitFor({ state: 'detached', timeout: 30_000 }),
-    page.locator(SEL.toast).first().waitFor({ state: 'visible', timeout: 30_000 }),
-  ]).catch(() => console.warn('Warning: could not confirm the reply was sent — check the browser.'));
+  // Existing tweets containing the same text are not proof of this submission.
+  const renderedReplyConfirmed = matchingReplies
+    .nth(existingReplyCount)
+    .waitFor({ state: 'visible', timeout: REPLY_VERIFY_TIMEOUT_MS })
+    .then(() => true)
+    .catch(() => false);
+
+  const [apiConfirmed, renderedConfirmed] = await Promise.all([
+    createTweetConfirmed,
+    renderedReplyConfirmed,
+  ]);
+  if (!apiConfirmed && !renderedConfirmed) {
+    throw new Error(REPLY_VERIFY_ERROR_MESSAGE);
+  }
 }
 
 async function getCurrentAccountHandle(page, savedUsername) {
@@ -474,12 +510,14 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  if (error?.name === 'AbortError' || error?.code === 'ERR_USE_AFTER_CLOSE') {
-    console.log('\nCancelled — nothing was posted.');
-    process.exitCode = 130;
-    return;
-  }
-  console.error(`\nFailed: ${error.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    if (error?.name === 'AbortError' || error?.code === 'ERR_USE_AFTER_CLOSE') {
+      console.log('\nCancelled — nothing was posted.');
+      process.exitCode = 130;
+      return;
+    }
+    console.error(`\nFailed: ${error.message}`);
+    process.exitCode = 1;
+  });
+}

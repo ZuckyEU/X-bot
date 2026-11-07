@@ -3,6 +3,24 @@ const { readFile, stat, writeFile } = require('node:fs/promises');
 const { setTimeout: delay } = require('node:timers/promises');
 
 (async () => {
+  const unconfirmedReplyState = process.env.SESSION_TEST_UNCONFIRMED_REPLY_STATE;
+  const failedUrl = process.env.SESSION_TEST_UNCONFIRMED_REPLY_URL;
+  if (unconfirmedReplyState && (!failedUrl || failedUrl === process.argv[2])) {
+    const priorAttempts = Number(await readFile(unconfirmedReplyState, 'utf8').catch(() => '0')) || 0;
+    await writeFile(unconfirmedReplyState, String(priorAttempts + 1), 'utf8');
+    if (priorAttempts === 1) {
+      console.error('Failed: Reply verification failed: Post was not confirmed on X');
+      process.exitCode = 1;
+    } else {
+      // Exercise legacy warnings on both streams, including an unterminated
+      // stdout line and a zero exit code on the last failed attempt.
+      const warning = 'Warning: could not confirm the reply was sent — check the browser.';
+      if (priorAttempts === 0) process.stdout.write(warning);
+      else console.warn(warning);
+    }
+    return;
+  }
+
   const retryState = process.env.SESSION_TEST_RETRY_STATE;
   if (retryState) {
     const priorAttempts = Number(await readFile(retryState, 'utf8').catch(() => '0')) || 0;
