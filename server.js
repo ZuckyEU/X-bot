@@ -98,8 +98,8 @@ function envInteger(name, fallback, min, max) {
 
 /**
  * The dashboard health check uses X's authenticated settings endpoint. It is a
- * cheap HTTP request (no browser) and fails closed if X cannot confirm the
- * cookies. Try the API host first, then the web-app host if the probe fails.
+ * cheap HTTP request (no browser), separating authentication rejection from
+ * inconclusive probes. Try the API host first, then the web-app host on failure.
  * Configured URLs run first; tests only call explicitly configured fixtures.
  */
 const X_SESSION_CHECK_DEFAULT_URLS = [
@@ -124,7 +124,6 @@ const X_WEB_BEARER = String(
   process.env.X_SESSION_CHECK_BEARER
     || 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
 ).trim();
-const X_SESSION_INVALID_ERROR_CODES = new Set([32, 89, 239, 326, 353]);
 
 const HISTORY_FILE = join(DATA_DIR, 'history.json');
 const REPLY_OUT_FILE = join(tmpdir(), 'playwright-gemini-reply.txt');
@@ -1112,11 +1111,8 @@ async function probeXSession(url, credentials, timeoutMs) {
     }
     const errorCode = xSessionErrorCode(payload);
 
-    // A rejected cookie is definitive no matter which host answered. Do not
-    // fall back to another endpoint after this: it would hide an expired login.
-    if (errorCode !== null && X_SESSION_INVALID_ERROR_CODES.has(errorCode)) {
-      return { status: 'invalid', httpStatus: response.status, errorCode, url };
-    }
+    // Only HTTP 401 explicitly rejects the session. Error payloads on other
+    // statuses (including a missing route) remain inconclusive and allow fallback.
     const hasError = errorCode !== null || Boolean(payload?.error)
       || (Array.isArray(payload?.errors) && payload.errors.length > 0);
     if (response.status === 200 && !hasError && typeof payload?.screen_name === 'string' && payload.screen_name.trim()) {
@@ -1140,7 +1136,7 @@ async function probeXSession(url, credentials, timeoutMs) {
   }
 }
 
-/** Only an authenticated settings response validates the cookies; failures block runs. */
+/** Confirm settings JSON, stop on HTTP 401, or report an inconclusive check as unknown. */
 async function verifyXSession(
   storageState,
   { timeoutMs = X_SESSION_CHECK_TIMEOUT_MS, urls = X_SESSION_CHECK_URLS } = {},
@@ -1157,10 +1153,10 @@ async function verifyXSession(
     outcomes.push(outcome);
   }
 
-  // No endpoint confirmed the login. Do not let 404s, outages, or HTML login
-  // pages fall through as a non-blocking "unknown" session.
+  // A missing endpoint, outage, or unexpected response does not establish that
+  // cookies expired. Callers separately block unverified imports and runs.
   const failure = outcomes.find((outcome) => ![404, 410].includes(outcome.httpStatus)) ?? outcomes[0];
-  return { ...(failure ?? { reason: 'no-endpoints' }), status: 'invalid' };
+  return failure ?? { status: 'unknown', reason: 'no-endpoints' };
 }
 
 const xSessionHealthCache = new Map();
@@ -1295,6 +1291,13 @@ app.post('/api/auth/import-session', async (req, res, next) => {
     const health = await checkXSessionHealth(storageState, { handle: username });
     if (health.xSessionValid === false) {
       throw new HttpError(422, 'X rejected these cookies. Sign in to X again and copy fresh auth_token and ct0 values.');
+    }
+    if (!X_SESSION_CHECK_DISABLED && health.xSessionValid !== true) {
+      return res.status(503).json({
+        error: 'X session verification is unavailable. Retry shortly; your saved session has not been changed.',
+        code: 'X_SESSION_CHECK_UNAVAILABLE',
+        ...health,
+      });
     }
 
     const result = await withWriteLock(async () => {
@@ -2006,6 +2009,13 @@ app.post('/api/run', async (req, res) => {
         return res.status(409).json({
           error: `X connection expired for @${selectedSession.xUsername}. Re-authenticate the account before publishing.`,
           code: 'X_SESSION_EXPIRED',
+          ...health,
+        });
+      }
+      if (!X_SESSION_CHECK_DISABLED && health.xSessionValid !== true) {
+        return res.status(503).json({
+          error: `X could not confirm the session for @${selectedSession.xUsername} through its settings endpoint. Retry shortly; publishing has not started.`,
+          code: 'X_SESSION_CHECK_UNAVAILABLE',
           ...health,
         });
       }

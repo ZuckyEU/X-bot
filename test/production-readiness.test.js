@@ -166,14 +166,17 @@ async function startXHealthFixture(t) {
   const requests = [];
   const server = createHttpServer((req, res) => {
     const cookie = String(req.headers.cookie ?? '');
-    requests.push({ url: req.url, cookie, csrf: req.headers['x-csrf-token'], authorization: req.headers.authorization });
+    requests.push({
+      url: req.url, cookie, csrf: req.headers['x-csrf-token'], authorization: req.headers.authorization,
+      authType: req.headers['x-twitter-auth-type'], activeUser: req.headers['x-twitter-active-user'],
+    });
     if (req.url?.startsWith('/missing')) {
       res.writeHead(404, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ errors: [{ message: 'Not found' }] }));
     }
     if (cookie.includes('notfound')) {
       res.writeHead(404, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ errors: [{ message: 'Not found' }] }));
+      return res.end(JSON.stringify({ errors: [{ message: 'Not found', ...(cookie.includes('autherror') ? { code: 89 } : {}) }] }));
     }
     if (cookie.includes('gone')) {
       res.writeHead(410, { 'content-type': 'application/json' });
@@ -190,6 +193,14 @@ async function startXHealthFixture(t) {
     if (cookie.includes('autherror')) {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ errors: [{ code: 89, message: 'Invalid or expired token' }] }));
+    }
+    if (cookie.includes('forbidden')) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ code: 89, message: 'Forbidden' }] }));
+    }
+    if (cookie.includes('ratelimited')) {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ code: 88, message: 'Rate limit exceeded' }] }));
     }
     if (cookie.includes('html')) {
       res.writeHead(200, { 'content-type': 'text/html' });
@@ -1067,6 +1078,8 @@ test('X session health rejects expired cookies, blocks live runs, and re-authent
   assert.match(probe.cookie, /ct0=good_ct0_value/);
   assert.equal(probe.csrf, 'good_ct0_value');
   assert.match(probe.authorization, /^Bearer /);
+  assert.equal(probe.authType, 'OAuth2Session');
+  assert.equal(probe.activeUser, 'yes');
 
   const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } });
   assert.equal(me.status, 200);
@@ -1117,13 +1130,16 @@ test('X session health rejects expired cookies, blocks live runs, and re-authent
     handle: 'beta', auth_token: 'flaky_auth_token_value', ct0: 'flaky_ct0_value',
   });
   const flakyText = await flaky.text();
-  assert.equal(flaky.status, 422, flakyText);
+  assert.equal(flaky.status, 503, flakyText);
+  assert.equal(JSON.parse(flakyText).code, 'X_SESSION_CHECK_UNAVAILABLE');
+  assert.equal(JSON.parse(flakyText).xSessionValid, null);
+  assert.equal(JSON.parse(flakyText).xSessionStatus, 'unknown');
   const preserved = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
   assert.equal(preserved.xSession.auth_token, good.auth_token);
   assert.equal(preserved.xSessionValid, true);
 });
 
-test('X health check never masks a 401 or authentication error with a successful fallback', { timeout: 30_000 }, async (t) => {
+test('X health check never masks an HTTP 401 with a successful fallback', { timeout: 30_000 }, async (t) => {
   const x = await startXHealthFixture(t);
   const { baseUrl } = await startServer(t, {
     X_SESSION_CHECK_DISABLED: '0',
@@ -1131,7 +1147,7 @@ test('X health check never masks a 401 or authentication error with a successful
     X_SESSION_CHECK_CACHE_MS: '0',
   });
   const owner = await register(baseUrl, 'health_unauthorized');
-  for (const prefix of ['unauthorized', 'autherror']) {
+  for (const prefix of ['unauthorized', 'expired']) {
     const requestCount = x.requests.length;
     const rejected = await importSession(baseUrl, owner.cookie, importPayload('alpha', prefix));
     assert.equal(rejected.status, 422, await rejected.text());
@@ -1140,7 +1156,27 @@ test('X health check never masks a 401 or authentication error with a successful
   }
 });
 
-test('X health check falls back across endpoints and blocks every failed verification before staging or spawn', { timeout: 30_000 }, async (t) => {
+test('X health check retries non-401 error responses on the authenticated fallback endpoint', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0',
+    X_SESSION_CHECK_URL: `${x.url},${x.url}?fallback=1`,
+    X_SESSION_CHECK_CACHE_MS: '0',
+  });
+  const owner = await register(baseUrl, 'health_non401');
+  for (const prefix of ['autherror', 'forbidden']) {
+    const requestCount = x.requests.length;
+    const imported = await importSession(baseUrl, owner.cookie, importPayload('alpha', prefix));
+    const body = await imported.json();
+    assert.equal(imported.status, 201, JSON.stringify(body));
+    assert.equal(body.xSessionValid, true);
+    assert.equal(body.xSessionStatus, 'valid');
+    assert.equal(x.requests.length, requestCount + 2, 'A non-401 error must allow endpoint fallback');
+    assert.equal(x.requests.at(-1).url, '/i/api/1.1/account/settings.json?fallback=1');
+  }
+});
+
+test('X health check falls back after 404 and reports unknown failures without staging or spawn', { timeout: 30_000 }, async (t) => {
   const x = await startXHealthFixture(t);
   const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-health-failures-'));
   const stageMarker = join(dataDir, 'stage-gate');
@@ -1158,8 +1194,8 @@ test('X health check falls back across endpoints and blocks every failed verific
   });
   const owner = await register(baseUrl, 'healthfallback');
 
-  // A missing first endpoint is retried on the valid second endpoint rather
-  // than surfacing a 404 as an ambiguous/unknown health result.
+  // A missing route is inconclusive; an authenticated fallback can still
+  // confirm the session instead of marking the cookies expired.
   const good = { handle: 'gamma', auth_token: 'good_gamma_auth_token', ct0: 'good_gamma_ct0' };
   const imported = await importSession(baseUrl, owner.cookie, good);
   const importedText = await imported.text();
@@ -1175,10 +1211,23 @@ test('X health check falls back across endpoints and blocks every failed verific
   });
   assert.equal(key.status, 200);
 
-  for (const prefix of ['notfound', 'gone', 'unauthorized', 'html', 'malformed', 'flaky', 'timeout', 'network']) {
+  for (const prefix of ['notfound', 'notfoundautherror', 'gone', 'unauthorized', 'autherror', 'forbidden', 'ratelimited', 'html', 'malformed', 'flaky', 'timeout', 'network']) {
+    const invalid = prefix === 'unauthorized';
+    const expectedStatus = invalid ? 'invalid' : 'unknown';
+    const expectedValid = invalid ? false : null;
+    const expectedCode = invalid ? 'X_SESSION_EXPIRED' : 'X_SESSION_CHECK_UNAVAILABLE';
     const failed = importPayload('gamma', prefix);
+    const savedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
     const rejected = await importSession(baseUrl, owner.cookie, failed);
-    assert.equal(rejected.status, 422, `${prefix}: ${await rejected.text()}`);
+    const rejectedBody = await rejected.json();
+    assert.equal(rejected.status, invalid ? 422 : 503, `${prefix}: ${JSON.stringify(rejectedBody)}`);
+    if (!invalid) {
+      assert.equal(rejectedBody.code, 'X_SESSION_CHECK_UNAVAILABLE', prefix);
+      assert.equal(rejectedBody.xSessionValid, null, prefix);
+      assert.equal(rejectedBody.xSessionStatus, 'unknown', prefix);
+      assert.doesNotMatch(rejectedBody.error, /expired|rejected|re-authenticate/i, prefix);
+    }
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), savedBefore, 'An unverified import must preserve the saved session');
 
     // The legacy editor simulates cookies that expired after they were saved.
     const rotated = await fetch(`${baseUrl}/api/auth`, {
@@ -1187,8 +1236,21 @@ test('X health check falls back across endpoints and blocks every failed verific
     });
     assert.equal(rotated.status, 200, prefix);
     const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
-    assert.equal(me.xSessionValid, false, prefix);
-    assert.equal(me.xSessionStatus, 'invalid', prefix);
+    assert.equal(me.xSessionValid, expectedValid, prefix);
+    assert.equal(me.xSessionStatus, expectedStatus, prefix);
+    assert.equal(me.xSession.auth_token, failed.auth_token, prefix);
+    if (prefix === 'notfound') {
+      const login = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
+      });
+      const loginBody = await login.json();
+      assert.equal(login.status, 200, JSON.stringify(loginBody));
+      assert.equal(loginBody.xSessionValid, null);
+      assert.equal(loginBody.xSessionStatus, 'unknown');
+      assert.equal(loginBody.activeXAccount, 'gamma');
+      owner.cookie = sessionCookie(login);
+    }
 
     const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
     await writeFile(stageMarker, 'fail');
@@ -1197,10 +1259,11 @@ test('X health check falls back across endpoints and blocks every failed verific
       body: JSON.stringify({ url: 'https://x.com/gamma/status/1' }),
     });
     const blockedBody = await blocked.json();
-    assert.equal(blocked.status, 409, `${prefix}: ${JSON.stringify(blockedBody)}`);
-    assert.equal(blockedBody.code, 'X_SESSION_EXPIRED', prefix);
-    assert.equal(blockedBody.xSessionValid, false, prefix);
-    assert.equal(blockedBody.xSessionStatus, 'invalid', prefix);
+    assert.equal(blocked.status, invalid ? 409 : 503, `${prefix}: ${JSON.stringify(blockedBody)}`);
+    assert.equal(blockedBody.code, expectedCode, prefix);
+    assert.equal(blockedBody.xSessionValid, expectedValid, prefix);
+    assert.equal(blockedBody.xSessionStatus, expectedStatus, prefix);
+    if (!invalid) assert.doesNotMatch(blockedBody.error, /expired|rejected|re-authenticate/i, prefix);
     assert.equal(await readFile(stageMarker, 'utf8'), 'fail', 'Rejected runs must not stage auth.json');
     assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
     await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });

@@ -605,6 +605,59 @@ test('an unknown X health result does not mark the session expired', { timeout: 
   assert.deepEqual(errors, []);
 });
 
+test('an unavailable X check keeps the importer open without marking the saved account expired', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, open, fill, submit } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    importStatus: 503,
+    importError: 'X session verification is unavailable. Retry shortly; your saved session has not been changed.',
+  });
+  await open();
+  await fill(cookieValues('bob'));
+  await submit();
+  await page.waitForFunction(() => document.getElementById('session-import-error').textContent.includes('verification is unavailable'));
+  assert.equal(await page.locator('#session-import-modal').isVisible(), true);
+  assert.equal(await page.locator('#session-import-submit').isEnabled(), true);
+  assert.equal(await page.locator('#session-auth-token').inputValue(), '');
+  assert.equal(await page.locator('#session-ct0').inputValue(), '');
+  assert.equal(await page.locator('#who').textContent(), '@alice');
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  assert.equal(await page.locator('#account-chip').evaluate((chip) => chip.classList.contains('expired')), false);
+  assert.deepEqual(state.accounts, [{ xUsername: 'alice', active: true, status: 'ready' }]);
+  assert.deepEqual(errors, []);
+});
+
+test('an unavailable X check is retryable and does not trigger session-expired UI', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    xSessionStatus: 'unknown',
+    groqConfigured: true,
+    runStatus: 503,
+    runBody: {
+      error: 'X could not confirm the session through its settings endpoint. Retry shortly; publishing has not started.',
+      code: 'X_SESSION_CHECK_UNAVAILABLE',
+      xSessionValid: null,
+      xSessionStatus: 'unknown',
+    },
+  });
+  await page.locator('#run-url').fill('https://x.com/alice/status/1');
+  await page.locator('#run').click();
+  await until(() => state.runs.length === 1);
+  await page.waitForFunction(() => document.getElementById('status').textContent === 'Run failed' && !document.getElementById('run').disabled);
+  assert.match(await page.locator('#status-detail').textContent(), /Retry shortly/);
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  assert.equal(await page.locator('#active-account-label').textContent(), 'Active X account');
+  assert.equal(await page.locator('#account-chip').evaluate((chip) => chip.classList.contains('expired')), false);
+  await page.locator('#run').click();
+  await until(() => state.runs.length === 2);
+  await page.waitForFunction(() => document.getElementById('status').textContent === 'Run failed' && !document.getElementById('run').disabled);
+  await page.locator('#account-chip').click();
+  const account = page.locator('.linked-account-item[data-x-username="alice"]');
+  assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
+  assert.equal(await account.locator('.session-expired').count(), 0);
+  assert.equal(await account.locator('.update-x-session').count(), 0);
+  assert.deepEqual(errors, []);
+});
+
 test('a backend X_SESSION_EXPIRED response switches the dashboard to reconnection mode', { timeout: 20_000 }, async (t) => {
   const { page, state, errors } = await fixture(t, {
     accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
