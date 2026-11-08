@@ -159,14 +159,48 @@ function importSession(baseUrl, cookie, body) {
 
 /**
  * Stand-in for X's authenticated settings endpoint. Cookies containing
- * "expired" are rejected, "flaky" produces a server error, and everything else
- * is accepted. This keeps the health-check tests deterministic and offline.
+ * "expired" are rejected; other named cookie pairs simulate failed probes.
+ * This keeps the health-check tests deterministic and offline.
  */
 async function startXHealthFixture(t) {
   const requests = [];
   const server = createHttpServer((req, res) => {
     const cookie = String(req.headers.cookie ?? '');
-    requests.push({ cookie, csrf: req.headers['x-csrf-token'], authorization: req.headers.authorization });
+    requests.push({ url: req.url, cookie, csrf: req.headers['x-csrf-token'], authorization: req.headers.authorization });
+    if (req.url?.startsWith('/missing')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ message: 'Not found' }] }));
+    }
+    if (cookie.includes('notfound')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ message: 'Not found' }] }));
+    }
+    if (cookie.includes('gone')) {
+      res.writeHead(410, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ message: 'Gone' }] }));
+    }
+    if (req.url?.includes('fallback=1')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ screen_name: 'fixture' }));
+    }
+    if (cookie.includes('unauthorized')) {
+      res.writeHead(401, { 'content-type': 'text/html' });
+      return res.end('<html>Sign in</html>');
+    }
+    if (cookie.includes('autherror')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ code: 89, message: 'Invalid or expired token' }] }));
+    }
+    if (cookie.includes('html')) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end('<html>Sign in</html>');
+    }
+    if (cookie.includes('malformed')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end('{}');
+    }
+    if (cookie.includes('timeout')) return;
+    if (cookie.includes('network')) return req.socket.destroy();
     if (cookie.includes('expired')) {
       res.writeHead(401, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ errors: [{ code: 32, message: 'Could not authenticate you.' }] }));
@@ -186,7 +220,12 @@ async function startXHealthFixture(t) {
     server.closeAllConnections();
     server.close(resolve);
   }));
-  return { url: `http://127.0.0.1:${server.address().port}/i/api/1.1/account/settings.json`, requests };
+  const base = `http://127.0.0.1:${server.address().port}`;
+  return {
+    url: `${base}/i/api/1.1/account/settings.json`,
+    missingUrl: `${base}/missing/1.1/account/settings.json`,
+    requests,
+  };
 }
 
 async function until(check, message = 'condition did not become true', timeoutMs = 5_000) {
@@ -1073,19 +1112,104 @@ test('X session health rejects expired cookies, blocks live runs, and re-authent
   assert.equal(restoredBody.xSessionValid, true);
   assert.equal(restoredBody.xSessionStatus, 'valid');
 
-  // A transient X failure is reported as unknown and does not mark the account
-  // expired or get rejected during import.
+  // Failed verification must not silently permit imports or live publishing.
   const flaky = await importSession(baseUrl, owner.cookie, {
     handle: 'beta', auth_token: 'flaky_auth_token_value', ct0: 'flaky_ct0_value',
   });
   const flakyText = await flaky.text();
-  assert.equal(flaky.status, 201, flakyText);
-  const flakyBody = JSON.parse(flakyText);
-  assert.equal(flakyBody.xSessionValid, null);
-  assert.equal(flakyBody.xSessionStatus, 'unknown');
-  const transientMe = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
-  assert.equal(transientMe.xSessionValid, null);
-  assert.equal(transientMe.xSessionStatus, 'unknown');
+  assert.equal(flaky.status, 422, flakyText);
+  const preserved = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(preserved.xSession.auth_token, good.auth_token);
+  assert.equal(preserved.xSessionValid, true);
+});
+
+test('X health check never masks a 401 or authentication error with a successful fallback', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0',
+    X_SESSION_CHECK_URL: `${x.url},${x.url}?fallback=1`,
+    X_SESSION_CHECK_CACHE_MS: '0',
+  });
+  const owner = await register(baseUrl, 'health_unauthorized');
+  for (const prefix of ['unauthorized', 'autherror']) {
+    const requestCount = x.requests.length;
+    const rejected = await importSession(baseUrl, owner.cookie, importPayload('alpha', prefix));
+    assert.equal(rejected.status, 422, await rejected.text());
+    assert.equal(x.requests.length, requestCount + 1, 'Authentication rejection must not trigger a fallback');
+    assert.equal(x.requests.at(-1).url, '/i/api/1.1/account/settings.json');
+  }
+});
+
+test('X health check falls back across endpoints and blocks every failed verification before staging or spawn', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-health-failures-'));
+  const stageMarker = join(dataDir, 'stage-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0',
+    X_SESSION_CHECK_URL: `${x.missingUrl},${x.url}`,
+    X_SESSION_CHECK_TIMEOUT_MS: '500',
+    X_SESSION_CHECK_CACHE_MS: '0',
+    SESSION_TEST_WRITE_GATE: stageMarker,
+    SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'healthfallback');
+
+  // A missing first endpoint is retried on the valid second endpoint rather
+  // than surfacing a 404 as an ambiguous/unknown health result.
+  const good = { handle: 'gamma', auth_token: 'good_gamma_auth_token', ct0: 'good_gamma_ct0' };
+  const imported = await importSession(baseUrl, owner.cookie, good);
+  const importedText = await imported.text();
+  assert.equal(imported.status, 201, importedText);
+  assert.equal(JSON.parse(importedText).xSessionStatus, 'valid');
+  const requestedPaths = x.requests.map((request) => request.url);
+  assert.ok(requestedPaths.includes('/missing/1.1/account/settings.json'));
+  assert.ok(requestedPaths.includes('/i/api/1.1/account/settings.json'));
+
+  const key = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ apiKey: 'test-only-groq-key-no-external-requests' }),
+  });
+  assert.equal(key.status, 200);
+
+  for (const prefix of ['notfound', 'gone', 'unauthorized', 'html', 'malformed', 'flaky', 'timeout', 'network']) {
+    const failed = importPayload('gamma', prefix);
+    const rejected = await importSession(baseUrl, owner.cookie, failed);
+    assert.equal(rejected.status, 422, `${prefix}: ${await rejected.text()}`);
+
+    // The legacy editor simulates cookies that expired after they were saved.
+    const rotated = await fetch(`${baseUrl}/api/auth`, {
+      method: 'PUT', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ auth_token: failed.auth_token, ct0: failed.ct0 }),
+    });
+    assert.equal(rotated.status, 200, prefix);
+    const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+    assert.equal(me.xSessionValid, false, prefix);
+    assert.equal(me.xSessionStatus, 'invalid', prefix);
+
+    const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    await writeFile(stageMarker, 'fail');
+    const blocked = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ url: 'https://x.com/gamma/status/1' }),
+    });
+    const blockedBody = await blocked.json();
+    assert.equal(blocked.status, 409, `${prefix}: ${JSON.stringify(blockedBody)}`);
+    assert.equal(blockedBody.code, 'X_SESSION_EXPIRED', prefix);
+    assert.equal(blockedBody.xSessionValid, false, prefix);
+    assert.equal(blockedBody.xSessionStatus, 'invalid', prefix);
+    assert.equal(await readFile(stageMarker, 'utf8'), 'fail', 'Rejected runs must not stage auth.json');
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+    await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+    await unlink(stageMarker);
+
+    // A blocked run must release its lock so fresh cookies can be imported.
+    const restored = await importSession(baseUrl, owner.cookie, good);
+    assert.equal(restored.status, 201, await restored.text());
+  }
 });
 
 test('production allows Render origins and rejects unknown origins', async (t) => {

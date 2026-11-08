@@ -5,6 +5,7 @@ import cors from 'cors';
 import bcrypt from 'bcrypt';
 import { spawn } from 'node:child_process';
 import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -97,16 +98,27 @@ function envInteger(name, fallback, min, max) {
 
 /**
  * The dashboard health check uses X's authenticated settings endpoint. It is a
- * cheap HTTP request (no browser) and distinguishes rejected cookies from
- * transient X/network failures so an outage never marks a session expired.
+ * cheap HTTP request (no browser) and fails closed if X cannot confirm the
+ * cookies. Try the API host first, then the web-app host if the probe fails.
+ * Configured URLs run first; tests only call explicitly configured fixtures.
  */
-const X_SESSION_CHECK_URL = String(
-  process.env.X_SESSION_CHECK_URL || 'https://x.com/i/api/1.1/account/settings.json',
-).trim();
+const X_SESSION_CHECK_DEFAULT_URLS = [
+  'https://api.x.com/1.1/account/settings.json',
+  'https://x.com/i/api/1.1/account/settings.json',
+];
+const X_SESSION_CHECK_CONFIGURED_URLS = String(process.env.X_SESSION_CHECK_URL || '')
+  .split(',')
+  .map((url) => url.trim())
+  .filter(Boolean);
+const X_SESSION_CHECK_URLS = X_SESSION_CHECK_CONFIGURED_URLS.length
+  ? IS_TEST
+    ? X_SESSION_CHECK_CONFIGURED_URLS
+    : [...new Set([...X_SESSION_CHECK_CONFIGURED_URLS, ...X_SESSION_CHECK_DEFAULT_URLS])]
+  : X_SESSION_CHECK_DEFAULT_URLS;
 const X_SESSION_CHECK_TIMEOUT_MS = envInteger('X_SESSION_CHECK_TIMEOUT_MS', 3_500, 500, 15_000);
 const X_SESSION_CHECK_CACHE_MS = envInteger('X_SESSION_CHECK_CACHE_MS', 60_000, 0, 15 * 60_000);
 const X_SESSION_CHECK_DISABLED = process.env.X_SESSION_CHECK_DISABLED === '1'
-  || (IS_TEST && !process.env.X_SESSION_CHECK_URL);
+  || (IS_TEST && X_SESSION_CHECK_CONFIGURED_URLS.length === 0);
 // Public web-app bearer used by x.com itself; overridable in case X rotates it.
 const X_WEB_BEARER = String(
   process.env.X_SESSION_CHECK_BEARER
@@ -339,7 +351,18 @@ async function atomicWritePrivateFile(path, contents) {
   const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
     await writeFile(tmp, contents, { encoding: 'utf8', mode: 0o600 });
-    await rename(tmp, path);
+    // Windows can briefly hold the destination open (antivirus, another
+    // reader, or the browser process), making replace-rename fail with EPERM.
+    // Retry briefly instead of failing a session write/rollback.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(tmp, path);
+        break;
+      } catch (error) {
+        if (attempt >= 19 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+        await delay(10);
+      }
+    }
   } finally {
     await unlink(tmp).catch((error) => {
       if (error.code !== 'ENOENT') throw error;
@@ -1053,17 +1076,8 @@ function xSessionHealth(status, checkedAt = new Date().toISOString()) {
   };
 }
 
-/**
- * Ask X whether the saved cookies still represent a signed-in account.
- * Returns `valid`, `invalid` (X rejected the cookies), or `unknown` (timeout,
- * network error, rate limit, or an ambiguous response). Unknown is deliberately
- * non-blocking so a temporary X outage does not look like an expired session.
- */
-async function verifyXSession(storageState, { timeoutMs = X_SESSION_CHECK_TIMEOUT_MS, url = X_SESSION_CHECK_URL } = {}) {
-  const credentials = xSessionCredentials(storageState);
-  if (!credentials.auth_token || !credentials.ct0) return { status: 'invalid', reason: 'missing-cookies' };
-  if (X_SESSION_CHECK_DISABLED) return { status: 'unknown', reason: 'disabled' };
-
+/** Probe one endpoint; an inconclusive result lets verification try the next. */
+async function probeXSession(url, credentials, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
@@ -1083,31 +1097,70 @@ async function verifyXSession(storageState, { timeoutMs = X_SESSION_CHECK_TIMEOU
       },
     });
 
+    // A 401 is definitive even when the response body is empty, HTML, or slow.
+    if (response.status === 401) {
+      await response.body?.cancel().catch(() => {});
+      return { status: 'invalid', reason: 'unauthorized', httpStatus: 401, url };
+    }
+
     let payload = null;
     try {
       payload = await response.json();
-    } catch {
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
       // Responses such as Cloudflare challenges are not JSON.
     }
     const errorCode = xSessionErrorCode(payload);
 
-    if (response.status === 401 || (errorCode !== null && X_SESSION_INVALID_ERROR_CODES.has(errorCode))) {
-      return { status: 'invalid', httpStatus: response.status, errorCode };
+    // A rejected cookie is definitive no matter which host answered. Do not
+    // fall back to another endpoint after this: it would hide an expired login.
+    if (errorCode !== null && X_SESSION_INVALID_ERROR_CODES.has(errorCode)) {
+      return { status: 'invalid', httpStatus: response.status, errorCode, url };
     }
-    if (response.ok) {
-      // A 200 response that still carries an X error payload is ambiguous.
-      if (errorCode !== null) return { status: 'unknown', httpStatus: response.status, errorCode };
-      return { status: 'valid', httpStatus: response.status };
+    const hasError = errorCode !== null || Boolean(payload?.error)
+      || (Array.isArray(payload?.errors) && payload.errors.length > 0);
+    if (response.status === 200 && !hasError && typeof payload?.screen_name === 'string' && payload.screen_name.trim()) {
+      return { status: 'valid', httpStatus: response.status, url };
     }
-    return { status: 'unknown', httpStatus: response.status, errorCode };
+    return {
+      status: 'unknown',
+      reason: [404, 410].includes(response.status) ? 'endpoint-not-found' : response.ok ? 'invalid-response' : 'http-error',
+      httpStatus: response.status,
+      errorCode,
+      url,
+    };
   } catch (error) {
     return {
       status: 'unknown',
-      reason: error?.name === 'AbortError' ? 'timeout' : 'network',
+      reason: controller.signal.aborted ? 'timeout' : 'network',
+      url,
     };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Only an authenticated settings response validates the cookies; failures block runs. */
+async function verifyXSession(
+  storageState,
+  { timeoutMs = X_SESSION_CHECK_TIMEOUT_MS, urls = X_SESSION_CHECK_URLS } = {},
+) {
+  const credentials = xSessionCredentials(storageState);
+  if (!credentials.auth_token || !credentials.ct0) return { status: 'invalid', reason: 'missing-cookies' };
+  if (X_SESSION_CHECK_DISABLED) return { status: 'unknown', reason: 'disabled' };
+
+  const outcomes = [];
+  for (const url of urls) {
+    const outcome = await probeXSession(url, credentials, timeoutMs);
+    // Never hide an explicit authentication rejection behind a fallback.
+    if (outcome.status === 'valid' || outcome.status === 'invalid') return outcome;
+    outcomes.push(outcome);
+  }
+
+  // No endpoint confirmed the login. Do not let 404s, outages, or HTML login
+  // pages fall through as a non-blocking "unknown" session.
+  const failure = outcomes.find((outcome) => ![404, 410].includes(outcome.httpStatus)) ?? outcomes[0];
+  return { ...(failure ?? { reason: 'no-endpoints' }), status: 'invalid' };
 }
 
 const xSessionHealthCache = new Map();
@@ -1238,7 +1291,7 @@ app.post('/api/auth/import-session', async (req, res, next) => {
 
     // Validate before writing anything. Rejected cookies should keep the
     // previous session intact and return the user to the re-authentication
-    // dialog with a clear message; transient X failures are allowed through.
+    // dialog with a clear message. Failed verification never replaces a session.
     const health = await checkXSessionHealth(storageState, { handle: username });
     if (health.xSessionValid === false) {
       throw new HttpError(422, 'X rejected these cookies. Sign in to X again and copy fresh auth_token and ct0 values.');
@@ -1365,6 +1418,7 @@ app.put('/api/auth', async (req, res, next) => {
     const values = Object.fromEntries(updates.map((name) => [name, validateValue(name, body[name])]));
 
     const saved = await withWriteLock(async () => {
+      if (activeRun) throw new HttpError(409, 'A run is already in progress');
       const payload = selectedSession
         ? structuredClone(selectedSession.state)
         : ((await readAuthFile(AUTH_FILE)) ?? { cookies: [] });
@@ -1937,7 +1991,10 @@ app.post('/api/run', async (req, res) => {
     attachRunCleanup(res, batchHandle);
 
     try {
-      selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
+      // Validate before writing auth.json or spawning Playwright. An expired
+      // account must fail with 409 immediately instead of launching a browser
+      // that only discovers the rejected cookies after startup.
+      selectedSession = await activeSessionFor(appAuth.user, { required: true });
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
 
@@ -1952,6 +2009,10 @@ app.post('/api/run', async (req, res) => {
           ...health,
         });
       }
+
+      selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
+      batchHandle.xUsername = selectedSession.xUsername;
+      if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
     } catch (error) {
       return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
     }
