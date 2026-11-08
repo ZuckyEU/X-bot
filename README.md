@@ -6,7 +6,7 @@ Minimal starting point: **Playwright** (browser automation), **@google/genai** (
 
 ```powershell
 npm install
-npx playwright install chromium   # only needed for the local UI regression tests
+npx playwright install chromium   # required for local automation and UI tests
 ```
 
 Add your keys to `.env` (created from `.env.example`):
@@ -14,12 +14,10 @@ Add your keys to `.env` (created from `.env.example`):
 ```
 GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-3.6-flash
-BROWSERBASE_API_KEY=YOUR_API_KEY
-BROWSERBASE_PROJECT_ID=YOUR_PROJECT_ID
 DATABASE_URL=your-supabase-postgres-connection-string
 ```
 
-User accounts and X sessions are stored in **Supabase PostgreSQL**; the server creates the required tables on boot. Reply automation creates a **Browserbase** session through the official `@browserbasehq/sdk` (`sessions.create()`) and connects Playwright with `chromium.connectOverCDP(session.connectUrl)`. Manual session imports do not launch a browser or require a Browserbase key. Keep `BROWSERBASE_API_KEY` and (recommended) `BROWSERBASE_PROJECT_ID` on the automation/Render backend, never in source control. If the project ID is omitted, the SDK infers the project from the API key. Sessions use Browserbase's standard stealth defaults on the Free tier; Enterprise Verified mode is opt-in via `BROWSERBASE_VERIFIED_MODE=true` because it otherwise fails with a 403. Sessions are explicitly released with `REQUEST_RELEASE` when a run finishes, fails, or is cancelled.
+User accounts and X sessions are stored in **Supabase PostgreSQL**; the server creates the required tables on boot. Reply automation launches **local headless Chromium** through Playwright inside the application container. The shared `lib/browser.js` launcher uses `chromium.launch({ headless: true, args: ['--no-sandbox'] })`; it never connects to a remote browser and needs no browser-service API key. On Render, select the **Docker runtime** and use the repository's Dockerfile, which includes Chromium and its Linux dependencies. Manual session imports do not launch a browser.
 
 `gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
 
@@ -30,20 +28,23 @@ npm start
 npm start -- https://news.ycombinator.com   # custom URL
 ```
 
-`index.js` loads `.env`, opens the URL in a Browserbase remote Chromium session, reads the title/heading, then asks Gemini to describe the page. If `GEMINI_API_KEY` is missing it still runs the Playwright part and prints a warning.
+`index.js` loads `.env`, opens the URL in local headless Chromium, reads the title/heading, then asks Gemini to describe the page. If `GEMINI_API_KEY` is missing it still runs the Playwright part and prints a warning.
 
 ## X login (saves session to auth.json)
 
 ```powershell
+$env:NODE_ENV='development'   # manual sign-in requires a local desktop, not Render
 npm run auth
 ```
 
-1. A Browserbase remote Chromium session opens directly on `https://x.com/i/flow/login`.
-2. Open the printed Browserbase live view and log in yourself — password, 2FA, captcha, anything X asks for.
+1. A visible local Chromium window opens directly on `https://x.com/i/flow/login`.
+2. Log in yourself in that browser window — password, 2FA, captcha, anything X asks for.
 3. Return to the terminal and press **ENTER**.
 4. The script checks for the `auth_token` cookie, then writes cookies and X localStorage to `auth.json`.
 
 If you press ENTER too early, the script warns that the session is unverified and saves anyway — just re-run `npm run auth`.
+
+This CLI helper is the only headed browser path and refuses to run in production or on Render. Use **Connect X Account** in the dashboard to import existing cookies for container automation; there is no remote sign-in viewer.
 
 Reuse the session in another script:
 
@@ -68,7 +69,7 @@ It uses Playwright's `storageState` shape, so you can also write it by hand (or 
 
 ## Reply automation (main.js)
 
-Prerequisites: a saved session (`npm run auth`) and `GEMINI_API_KEY` in `.env`.
+Prerequisites: a saved session (`npm run auth` locally, or dashboard cookie import on Render) and a Groq API key (`GROQ_API_KEY` for CLI use, or the saved dashboard key for `/api/run`).
 
 ```powershell
 npm run automate -- https://x.com/user/status/1234567890 --dry-run  # generate only, no posting
@@ -76,7 +77,7 @@ npm run automate -- https://x.com/user/status/1234567890            # asks for c
 npm run automate -- https://x.com/user/status/1234567890 --yes      # no prompt
 ```
 
-Flow: restores cookies and localStorage from `auth.json` → verifies the session on `x.com/home` → opens the tweet → extracts the text (expanding "Show more") → asks Gemini (`GEMINI_MODEL`, default 3.6 Flash) to classify the tweet and write a reply in that domain (≤ 240 chars) → types it into the reply composer → posts it → likes the tweet.
+Flow: launches local headless Chromium → restores cookies and localStorage from `auth.json` → verifies the session on `x.com/home` → opens the tweet → extracts the text (expanding "Show more") → asks Groq to classify the tweet and write a reply → performs the requested reply/like actions.
 
 **Dynamic tone, not a crypto bot.** The system prompt makes Gemini identify the tweet's domain first — `crypto`, `web-development`, `software-engineering`, `ui-ux-design`, `ai-ml`, `product-startup` or `other` — and reply in that domain's vocabulary:
 
@@ -93,7 +94,7 @@ Crypto framing (tokens, price action, "alpha", on-chain, trading) is allowed onl
 |---|---|
 | `--dry-run` | Stop after printing the generated reply |
 | `--yes`, `-y` | Skip the confirmation prompt |
-| `--headless` | Accepted for compatibility; Browserbase controls browser visibility |
+| `--headless` | Accepted for compatibility; automation always runs headless |
 
 Output example:
 
@@ -142,43 +143,30 @@ After login and on every dashboard bootstrap, `GET /api/auth/me` reads the user'
 
 Run `npm test` for API, tenant-isolation, persistence, rollback, and runner regression checks. Run `npm run test:ui` after installing local Chromium for form submission, secret cleanup, error handling, and stale-response checks. Tests use synthetic cookies and local fixtures, not a credentialed X login.
 
-### Optional interactive Browserbase sign-in (`POST /auth/x`)
+### Browser execution and session flow
 
-The Browserbase API remains available as an alternative for authenticated NDJSON clients. `POST /auth/x` streams a Browserbase live URL plus status events, and the user finishes sign-in directly in that remote browser. The dashboard uses manual session imports instead.
+Before the local-browser migration, `lib/browser.js` imported the Browserbase SDK, called `sessions.create()`, connected with `chromium.connectOverCDP()`, minted live URLs with `sessions.debug()`, and released sessions with `sessions.update()`. `main.js`, `index.js`, `auth.js`, and the optional `/auth/x` route all used that shared remote path. Only the dashboard browser tests used local `chromium.launch()`.
 
-Flow:
+The current execution paths are:
 
-1. The server creates a **Browserbase** session with `sessions.create()` using standard Free-tier-compatible stealth defaults (`browserSettings.verified` is not requested unless `BROWSERBASE_VERIFIED_MODE=true`), connects with `chromium.connectOverCDP(session.connectUrl)`, reuses the remote browser's default context, applies context-wide stealth init scripts (`navigator.webdriver`, permissions, Chrome runtime, WebGL, canvas) to every page, and applies the Chrome 122 User-Agent plus native `sec-ch-ua` client hints to existing pages and popups.
-2. Before X navigation, it restores that app tenant's trusted cookies/localStorage, mints the Browserbase debugger URL with `sessions.debug()`, and immediately emits it to the authenticated NDJSON client. The backend passes through the SDK's `debuggerFullscreenUrl` without rewriting or hardcoding Browserbase's debugger domain. The same remote page then opens `https://x.com/i/flow/login` with `Referer: https://x.com/`.
-3. Clients should open the debugger URL in a native tab rather than embedding it. Client hints are generated natively through CDP metadata rather than forced as global extra headers, because global non-safelisted headers break X's cross-origin onboarding API preflights.
-4. Sign in to X in the remote window, including 2FA or any challenge.
-5. The server watches for navigation to X's `/home` timeline or for both `auth_token` and `ct0`. It then captures cookies and localStorage with `context.storageState()`, upserts `auth_token` and `ct0` into PostgreSQL, updates the user's linked accounts, and refreshes the account list automatically.
-6. The browser disconnects and the Browserbase session is released with `REQUEST_RELEASE`, invalidating the debugger URL. The live link is a short-lived bearer credential; the server sends it only over the authenticated NDJSON stream and never logs it.
-7. Call `POST /auth/x/cancel` to stop an active remote sign-in. This releases the active-run lock, aborts the Playwright flow, and releases the Browserbase session.
+| Entry point | Browser execution |
+|---|---|
+| `POST /api/run` in `server.js` | Stages the authenticated user's cookies, then spawns `main.js`; the server itself does not launch a browser |
+| `main.js` and `index.js` | `connectBrowser()` → local `chromium.launch({ headless: true, args: ['--no-sandbox'] })` |
+| `auth.js` | Local headed Chromium for desktop-only manual login; blocked in production/Render |
+| Dashboard browser tests | Local headless Chromium against a fixture server |
 
-Each app user also gets `sessions/<userId>/_trusted-login-profile.json`. It keeps X guest/device cookies and X localStorage while deliberately removing `auth_token`, `ct0`, `twid`, and other account-authentication cookies, so adding another account reuses a consistent browser identity without silently opening the previously linked account. A request that explicitly supplies an already linked `xUsername` restores that account's saved two-cookie state from PostgreSQL. Login state is checkpointed during the live session and saved atomically.
+1. Server boot initializes PostgreSQL and creates the `users`/`x_sessions` schema. Boot hydration stages the most recently active saved account in `auth.json`; this does not launch Chromium.
+2. App login and `GET /api/auth/me` resolve that user's active `x_sessions` row. They restage `auth.json` only while idle, so dashboard bootstrap cannot replace cookies during a run.
+3. `POST /api/run` validates URLs, authenticates the app session, checks the saved Groq key, reserves the single-run lock, and re-reads/stages the selected user's `auth_token`/`ct0` from PostgreSQL. The boot-staged account is not blindly reused.
+4. Each target attempt spawns `main.js` with `AUTH_FILE_PATH`, `X_ACCOUNT_USERNAME`, and the user's Groq key. The child launches Chromium inside the same container, awaits a new browser context, injects the staged cookies with `context.addCookies()`, and only then opens X.
+5. The child performs the requested actions and closes its local browser in `finally`. The server preserves bounded retries, final-attempt history, NDJSON progress, cancellation-aware delays, and run-lock cleanup.
 
-An existing **“We've temporarily limited your login”** response is enforced by X and cannot be removed by JavaScript. Stop retrying until X's cooldown expires; repeated attempts from the same cloud IP can extend it. These changes reduce unnecessary fresh-device logins, but a consistent/reputable Browserbase session region is still important.
+The Browserbase SDK and its configuration are no longer used. Existing browser-service environment variables may be removed from Render; they cannot switch automation back to a remote browser. X will now see the Render container's outbound IP, so cloud-IP restrictions and expired cookies can still block a run.
 
-If the live link cannot be minted, start a new `POST /auth/x` sign-in when the Browserbase session is available again, or import an existing session through the dashboard.
+### Retired remote sign-in endpoints
 
-`POST /auth/x` responds with `application/x-ndjson` (same event shape as the run endpoint):
-
-```
-{"type":"start","command":"browser sign-in -> https://x.com/i/flow/login (Browserbase remote Chromium)"}
-{"type":"live","status":"ready","url":"https://browserbase.com/sessions/…","expiresAt":"…"}
-{"type":"stdout","data":"Opening https://x.com/i/flow/login …"}
-{"type":"stdout","data":"Waiting for X sign-in to finish in the remote window …"}
-{"type":"status","stage":"signed-in","data":"X session cookies detected — saving the account automatically…"}
-{"type":"stdout","data":"Waiting for X home and account identity …"}
-{"type":"exit","code":0,"result":{"ok":true,"cookieCount":2,"username":"…"}}
-```
-
-`POST /auth/x/cancel` is idempotent: it returns `{ "ok": true, "cancelled": false }` when nothing is running, and otherwise clears the active sign-in lock, aborts the Playwright run, and releases the Browserbase session before replying. It is scoped to the authenticated app user.
-
-The optional `BROWSERBASE_LIVE_TIMEOUT_MS` environment variable controls how long the debugger URL stays valid (default: the 10-minute login window, minimum 30 seconds, capped at the login window). The underlying Browserbase session stays open until sign-in finishes or the run is cancelled. Use `BROWSERBASE_SESSION_TIMEOUT_SECONDS` (default `900`) when the X login flow needs longer; Browserbase caps sessions at 21,600 seconds. A legacy `BROWSERLESS_LIVE_TIMEOUT_MS` value is still read for migration.
-
-The equivalent CLI flow is `npm run auth` (same URL, press ENTER after login, writes `auth.json`).
+Authenticated `POST /auth/x` now returns **410 Gone** with a message directing clients to `POST /api/auth/import-session`. It never launches a browser or reserves the run lock; during an existing run/import it still returns 409. `POST /auth/x/cancel` remains an authenticated compatibility no-op returning `{ "ok": true, "cancelled": false }` and cannot cancel automation. The dashboard already uses cookie import, so its login flow is unchanged.
 
 ## Session dashboard and API (server.js)
 
@@ -202,8 +190,8 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 | `POST /api/auth/logout` | Revoke the app session and stop its active run; saved X sessions survive logout |
 | `GET /api/history` | Read the local `history.json` run log |
 | `DELETE /api/history` | Clear the local `history.json` run log |
-| `POST /auth/x` | NDJSON: start → live → auto-detect X session → save → exit (interactive Browserbase sign-in) |
-| `POST /auth/x/cancel` | Cancel an active remote X sign-in, release the run lock, and release the Browserbase session |
+| `POST /auth/x` | Retired interactive sign-in; authenticated 410 response directs clients to cookie import |
+| `POST /auth/x/cancel` | Authenticated compatibility no-op; does not cancel automation |
 | `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:
@@ -214,8 +202,6 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 {"type":"stderr","data":"…"}
 {"type":"exit","code":0,"signal":null}
 ```
-
-`POST /auth/x` responds the same way; the final event carries the sign-in result (`{"type":"exit","code":0,"result":{"ok":true,"cookieCount":2}}`).
 
 Consumers should render only a **status notification** (`Idle` / `Running…` / `Completed successfully` / `Run failed` / sign-in equivalents) — raw log lines stay off the dashboard.
 
@@ -274,7 +260,9 @@ For durable accounts and sessions:
 
 `auth.json`, `history.json`, and `sessions/<userId>/_trusted-login-profile.json` remain runtime files under `DATA_DIR`. Set `DATA_DIR` to a mounted disk if you want automation history and trusted login profiles to survive restarts; user accounts and X sessions do not depend on it.
 
-For a native Node deployment, use **`npm ci`** as the build command and **`npm run serve`** as the start command, with the project directory as the service root. Set `NODE_ENV=production`, a strong `SESSION_SECRET`, `DATABASE_URL`, the Browserbase credentials used by automation, and optionally `DATA_DIR`. No local browser or desktop worker is required. `npm run check:prod` requires the production database URL, syntax-checks the project, runs the API regression suite, and then starts the server.
+For **Render**, deploy with the **Docker runtime**, this directory as the service root, and the repository's `Dockerfile`. It uses `mcr.microsoft.com/playwright:v1.64.1-jammy`, matching the pinned `playwright` package version, with Chromium and Linux dependencies preinstalled. The build smoke-tests the shared headless launcher and starts **`npm run serve`**. Keep the image tag and dependency version aligned when upgrading Playwright.
+
+Set `NODE_ENV=production`, a strong `SESSION_SECRET`, `DATABASE_URL`, and optionally `DATA_DIR`. No browser-service key or interactive desktop worker is required. A native Linux Node deployment must additionally run **`npx playwright install --with-deps chromium`** after **`npm ci`** (with permission to install system packages); `npm ci` alone does not install Chromium. `npm run check:prod` validates the production secret/database URL, syntax-checks the project, runs the API regression suite, and then starts the server.
 
 Run one server process per deployment: the write queue and active-run reservation are in-process locks, not distributed locks across replicas.
 
@@ -285,4 +273,4 @@ The CLI (`npm run auth` and `npm run automate`) honors the same `DATA_DIR` for `
 ## Versions
 
 - Node.js >= 20 (project uses ESM: `"type": "module"`)
-- playwright 1.64, @browserbasehq/sdk 2.25, @google/genai 2.32, dotenv 18, express 5.3, body-parser 2.4, cors 2.8
+- playwright 1.64.1 (pinned to the Docker image), @google/genai 2.32, dotenv 18, express 5.3, body-parser 2.4, cors 2.8

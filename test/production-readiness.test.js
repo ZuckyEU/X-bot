@@ -9,24 +9,17 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import bcrypt from 'bcrypt';
+import { chromium } from 'playwright';
 import {
-  browserbaseSessionParams,
   CHROME_USER_AGENT,
   chromeIdentityForVersion,
   closeBrowser,
   connectBrowser,
-  createBrowserbaseClient,
   createTrustedLoginProfile,
-  createLiveInspection,
-  getBrowserbaseSession,
   getDefaultContext,
   getOrCreatePage,
   hasXSessionCookies,
   isXHomeURL,
-  resolveBrowserbaseLiveURL,
-  resolveBrowserbaseConfig,
-  resolveSessionTimeoutSeconds,
-  resolveVerifiedModeEnabled,
   restoreStorageState,
   safeContextCall,
   safeGoto,
@@ -1068,253 +1061,68 @@ test('cookie operations are skipped on closed or disconnected contexts', async (
   assert.match(closingResult.error.message, /browser context was closed/);
 });
 
-function fakeBrowserbaseClient({
-  createResponse = { id: 'session-1', connectUrl: 'wss://connect.browserbase.test/session-1' },
-  debugResponse = {
-    debuggerFullscreenUrl: 'https://browserbase.test/live/fullscreen',
-    debuggerUrl: 'https://browserbase.test/live/debugger',
-    pages: [{ id: 'page-1', debuggerUrl: 'https://browserbase.test/live/page-1' }],
-  },
-} = {}) {
-  const calls = { create: [], update: [], debug: [] };
-  const client = {
-    sessions: {
-      create: async (params) => {
-        calls.create.push(params);
-        if (createResponse instanceof Error) throw createResponse;
-        return createResponse;
-      },
-      update: async (id, body) => {
-        calls.update.push({ id, body });
-        return {};
-      },
-      debug: async (id, query) => {
-        calls.debug.push({ id, query });
-        if (debugResponse instanceof Error) throw debugResponse;
-        return debugResponse;
-      },
-    },
-  };
-  return { client, calls };
-}
+test('connectBrowser launches local headless Chromium without any remote connection', async (t) => {
+  let launches = 0;
+  let closes = 0;
+  const browser = { close: async () => { closes += 1; } };
+  t.mock.method(chromium, 'launch', async (options) => {
+    launches += 1;
+    assert.deepEqual(options, { headless: true, args: ['--no-sandbox'] });
+    return browser;
+  });
+  t.mock.method(chromium, 'connectOverCDP', () => {
+    assert.fail('Local automation must not connect to a remote browser');
+  });
 
-function fakePlaywrightBrowser() {
+  assert.equal(await connectBrowser(), browser);
+  assert.equal(launches, 1);
+  await closeBrowser(browser);
+  assert.equal(closes, 1);
+});
+
+test('local launch failures propagate without falling back to a remote browser', async (t) => {
+  const failure = new Error('Synthetic Chromium launch failure');
+  t.mock.method(chromium, 'launch', async () => { throw failure; });
+  t.mock.method(chromium, 'connectOverCDP', () => {
+    assert.fail('Launch failures must not fall back to a remote browser');
+  });
+  await assert.rejects(connectBrowser(), (error) => error === failure);
+});
+
+test('local browser cleanup tolerates absent and already-closed processes', async () => {
+  await closeBrowser(null);
+  await closeBrowser({ close: async () => { throw new Error('Browser has been closed'); } });
+});
+
+test('a fresh local browser awaits context creation before profiling and cookie restoration', async () => {
+  const operations = [];
+  const contexts = [];
   const context = {
+    browser: () => browser,
     pages: () => [],
-    addInitScript: async () => {},
-    on: () => {},
+    addInitScript: async () => operations.push('profile'),
+    clearCookies: async () => operations.push('clearCookies'),
+    addCookies: async (cookies) => operations.push({ cookies }),
   };
-  return {
-    contexts: () => [context],
-    newContext: () => context,
-    close: async () => {},
+  const browser = {
+    contexts: () => contexts,
     isConnected: () => true,
-  };
-}
-
-test('Browserbase credentials and stealth session parameters are resolved safely', () => {
-  assert.deepEqual(
-    resolveBrowserbaseConfig({
-      BROWSERBASE_API_KEY: '  api-key  ',
-      BROWSERBASE_PROJECT_ID: '  project-id  ',
-    }),
-    { apiKey: 'api-key', projectId: 'project-id' },
-  );
-  assert.deepEqual(resolveBrowserbaseConfig({}), { apiKey: '', projectId: '' });
-  assert.throws(() => createBrowserbaseClient({}), /BROWSERBASE_API_KEY is required/);
-  assert.equal(createBrowserbaseClient({ BROWSERBASE_API_KEY: 'key' }).projectId, '');
-  assert.ok(createBrowserbaseClient({ BROWSERBASE_API_KEY: 'key' }).client.sessions);
-
-  assert.equal(resolveSessionTimeoutSeconds({}), 900);
-  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_MS: 1_200_000 }), 1200);
-  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_SECONDS: '600' }), 600);
-  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_SECONDS: '1' }), 60);
-  assert.equal(resolveSessionTimeoutSeconds({ BROWSERBASE_SESSION_TIMEOUT_SECONDS: '999999' }), 21_600);
-
-  const params = browserbaseSessionParams({
-    projectId: 'project-id',
-    timeoutSeconds: 900,
-    userMetadata: { tenant: 'one' },
-  });
-  assert.equal(params.projectId, 'project-id');
-  assert.equal(params.api_timeout, 900);
-  assert.equal(params.browserSettings.verified, undefined, 'Verified mode is opt-in');
-  assert.equal(params.browserSettings.os, undefined, 'stealth-only OS is omitted on Free tier');
-  assert.equal(params.browserSettings.solveCaptchas, true);
-  assert.deepEqual(params.userMetadata, { tenant: 'one' });
-  assert.equal(Object.hasOwn(browserbaseSessionParams({}), 'projectId'), false);
-
-  const verified = browserbaseSessionParams({ verifiedMode: true });
-  assert.equal(verified.browserSettings.verified, true);
-  assert.equal(verified.browserSettings.os, 'windows');
-
-  assert.equal(resolveVerifiedModeEnabled({}), false);
-  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: 'false' }), false);
-  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: 'true' }), true);
-  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: '1' }), true);
-  assert.equal(resolveVerifiedModeEnabled({ BROWSERBASE_VERIFIED_MODE: 'on' }), true);
-});
-
-test('connectBrowser creates a stealth Browserbase session and releases it on cleanup', async () => {
-  const { client, calls } = fakeBrowserbaseClient();
-  const browser = fakePlaywrightBrowser();
-  let connectArgs = null;
-
-  const connected = await connectBrowser({
-    client,
-    projectId: 'project-id',
-    timeoutSeconds: 1_200,
-    connectOverCDP: async (endpoint, options) => {
-      connectArgs = { endpoint, options };
-      return browser;
+    async newContext() {
+      await delay(1);
+      operations.push('newContext');
+      contexts.push(context);
+      return context;
     },
-  });
+  };
+  const state = { cookies: xStorageState('alice').cookies, origins: [] };
 
-  assert.equal(connected, browser);
-  assert.equal(connectArgs.endpoint, 'wss://connect.browserbase.test/session-1');
-  assert.equal(connectArgs.options.timeout, 60_000);
-  assert.equal(calls.create.length, 1);
-  assert.equal(calls.create[0].projectId, 'project-id');
-  assert.equal(calls.create[0].api_timeout, 1_200);
-  assert.equal(calls.create[0].browserSettings.verified, undefined);
-  assert.equal(calls.create[0].browserSettings.os, undefined);
-  assert.equal(getBrowserbaseSession(browser).session.id, 'session-1');
-
-  await closeBrowser(browser);
-  assert.deepEqual(calls.update, [{ id: 'session-1', body: { status: 'REQUEST_RELEASE' } }]);
-  assert.equal(getBrowserbaseSession(browser), null);
-
-  await closeBrowser(browser);
-  assert.equal(calls.update.length, 1, 'release is idempotent');
-});
-
-test('connectBrowser releases the Browserbase session when connection setup fails', async () => {
-  const { client, calls } = fakeBrowserbaseClient();
-  await assert.rejects(
-    connectBrowser({
-      client,
-      projectId: 'project-id',
-      connectOverCDP: async () => {
-        throw new Error('CDP refused');
-      },
-    }),
-    /Could not connect Playwright to Browserbase: CDP refused/,
-  );
-  assert.deepEqual(calls.update, [{ id: 'session-1', body: { status: 'REQUEST_RELEASE' } }]);
-
-  const missingUrl = fakeBrowserbaseClient({ createResponse: { id: 'session-2' } });
-  await assert.rejects(
-    connectBrowser({ client: missingUrl.client, projectId: 'project-id' }),
-    /did not return a session connect URL/,
-  );
-  assert.deepEqual(missingUrl.calls.update, [{ id: 'session-2', body: { status: 'REQUEST_RELEASE' } }]);
-});
-
-test('Browserbase live inspection exposes the SDK debugger URL', async () => {
-  const { client, calls } = fakeBrowserbaseClient();
-  const browser = fakePlaywrightBrowser();
-  await connectBrowser({
-    client,
-    projectId: 'project-id',
-    connectOverCDP: async () => browser,
-  });
-  const page = { context: () => ({ browser: () => browser }) };
-
-  const inspection = await createLiveInspection(page, { timeoutMs: 600_000 });
-  assert.equal(inspection.liveURL, 'https://browserbase.test/live/fullscreen');
-  assert.equal(inspection.liveURLId, 'page-1');
-  assert.ok(inspection.expiresAt > Date.now());
-  assert.deepEqual(calls.debug, [{ id: 'session-1', query: { expiresIn: 600 } }]);
-
-  await inspection.close();
-  await closeBrowser(browser);
-});
-
-test('Browserbase live inspection passes through the SDK URL without hardcoding a domain', async () => {
-  const sdkUrl = 'https://live.browserbase.test/fullscreen?token=abc&navbar=false';
-  assert.equal(resolveBrowserbaseLiveURL({ debuggerFullscreenUrl: sdkUrl }), sdkUrl);
-  assert.equal(resolveBrowserbaseLiveURL({ debuggerUrl: sdkUrl }), sdkUrl);
-  assert.equal(
-    resolveBrowserbaseLiveURL({ pages: [{ debuggerFullscreenUrl: sdkUrl }] }),
-    sdkUrl,
-  );
-  assert.equal(resolveBrowserbaseLiveURL({ debuggerFullscreenUrl: 'not a url' }), null);
-  assert.equal(resolveBrowserbaseLiveURL({ debuggerFullscreenUrl: 'javascript:alert(1)' }), null);
-
-  const browserSource = await readFile(join(ROOT, 'lib', 'browser.js'), 'utf8');
-  assert.equal(
-    browserSource.includes('browserbase.com'),
-    false,
-    'the live URL builder must not force a Browserbase domain',
-  );
-
-  const { client, calls } = fakeBrowserbaseClient({ debugResponse: { debuggerFullscreenUrl: sdkUrl } });
-  const browser = fakePlaywrightBrowser();
-  await connectBrowser({
-    client,
-    projectId: 'project-id',
-    connectOverCDP: async () => browser,
-  });
-  const page = { context: () => ({ browser: () => browser }) };
-
-  const inspection = await createLiveInspection(page, { timeoutMs: 60_000 });
-  assert.equal(inspection.liveURL, sdkUrl);
-  assert.deepEqual(calls.debug, [{ id: 'session-1', query: { expiresIn: 60 } }]);
-
-  await closeBrowser(browser);
-});
-
-test('Browserbase live inspection falls back to the debugger URL and reports failures', async () => {
-  const fallback = fakeBrowserbaseClient({
-    debugResponse: { debuggerUrl: 'https://browserbase.test/live/debugger' },
-  });
-  const fallbackBrowser = fakePlaywrightBrowser();
-  await connectBrowser({
-    client: fallback.client,
-    projectId: 'project-id',
-    connectOverCDP: async () => fallbackBrowser,
-  });
-  const fallbackPage = { context: () => ({ browser: () => fallbackBrowser }) };
-  const inspection = await createLiveInspection(fallbackPage, { timeoutMs: 60_000 });
-  assert.equal(inspection.liveURL, 'https://browserbase.test/live/debugger');
-  assert.equal(inspection.liveURLId, 'session-1');
-  assert.deepEqual(fallback.calls.debug, [{ id: 'session-1', query: { expiresIn: 60 } }]);
-  await closeBrowser(fallbackBrowser);
-
-  await assert.rejects(
-    createLiveInspection({ context: () => ({ browser: () => null }) }),
-    /requires an active Browserbase session/,
-  );
-
-  const failing = fakeBrowserbaseClient({ debugResponse: new Error('debug unavailable') });
-  const failingBrowser = fakePlaywrightBrowser();
-  await connectBrowser({
-    client: failing.client,
-    projectId: 'project-id',
-    connectOverCDP: async () => failingBrowser,
-  });
-  await assert.rejects(
-    createLiveInspection({ context: () => ({ browser: () => failingBrowser }) }),
-    /Browserbase could not create a live inspection link: debug unavailable/,
-  );
-  await closeBrowser(failingBrowser);
-});
-
-test('Browserbase session creation clamps invalid timeouts and rejects missing debug URLs', async () => {
-  const { client, calls } = fakeBrowserbaseClient({ debugResponse: {} });
-  const browser = fakePlaywrightBrowser();
-  await connectBrowser({
-    client,
-    projectId: 'project-id',
-    timeoutSeconds: 30,
-    connectOverCDP: async () => browser,
-  });
-  assert.equal(calls.create[0].api_timeout, 60);
-  await assert.rejects(
-    createLiveInspection({ context: () => ({ browser: () => browser }) }),
-    /did not return a live inspection URL/,
-  );
-  await closeBrowser(browser);
+  assert.equal(await getDefaultContext(browser), context);
+  const restored = await safeContextCall(context, () => restoreStorageState(context, state, { clearCookies: true }));
+  assert.equal(restored.ok, true);
+  assert.deepEqual(operations, ['newContext', 'profile', 'clearCookies', { cookies: state.cookies }]);
+  assert.equal(await getDefaultContext(browser), context);
+  assert.equal(contexts.length, 1, 'The same run must reuse its context');
+  assert.equal(operations.filter((operation) => operation === 'profile').length, 1);
 });
 
 test('storage state restores cookies and localStorage while tenant profiles omit account auth', async () => {
@@ -1352,7 +1160,7 @@ test('storage state restores cookies and localStorage while tenant profiles omit
   assert.deepEqual(trustedProfile.origins, [state.origins[0]]);
 });
 
-test('remote X sign-in detection recognizes home and both required cookies', () => {
+test('X session detection recognizes home and both required cookies', () => {
   assert.equal(isXHomeURL('https://x.com/home'), true);
   assert.equal(isXHomeURL('https://mobile.twitter.com/home/'), true);
   assert.equal(isXHomeURL('https://x.com/i/flow/login'), false);
@@ -1380,7 +1188,7 @@ test('Chrome identity follows the actual Chromium build and falls back safely', 
   assert.equal(fallback.userAgent, CHROME_USER_AGENT);
 });
 
-test('Browserbase contexts and pages use a realistic Chrome identity and stealth profile', async () => {
+test('Chromium contexts and pages use a realistic Chrome identity and stealth profile', async () => {
   const page = { isClosed: () => false };
   const commands = [];
   const initScripts = [];
@@ -1451,7 +1259,7 @@ test('Browserbase contexts and pages use a realistic Chrome identity and stealth
   assert.equal(commands[1].method, 'Network.setUserAgentOverride');
 });
 
-test('remote sign-in cancellation is authenticated and idempotent', async (t) => {
+test('retired sign-in cancellation is authenticated and idempotent', async (t) => {
   const { baseUrl } = await startServer(t);
   const { cookie } = await register(baseUrl, 'remotecancel');
 
@@ -1471,35 +1279,108 @@ test('remote sign-in cancellation is authenticated and idempotent', async (t) =>
   assert.deepEqual(await noRun.json(), { ok: true, cancelled: false });
 });
 
-test('native service uses the platform port and retains optional Browserbase sign-in', async () => {
+test('retired interactive sign-in does not block cookie imports or interfere with automation', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-local-login-'));
+  const runGate = join(dataDir, 'automation-gate');
+  t.after(() => unlink(runGate).catch(() => {}));
+  const { baseUrl } = await startServer(t, { SESSION_TEST_RUN_GATE: runGate }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'local_login');
+  const anonymous = await fetch(`${baseUrl}/auth/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(anonymous.status, 401);
+  const retired = await fetch(`${baseUrl}/auth/x`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
+  });
+  assert.equal(retired.status, 410);
+  assert.match((await retired.json()).error, /local headless Chromium.*\/api\/auth\/import-session/);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-for-local-fixture' }),
+  })).status, 200);
+
+  await writeFile(runGate, 'pause');
+  const runBody = JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true, headless: false });
+  const running = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: runBody,
+  });
+  assert.equal(running.status, 200);
+  await until(() => stat(`${runGate}.entered`).then(() => true, () => false));
+  const cancel = await fetch(`${baseUrl}/auth/x/cancel`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
+  });
+  assert.deepEqual(await cancel.json(), { ok: true, cancelled: false });
+  const overlapping = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: runBody,
+  });
+  assert.equal(overlapping.status, 409, 'The compatibility no-op must not release the automation lock');
+  await unlink(runGate);
+  const output = await running.text();
+  assert.match(output, /"type":"batch-complete".*"succeeded":1,"failed":0/);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice', 'refreshed'))).status, 201);
+});
+
+test('desktop login helper refuses production before launching a browser or saving cookies', { timeout: 10_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-local-auth-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const child = spawn(process.execPath, ['auth.js'], {
+    cwd: ROOT,
+    env: { ...process.env, NODE_ENV: 'production', DATA_DIR: dataDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += String(chunk); });
+  child.stderr.on('data', (chunk) => { output += String(chunk); });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.equal(code, 1);
+  assert.match(output, /Manual X login requires a local desktop/);
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+});
+
+test('native service uses the platform port and delegates browser execution to main.js', async () => {
   const server = await readFile(join(ROOT, 'server.js'), 'utf8');
   assert.match(server, /process\.env\.PORT \|\| 3000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
   assert.match(server, /Server listening on port/);
 
-  const loginFlow = server.slice(
-    server.indexOf('async function runBrowserLogin'),
-    server.indexOf("app.post('/auth/x'"),
-  );
-  assert.ok(loginFlow.indexOf('createLiveInspection(page') < loginFlow.indexOf('safeGoto(page, LOGIN_URL'));
-  assert.match(loginFlow, /waitForRemoteSignIn\(page, context, signal, send\)/);
+  assert.match(server, /const args = \['main\.js', targetUrl, '--yes'\]/);
+  assert.match(server, /AUTH_FILE_PATH: AUTH_FILE/);
+  assert.doesNotMatch(server, /connectBrowser|createLiveInspection|runBrowserLogin|Browserbase/);
   assert.equal(server.includes('/auth/x/credentials'), false);
   assert.doesNotMatch(server, /HARVEST_|INTERACTIVE_LOGIN_|remote-desktop-http|desktop-browser/);
 });
 
-test('production preflight and docs describe manual imports without the retired service configuration', async () => {
-  const [checkProd, envExample, readme] = await Promise.all([
+test('production preflight and Render image require local Playwright instead of a browser-service key', async () => {
+  const [checkProd, envExample, readme, dockerfile, packageJson, browserSource] = await Promise.all([
     readFile(join(ROOT, 'scripts', 'check-prod.js'), 'utf8'),
     readFile(join(ROOT, '.env.example'), 'utf8'),
     readFile(join(ROOT, 'README.md'), 'utf8'),
+    readFile(join(ROOT, 'Dockerfile'), 'utf8'),
+    readFile(join(ROOT, 'package.json'), 'utf8'),
+    readFile(join(ROOT, 'lib', 'browser.js'), 'utf8'),
   ]);
 
-  assert.match(checkProd, /BROWSERBASE_API_KEY/);
+  assert.doesNotMatch(checkProd, /BROWSERBASE_|BROWSERLESS_/);
+  assert.doesNotMatch(envExample, /BROWSERBASE_|BROWSERLESS_/);
+  assert.doesNotMatch(browserSource, /Browserbase|browserbase|connectOverCDP/);
   assert.match(checkProd, /SESSION_SECRET/);
   assert.match(checkProd, /DATABASE_URL/);
   assert.match(envExample, /DATABASE_URL/);
   assert.match(readme, /Supabase PostgreSQL/);
   assert.match(readme, /POST \/api\/auth\/import-session/);
+  assert.match(readme, /local headless Chromium/);
+  const manifest = JSON.parse(packageJson);
+  const imageVersion = dockerfile.match(/^FROM mcr\.microsoft\.com\/playwright:v([\d.]+)-jammy$/m)?.[1];
+  assert.equal(manifest.dependencies.playwright, imageVersion, 'Pin Playwright to the container browser version');
+  assert.equal(Object.hasOwn(manifest.dependencies, '@browserbasehq/sdk'), false);
+  assert.match(dockerfile, /RUN node --input-type=module -e.*await connectBrowser\(\).*await closeBrowser\(browser\)/);
   for (const contents of [checkProd, envExample, readme]) {
     assert.doesNotMatch(contents, /HARVEST_|INTERACTIVE_LOGIN_|fly\.dev|noVNC|Xvfb/);
   }

@@ -4,10 +4,9 @@ import { stdin as input, stdout as output } from 'node:process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright';
 import {
   closeBrowser,
-  connectBrowser,
-  createLiveInspection,
   getDefaultContext,
   getOrCreatePage,
   restoreStorageState,
@@ -20,9 +19,9 @@ import {
 /**
  * Manual X (Twitter) login helper.
  *
- * Opens a Browserbase remote Chromium session on the X login page, prints the
- * live debugger URL for manual sign-in/2FA/captcha, then saves the complete
- * storage state (cookies and localStorage) to auth.json.
+ * Opens a visible local Chromium window for manual sign-in/2FA/captcha, then
+ * saves cookies and localStorage to auth.json. Container deployments use the
+ * dashboard's cookie import instead; no remote browser service is involved.
  */
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -47,8 +46,8 @@ const banner = `
 ────────────────────────────────────────────────────────────
  X login — manual sign-in
 ────────────────────────────────────────────────────────────
- 1. Browserbase opens a remote Chromium session on ${LOGIN_URL}
- 2. Open the printed Browserbase live view and log in to X
+  1. A local Chromium window opens on ${LOGIN_URL}
+  2. Log in to X in that browser window
     (password, 2FA, captcha — as prompted).
  3. When you can see your timeline, come back here and press
     ENTER to save the session to ${AUTH_FILE}.
@@ -78,12 +77,16 @@ async function waitForSessionCookie(context, timeoutMs) {
 }
 
 async function main() {
+  if (process.env.NODE_ENV === 'production' || process.env.RENDER || process.env.RENDER_EXTERNAL_URL) {
+    throw new Error('Manual X login requires a local desktop. On Render, import auth_token and ct0 through the dashboard.');
+  }
   console.log(banner);
 
   let browser = null;
-  let liveInspection = null;
   try {
-    browser = await connectBrowser();
+    // Only this desktop login helper is headed. Automation always uses the
+    // shared headless launcher, regardless of request flags or environment.
+    browser = await chromium.launch({ headless: false, args: ['--no-sandbox'] });
     const context = await getDefaultContext(browser);
     const savedState = await loadSavedState();
     const restored = await safeContextCall(
@@ -102,13 +105,6 @@ async function main() {
       );
     }
     const page = await getOrCreatePage(context);
-
-    try {
-      liveInspection = await createLiveInspection(page, { timeoutMs: 15 * 60_000 });
-      console.log(`\nBrowserbase live view (finish sign-in, 2FA, or captcha there):\n${liveInspection.liveURL}\n`);
-    } catch (error) {
-      console.warn(`Could not create a Browserbase live view: ${error.message}`);
-    }
 
     const navigation = await safeGoto(page, LOGIN_URL, {
       waitUntil: 'commit',
@@ -180,7 +176,6 @@ async function main() {
         'auth.json grants full access to your X account — keep it private and never commit it.\n',
     );
   } finally {
-    await liveInspection?.close();
     await closeBrowser(browser);
   }
 }

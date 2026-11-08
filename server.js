@@ -16,23 +16,7 @@ import {
   query,
   withTransaction,
 } from './lib/database.js';
-import {
-  closeBrowser,
-  connectBrowser,
-  createTrustedLoginProfile,
-  createLiveInspection,
-  getDefaultContext,
-  getOrCreatePage,
-  hasXSessionCookies,
-  isXHomeURL,
-  restoreStorageState,
-  safeContextCall,
-  safeGoto,
-  X_AUTH_COOKIE,
-  X_CSRF_COOKIE,
-  X_LOGIN_URL,
-  X_REFERER,
-} from './lib/browser.js';
+import { createTrustedLoginProfile, X_LOGIN_URL } from './lib/browser.js';
 
 /**
  * Local service for the X reply automation.
@@ -42,8 +26,8 @@ import {
  *   POST /api/auth/import-session -> import X cookies -> active per-user session
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
- *   POST /auth/x     -> optional Browserbase Live URL sign-in -> sessions/<userId>/<xUsername>.json
- *   POST /auth/x/cancel -> cancel the active remote sign-in and release Browserbase
+ *   POST /auth/x     -> retired interactive sign-in; directs clients to cookie import
+ *   POST /auth/x/cancel -> authenticated compatibility no-op
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
  * Binds to 0.0.0.0 by default so container platforms such as Render can reach it.
@@ -104,26 +88,10 @@ if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
 const TWEET_URL = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
-const LOGIN_URL = X_LOGIN_URL;
-const HOME_URL = 'https://x.com/home';
-const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
-const LIVE_VIEW_TIMEOUT_MS = (() => {
-  const configured = Number(process.env.BROWSERBASE_LIVE_TIMEOUT_MS ?? process.env.BROWSERLESS_LIVE_TIMEOUT_MS);
-  if (!Number.isFinite(configured) || configured < 30_000) return LOGIN_TIMEOUT_MS;
-  return Math.min(configured, LOGIN_TIMEOUT_MS);
-})();
-const POST_LOGIN_TIMEOUT_MS = 60 * 1000;
-const AUTH_RUN_TIMEOUT_MS = LOGIN_TIMEOUT_MS + POST_LOGIN_TIMEOUT_MS + 5_000;
-const LOGIN_PROFILE_CHECKPOINT_MS = 15_000;
-const RESERVED_X_ROUTES = new Set(['home', 'explore', 'notifications', 'messages', 'search', 'compose', 'settings', 'i']);
-
 const HISTORY_FILE = join(DATA_DIR, 'history.json');
 const REPLY_OUT_FILE = join(tmpdir(), 'playwright-gemini-reply.txt');
 
-/** Invalidates an in-flight sign-in before it can save a cleared session again. */
-let authGeneration = 0;
-
-/** Only one automation / sign-in run at a time; drives the 409 + the Stop button. */
+/** Only one automation / session import at a time; drives the 409 + the Stop button. */
 let activeRun = null;
 
 const app = express();
@@ -1079,60 +1047,6 @@ function trustedLoginProfilePayload(storageState) {
   };
 }
 
-async function saveTrustedLoginProfile(userId, storageState) {
-  const payload = trustedLoginProfilePayload(storageState);
-  await withWriteLock(() => writeAuthFile(payload, loginProfileFileFor(userId)));
-  return payload;
-}
-
-async function loginBootstrapStateFor(user, requestedXUsername = null) {
-  normalizeUserAccounts(user);
-
-  if (requestedXUsername && user.xAccounts.includes(requestedXUsername)) {
-    const state = await readXSession(user.id, requestedXUsername);
-    if (state) {
-      return {
-        state,
-        source: `saved session for @${requestedXUsername}`,
-      };
-    }
-  }
-
-  const profilePath = loginProfileFileFor(user.id);
-  if (await sessionFileExists(profilePath)) {
-    return {
-      state: await readAuthFile(profilePath),
-      source: 'tenant trusted-browser profile',
-    };
-  }
-
-  const activeSession = await activeSessionFor(user);
-  if (!activeSession) return null;
-  return {
-    state: createTrustedLoginProfile(activeSession.state),
-    source: `trusted device state from @${activeSession.xUsername}`,
-  };
-}
-
-async function addAccountToUser(userId, xUsername) {
-  return withWriteLock(async () => {
-    const users = await loadUserDb();
-    const user = users.find((candidate) => candidate.id === userId);
-    if (!user) throw new HttpError(401, 'User account no longer exists');
-    normalizeUserAccounts(user);
-
-    if (!user.xAccounts.includes(xUsername)) {
-      if (user.xAccounts.length >= MAX_X_ACCOUNTS) {
-        throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-      }
-      user.xAccounts.push(xUsername);
-    }
-    user.preferences.defaultXAccount ??= xUsername;
-    await saveUserDb(users);
-    return user;
-  });
-}
-
 /* --------------------------- manual X session import ---------------------- */
 
 app.post('/api/auth/import-session', async (req, res, next) => {
@@ -1757,527 +1671,27 @@ app.delete('/api/history', async (req, res, next) => {
   }
 });
 
-/* ---------------- headed browser sign-in -> per-account state ------------- */
-
-function throwIfAborted(signal) {
-  if (!signal?.aborted) return;
-  const error = new Error('Aborted');
-  error.name = 'AbortError';
-  throw error;
-}
-
-function usernameFromProfileHref(href) {
+// A headless container has no interactive viewer. Fail fast instead of reserving
+// the automation lock for a sign-in the user cannot complete.
+app.post('/auth/x', async (req, res, next) => {
   try {
-    const url = new URL(String(href ?? ''), HOME_URL);
-    const hostname = url.hostname.toLowerCase().replace(/^www\./, '');
-    if (hostname !== 'x.com') return null;
-    const match = url.pathname.match(/^\/@?([A-Za-z0-9_]{1,15})\/?$/);
-    if (!match) return null;
-    const username = normalizeXUsername(match[1]);
-    return RESERVED_X_ROUTES.has(username) ? null : username;
-  } catch {
-    return null;
-  }
-}
-
-function usernameFromSwitcherText(value) {
-  const match = String(value ?? '').match(/@([A-Za-z0-9_]{1,15})\b/);
-  return match ? normalizeXUsername(match[1]) : null;
-}
-
-async function waitForXHome(page, signal, deadline) {
-  const automaticRedirectDeadline = Math.min(deadline, Date.now() + 20_000);
-
-  while (Date.now() < automaticRedirectDeadline) {
-    throwIfAborted(signal);
-    if (isXHomeURL(page.url())) return true;
-
-    try {
-      await page.waitForURL((url) => isXHomeURL(url), {
-        waitUntil: 'domcontentloaded',
-        timeout: Math.max(1, Math.min(1_000, automaticRedirectDeadline - Date.now())),
-      });
-      return true;
-    } catch {
-      throwIfAborted(signal);
-      if (page.isClosed()) throw new Error('X login page closed before account detection completed');
-    }
-  }
-
-  throwIfAborted(signal);
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) return false;
-
-  await page
-    .goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: Math.min(20_000, remaining) })
-    .catch(() => null);
-  throwIfAborted(signal);
-  return isXHomeURL(page.url());
-}
-
-async function readSignedInUsername(page, signal) {
-  const deadline = Date.now() + POST_LOGIN_TIMEOUT_MS;
-  if (!(await waitForXHome(page, signal, deadline))) return null;
-
-  const profileLinks = page.locator('[data-testid="AppTabBar_Profile_Link"][href], a[aria-label="Profile"][href]');
-  const accountSwitchers = page.locator(
-    '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Account_Menu_Button"]',
-  );
-
-  while (Date.now() < deadline) {
-    throwIfAborted(signal);
-
-    const profileHrefs = await profileLinks
-      .evaluateAll((links) => links.map((link) => link.getAttribute('href')).filter(Boolean))
-      .catch(() => []);
-    for (const href of profileHrefs) {
-      const username = usernameFromProfileHref(href);
-      if (username) return { username, source: 'profile link' };
-    }
-
-    const switcherTexts = await accountSwitchers
-      .evaluateAll((switchers) =>
-        switchers.flatMap((switcher) => {
-          const values = [switcher.textContent, switcher.getAttribute('aria-label')];
-          for (const child of switcher.querySelectorAll('span, [dir="ltr"]')) values.push(child.textContent);
-          return values.filter(Boolean);
-        }),
-      )
-      .catch(() => []);
-    for (const text of switcherTexts) {
-      const username = usernameFromSwitcherText(text);
-      if (username) return { username, source: 'account switcher' };
-    }
-
-    await sleep(Math.min(500, Math.max(0, deadline - Date.now())));
-  }
-
-  return null;
-}
-
-async function persistSignedInBrowserSession({
-  context,
-  page,
-  user,
-  requestedXUsername = null,
-  signal,
-  generation,
-  onStatus = () => {},
-}) {
-  onStatus('Waiting for X home and account identity …');
-  const identity = await readSignedInUsername(page, signal);
-  let username = identity?.username ?? null;
-  if (identity) onStatus(`Detected @${username} from the ${identity.source}.`);
-
-  if (requestedXUsername && username && requestedXUsername !== username) {
-    throw new Error(`Signed in as @${username}, but @${requestedXUsername} was requested`);
-  }
-  username ??= requestedXUsername;
-  if (!username) throw new Error('Could not determine the signed-in X username');
-
-  const storedState = await safeContextCall(
-    context,
-    () => context.storageState(),
-    'Capturing browser session state',
-  );
-  if (!storedState.ok) throw storedState.error;
-  const storageState = storedState.value;
-  if (!hasXSessionCookies(storageState.cookies)) {
-    throw new Error(
-      `X session cookies (${X_AUTH_COOKIE}, ${X_CSRF_COOKIE}) were not both present in the saved browser state`,
-    );
-  }
-
-  const payload = {
-    ...storageState,
-    savedAt: new Date().toISOString(),
-    loginUrl: LOGIN_URL,
-    cookieCount: storageState.cookies.length,
-    username,
-  };
-  const trustedProfile = trustedLoginProfilePayload(storageState);
-
-  await withWriteLock(async () => {
-    if (signal?.aborted || generation !== authGeneration) {
-      const error = new Error('Aborted');
-      error.name = 'AbortError';
-      throw error;
-    }
-    await writeXSession(user.id, username, payload);
-    await writeAuthFile(trustedProfile, loginProfileFileFor(user.id));
-  });
-  const updatedUser = await addAccountToUser(user.id, username);
-  if (updatedUser.preferences.defaultXAccount === username) await stageActiveSession(updatedUser);
-
-  return {
-    ok: true,
-    cookieCount: storageState.cookies.length,
-    username,
-    activeXAccount: updatedUser.preferences.defaultXAccount,
-    accounts: await accountSummaries(updatedUser),
-  };
-}
-
-/**
- * Waits for the remote browser to reach X's home timeline or expose the two
- * cookies required for a reusable session. The caller saves and releases the
- * session immediately when either signal appears.
- */
-async function waitForRemoteSignIn(page, context, signal, send) {
-  const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-  let readyAnnounced = false;
-
-  while (Date.now() < deadline) {
-    throwIfAborted(signal);
-
-    const cookieResult = await safeContextCall(context, () => context.cookies(), 'Reading login cookies');
-    if (!cookieResult.ok) {
-      throwIfAborted(signal);
-      return { loggedIn: false, error: cookieResult.error };
-    }
-
-    const cookiesReady = hasXSessionCookies(cookieResult.value);
-    let currentUrl = '';
-    try {
-      currentUrl = page?.url?.() ?? '';
-    } catch {
-      // The page can close while the remote viewer is being reused.
-    }
-    const homeReady = isXHomeURL(currentUrl);
-
-    if (cookiesReady || homeReady) {
-      if (!readyAnnounced) {
-        readyAnnounced = true;
-        send({
-          type: 'status',
-          stage: 'signed-in',
-          data: cookiesReady
-            ? 'X session cookies detected — saving the account automatically…'
-            : 'X home timeline detected — saving the account automatically…',
-        });
-      }
-      return { loggedIn: true, error: null };
-    }
-
-    await sleep(1_000);
-  }
-
-  throwIfAborted(signal);
-  return { loggedIn: false, error: null, timedOut: true };
-}
-
-/**
- * Connects to Browserbase, reuses its default context, waits for the user to
- * finish logging in, then saves Playwright storage state for that user/X account.
- */
-async function runBrowserLogin({
-  send,
-  signal,
-  generation,
-  user,
-  requestedXUsername = null,
-  onBrowserConnected = null,
-}) {
-  send({
-    type: 'start',
-    command: `browser sign-in -> ${LOGIN_URL} (Browserbase remote Chromium)`,
-  });
-
-  let browser = null;
-  let context = null;
-  let liveInspection = null;
-  let profileCheckpointTimer = null;
-  let profileCheckpointPromise = null;
-  const checkpointTrustedProfile = () => {
-    if (!context || signal?.aborted) return Promise.resolve(false);
-    if (profileCheckpointPromise) return profileCheckpointPromise;
-
-    profileCheckpointPromise = (async () => {
-      const state = await safeContextCall(
-        context,
-        () => context.storageState(),
-        'Capturing the tenant trusted-browser profile',
-      );
-      if (!state.ok) return false;
-      await saveTrustedLoginProfile(user.id, state.value);
-      return true;
-    })()
-      .catch((error) => {
-        console.warn(`[browser] Could not checkpoint the trusted login profile: ${error.message}`);
-        return false;
-      })
-      .finally(() => {
-        profileCheckpointPromise = null;
-      });
-    return profileCheckpointPromise;
-  };
-  const closeBrowserOnAbort = () => {
-    void closeBrowser(browser);
-  };
-  signal?.addEventListener('abort', closeBrowserOnAbort, { once: true });
-
-  try {
-    browser = await connectBrowser();
-    onBrowserConnected?.(browser);
-    throwIfAborted(signal);
-
-    context = await getDefaultContext(browser);
-    const bootstrap = await loginBootstrapStateFor(user, requestedXUsername);
-    const restored = await safeContextCall(
-      context,
-      () => restoreStorageState(context, bootstrap?.state, { clearCookies: true }),
-      'Restoring the tenant browser profile',
-    );
-    if (!restored.ok) {
-      send({ type: 'stderr', data: `${restored.error.message}. Aborting sign-in.` });
-      return { ok: false };
-    }
-    if (bootstrap) {
-      send({
-        type: 'status',
-        stage: 'profile-restored',
-        data: `Reused ${bootstrap.source} (${restored.value.cookieCount} cookies, ${restored.value.localStorageCount} local-storage entries).`,
-      });
-    }
-    const page = await getOrCreatePage(context);
-
-    // Mint and stream the viewer URL before X navigation so the client can
-    // launch a native tab immediately while this same remote page loads.
-    try {
-      liveInspection = await createLiveInspection(page, {
-        timeoutMs: LIVE_VIEW_TIMEOUT_MS,
-        onViewerConnected: () => {
-          send({
-            type: 'status',
-            stage: 'viewer-connected',
-            data: 'Remote sign-in window connected. Finish signing in to X there.',
-          });
-        },
-        onComplete: ({ reason } = {}) => {
-          if (reason === 'timeout') {
-            send({
-              type: 'status',
-              stage: 'live-expired',
-              data: 'The remote sign-in link expired. Cancel and start a new sign-in if you still need it.',
-            });
-          } else if (reason === 'viewerDisconnected') {
-            send({
-              type: 'status',
-              stage: 'viewer-disconnected',
-              data: 'Remote viewer disconnected. Sign-in will still be saved automatically when X reaches the home timeline.',
-            });
-          } else if (reason === 'closed') {
-            send({
-              type: 'status',
-              stage: 'live-closed',
-              data: 'The remote sign-in link closed. The browser is still waiting for X to finish signing in.',
-            });
-          }
-        },
-      });
-
-      send({
-        type: 'live',
-        status: 'ready',
-        url: liveInspection.liveURL,
-        expiresAt: new Date(liveInspection.expiresAt).toISOString(),
-      });
-      send({
-        type: 'stdout',
-        data: 'Remote sign-in window ready. Finish signing in there; the session saves automatically.',
-      });
-    } catch (error) {
-      send({ type: 'live', status: 'error', message: error.message });
-      send({
-        type: 'stderr',
-        data: `${error.message}. If you can open the Browserbase dashboard, finish there; the session saves automatically.`,
-      });
-    }
-
-    send({ type: 'stdout', data: `Opening ${LOGIN_URL} …` });
-    const navigation = await safeGoto(page, LOGIN_URL, {
-      waitUntil: 'commit',
-      timeout: 45_000,
-      referer: X_REFERER,
+    await authenticatedUser(req);
+    if (activeRun) throw new HttpError(409, 'A run is already in progress');
+    return res.status(410).json({
+      error: 'Interactive X sign-in is unavailable with local headless Chromium. Import auth_token and ct0 through /api/auth/import-session.',
     });
-    if (navigation.error) {
-      send({
-        type: 'stderr',
-        data: `Navigation warning: ${navigation.error.message}. Continuing to wait for sign-in …`,
-      });
-    } else if (navigation.response && navigation.response.status() >= 400) {
-      send({
-        type: 'stderr',
-        data: `X returned HTTP ${navigation.response.status()} on the login page; continuing to wait for sign-in …`,
-      });
-    }
-
-    void checkpointTrustedProfile();
-    profileCheckpointTimer = setInterval(() => void checkpointTrustedProfile(), LOGIN_PROFILE_CHECKPOINT_MS);
-    profileCheckpointTimer.unref?.();
-
-    send({ type: 'stdout', data: 'Waiting for X sign-in to finish in the remote window …' });
-
-    const login = await waitForRemoteSignIn(page, context, signal, send);
-    if (login.error) {
-      send({
-        type: 'stderr',
-        data: `${login.error.message}. The browser session closed before sign-in completed; nothing was saved.`,
-      });
-      return { ok: false };
-    }
-    if (!login.loggedIn) {
-      send({
-        type: 'stderr',
-        data: login.timedOut
-          ? 'X sign-in timed out before the home timeline or session cookies appeared — nothing was saved.'
-          : 'X sign-in was not verified — the session was not saved.',
-      });
-      return { ok: false };
-    }
-
-    await liveInspection?.close();
-    liveInspection = null;
-    const result = await persistSignedInBrowserSession({
-      context,
-      page,
-      user,
-      requestedXUsername,
-      signal,
-      generation,
-      onStatus: (message) => send({ type: 'stdout', data: message }),
-    });
-
-    send({
-      type: 'stdout',
-      data: `Saved ${result.cookieCount} cookies for @${result.username} (session valid).\n`,
-    });
-
-    return result;
-  } finally {
-    clearInterval(profileCheckpointTimer);
-    if (!signal?.aborted) await checkpointTrustedProfile();
-    signal?.removeEventListener('abort', closeBrowserOnAbort);
-    await liveInspection?.close();
-    await closeBrowser(browser);
-  }
-}
-
-app.post('/auth/x', async (req, res) => {
-  let auth;
-  let requestedXUsername = null;
-  try {
-    auth = await authenticatedUser(req);
-    normalizeUserAccounts(auth.user);
-    if (req.body?.xUsername) requestedXUsername = normalizeXUsername(req.body.xUsername);
-    if (
-      auth.user.xAccounts.length >= MAX_X_ACCOUNTS &&
-      (!requestedXUsername || !auth.user.xAccounts.includes(requestedXUsername))
-    ) {
-      throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
-    }
   } catch (error) {
-    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not start X sign-in' });
-  }
-
-  if (activeRun) {
-    return res.status(409).json({ error: 'A run is already in progress' });
-  }
-
-  res.writeHead(200, {
-    'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store',
-    'x-accel-buffering': 'no',
-  });
-  res.flushHeaders?.();
-
-  const send = makeSend(res);
-  const controller = new AbortController();
-  const generation = authGeneration;
-  const completion = createCompletionSignal();
-  let abortRequested = false;
-  const handle = {
-    type: 'x-auth',
-    userId: auth.user.id,
-    xUsername: requestedXUsername,
-    done: completion.promise,
-    browser: null,
-    abort() {
-      if (abortRequested) return;
-      abortRequested = true;
-      authGeneration += 1;
-      controller.abort();
-    },
-  };
-  activeRun = handle;
-
-  const timer = setTimeout(() => {
-    send({ type: 'stderr', data: `[server] sign-in exceeded ${Math.ceil(AUTH_RUN_TIMEOUT_MS / 60_000)} minutes - stopping it.` });
-    handle.abort();
-  }, AUTH_RUN_TIMEOUT_MS);
-
-  attachRunCleanup(res, handle);
-
-  try {
-    const result = await runBrowserLogin({
-      send,
-      signal: controller.signal,
-      generation,
-      user: auth.user,
-      requestedXUsername,
-      onBrowserConnected: (connectedBrowser) => {
-        handle.browser = connectedBrowser;
-      },
-    });
-    send({ type: 'exit', code: result.ok ? 0 : 1, result });
-    return res.end();
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      send({ type: 'exit', code: 130, result: { aborted: true } });
-      return res.end();
-    }
-    send({ type: 'stderr', data: `\nFailed: ${error.message}` });
-    send({ type: 'exit', code: 1, result: { ok: false, error: error.message } });
-    return res.end();
-  } finally {
-    clearTimeout(timer);
-    if (activeRun === handle) activeRun = null;
-    completion.resolve();
+    next(error);
   }
 });
 
-app.post('/auth/x/cancel', async (req, res) => {
-  let auth;
+app.post('/auth/x/cancel', async (req, res, next) => {
   try {
-    auth = await authenticatedUser(req);
-  } catch (error) {
-    return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not cancel X sign-in' });
-  }
-
-  const handle = activeRun;
-  if (!handle || handle.type !== 'x-auth') {
+    await authenticatedUser(req);
     return res.json({ ok: true, cancelled: false });
+  } catch (error) {
+    next(error);
   }
-  if (handle.userId !== auth.user.id) {
-    return res.status(403).json({ error: 'This X sign-in belongs to another session' });
-  }
-
-  // Release the lock before cleanup so a new sign-in can start immediately.
-  activeRun = null;
-  handle.abort();
-  if (handle.browser) void closeBrowser(handle.browser);
-
-  let timer;
-  const closed = await Promise.race([
-    handle.done.then(() => true),
-    new Promise((resolve) => {
-      timer = setTimeout(() => resolve(false), 5_000);
-      timer.unref?.();
-    }),
-  ]);
-  clearTimeout(timer);
-
-  return res.json({ ok: true, cancelled: true, closed });
 });
 
 app.post('/api/run', async (req, res) => {
@@ -2701,7 +2115,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
   console.log(`  DELETE ${HOST}:${PORT}/api/history`);
-  console.log(`  POST ${HOST}:${PORT}/auth/x      (interactive Browserbase sign-in -> per-user session file)`);
+  console.log(`  POST ${HOST}:${PORT}/auth/x      (retired; use /api/auth/import-session)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
 
