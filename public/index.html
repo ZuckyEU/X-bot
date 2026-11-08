@@ -178,6 +178,39 @@
       .account-chip .profile-line { color: var(--muted); font-size: 12px; margin-top: 2px; }
       .account-chip .chevron { color: var(--muted); font-size: 11px; transition: transform 0.15s ease; }
       .account-chip[aria-expanded="true"] .chevron { transform: rotate(180deg); }
+      .account-chip.expired { border-color: rgba(248, 113, 113, 0.55); }
+      .account-chip .state.err { color: var(--err); }
+
+      /* --------------------------- X session health ----------------------- */
+      .session-warning {
+        width: 100%;
+        max-width: 1240px;
+        margin: 0 auto 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 12px 14px;
+        border: 1px solid rgba(248, 113, 113, 0.5);
+        border-radius: 8px;
+        background: linear-gradient(180deg, rgba(64, 20, 26, 0.92), rgba(32, 12, 16, 0.94));
+        box-shadow: 0 12px 34px rgba(0, 0, 0, 0.32);
+      }
+      .session-warning-icon {
+        display: grid;
+        place-items: center;
+        flex: 0 0 auto;
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        background: rgba(248, 113, 113, 0.18);
+        color: var(--err);
+        font-weight: 800;
+      }
+      .session-warning-text { display: grid; gap: 2px; flex: 1 1 320px; min-width: 0; }
+      .session-warning-text strong { color: #ffd8db; font-size: 13px; letter-spacing: 0.01em; }
+      .session-warning-text span { color: var(--text-soft); font-size: 12px; }
+      .session-warning button { flex: 0 0 auto; }
       .account-wrap { position: relative; z-index: 101; display: inline-block; }
       .account-dropdown { position: absolute; isolation: isolate; overflow: hidden; right: 0; top: calc(100% + 8px); width: 324px; max-width: calc(100vw - 32px); border: 1px solid var(--border-strong); border-radius: 8px; background: #111827; background-color: #111827; padding: 8px; box-shadow: 0 28px 72px rgba(0, 0, 0, 0.78), 0 0 0 1px rgba(255, 255, 255, 0.025); z-index: 9999; }
       .account-dropdown-head { padding: 6px 7px 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.11em; color: var(--muted); }
@@ -399,6 +432,8 @@
         #session-import-modal { padding: 8px; }
         .session-import { max-height: calc(100vh - 16px); padding: 16px; }
         .session-import-actions button { flex: 1 1 150px; }
+        .session-warning { padding: 11px; }
+        .session-warning button { width: 100%; }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -455,7 +490,7 @@
         <div class="session-import-head">
           <div>
             <h2 id="session-import-title">Import X session</h2>
-            <p>Connect an account using cookies from your signed-in browser.</p>
+            <p id="session-import-subtitle">Connect an account using cookies from your signed-in browser.</p>
           </div>
           <button id="session-import-close" class="ghost" type="button" aria-label="Close session import">Close</button>
         </div>
@@ -469,7 +504,7 @@
             <li>Open Developer Tools → Application (or Storage) → Cookies → <strong>https://x.com</strong>.</li>
             <li>Copy the <strong>Value</strong> of <code>auth_token</code> and <code>ct0</code>. Paste only the values below, not a full cookie header.</li>
           </ol>
-          <p>Both cookies must come from the same account. Imports do not check validity with X; expired or revoked cookies need to be replaced.</p>
+          <p>Both cookies must come from the same account. The cookies are checked with X before they are saved, so expired or revoked values are rejected.</p>
         </details>
         <form id="session-import-form" autocomplete="off">
           <div class="auth-field">
@@ -530,6 +565,15 @@
         <button id="signin" class="ghost hidden" type="button">Sign In</button>
       </nav>
     </header>
+
+    <div id="x-session-warning" class="session-warning hidden" role="alert" aria-live="assertive">
+      <span class="session-warning-icon" aria-hidden="true">!</span>
+      <span class="session-warning-text">
+        <strong>X Connection Expired — Reconnection Needed</strong>
+        <span id="x-session-warning-detail">Publishing is paused until you update the account cookies.</span>
+      </span>
+      <button id="x-session-reconnect" class="primary" type="button">Re-authenticate Account</button>
+    </div>
 
     <main>
       <section class="panel" id="panel-ai">
@@ -644,6 +688,9 @@
       let currentUserEmail = '';
       let linkedXAccounts = [];
       let activeXAccount = null;
+      let xSessionStatus = 'none';
+      let xSessionCheckedAt = null;
+      let sessionImportReauthenticate = false;
       let groqConfigured = false;
       let authStateGeneration = 0;
       let elapsedInterval = null;
@@ -803,23 +850,82 @@
         for (const id of ['session-handle', 'session-auth-token', 'session-ct0', 'session-import-submit']) {
           $(id).disabled = busy;
         }
-        $('session-import-submit').textContent = busy ? 'Importing…' : 'Import & activate account';
+        $('session-import-submit').textContent = busy
+          ? 'Importing…'
+          : sessionImportReauthenticate ? 'Re-authenticate account' : 'Import & activate account';
         $('add-x-account').disabled = busy || Boolean(controller);
-        $('run').disabled = busy || Boolean(controller);
+        $('run').disabled = busy || Boolean(controller) || sessionBlocksPublishing();
         $('dry-run-btn').disabled = busy || Boolean(controller);
       }
 
-      function openSessionImport() {
+      function sessionBlocksPublishing() {
+        return xSessionStatus === 'invalid' && Boolean(activeXAccount);
+      }
+
+      function renderXSessionStatus() {
+        const expired = sessionBlocksPublishing();
+        $('x-session-warning').classList.toggle('hidden', !expired);
+        $('account-chip').classList.toggle('expired', expired);
+
+        const label = $('active-account-label');
+        if (!activeXAccount) {
+          label.textContent = 'No X account selected';
+          label.className = 'state';
+        } else if (expired) {
+          label.textContent = 'X session expired';
+          label.className = 'state err';
+        } else if (xSessionStatus === 'valid') {
+          label.textContent = 'X connection verified';
+          label.className = 'state ok';
+        } else {
+          label.textContent = 'Active X account';
+          label.className = 'state';
+        }
+        if (expired) {
+          $('x-session-warning-detail').textContent =
+            `Publishing for @${activeXAccount} is paused until you update its cookies.`;
+        }
+        $('active-account-label').title = xSessionCheckedAt
+          ? `Connection checked ${new Date(xSessionCheckedAt).toLocaleString()}`
+          : '';
+        if (!controller && !sessionImportRequest) $('run').disabled = expired;
+      }
+
+      function applyXSessionHealth(data) {
+        const status = data?.xSessionStatus
+          ?? (data?.xSessionValid === true ? 'valid' : data?.xSessionValid === false ? 'invalid' : 'unknown');
+        xSessionStatus = ['valid', 'invalid', 'unknown', 'none'].includes(status) ? status : 'unknown';
+        xSessionCheckedAt = data?.xSessionCheckedAt ?? null;
+        renderXSessionStatus();
+      }
+
+      function openReauthentication() {
+        if (!currentAppUsername) return showAuthOverlay();
+        if (!activeXAccount) return openSessionImport();
+        closeAccountMenu();
+        openSessionImport({ reauthenticate: true });
+      }
+
+      function openSessionImport({ reauthenticate = false } = {}) {
         if (!currentAppUsername) return showAuthOverlay();
         if (controller || sessionImportRequest) return;
-        sessionImportReturnFocus = $('account-chip');
+        sessionImportReturnFocus = reauthenticate ? $('x-session-reconnect') : $('account-chip');
         $('session-import-form').reset();
+        sessionImportReauthenticate = Boolean(reauthenticate && activeXAccount);
+        $('session-import-title').textContent = sessionImportReauthenticate
+          ? 'Re-authenticate X account'
+          : 'Import X session';
+        $('session-import-subtitle').textContent = sessionImportReauthenticate
+          ? `Update the cookies for @${activeXAccount} to restore publishing.`
+          : 'Connect an account using cookies from your signed-in browser.';
+        $('session-handle').readOnly = sessionImportReauthenticate;
+        if (sessionImportReauthenticate) $('session-handle').value = activeXAccount;
         $('session-import-error').textContent = '';
         setSessionImportBusy(false);
         $('session-import-modal').classList.remove('hidden');
         $('session-import-modal').setAttribute('aria-hidden', 'false');
         document.body.classList.add('import-open');
-        $('session-handle').focus();
+        (sessionImportReauthenticate ? $('session-auth-token') : $('session-handle')).focus();
       }
 
       function closeSessionImport({ restoreFocus = true } = {}) {
@@ -829,6 +935,10 @@
         $('session-import-modal').setAttribute('aria-hidden', 'true');
         document.body.classList.remove('import-open');
         $('session-import-form').reset();
+        sessionImportReauthenticate = false;
+        $('session-handle').readOnly = false;
+        $('session-import-title').textContent = 'Import X session';
+        $('session-import-subtitle').textContent = 'Connect an account using cookies from your signed-in browser.';
         $('session-import-error').textContent = '';
         setSessionImportBusy(false);
         if (restoreFocus) sessionImportReturnFocus?.focus();
@@ -897,6 +1007,7 @@
               displayActiveXAccount(selectedAccount);
               await loadLinkedAccounts();
             }
+            applyXSessionHealth(data);
           }
           await loadGroqConfiguration();
           await loadHistory();
@@ -921,7 +1032,7 @@
         $('avatar').textContent = username
           ? username.charAt(0).toUpperCase()
           : currentAppUsername?.charAt(0).toUpperCase() || '?';
-        $('active-account-label').textContent = username ? 'Active X account' : 'No X account selected';
+        renderXSessionStatus();
       }
 
       function normalizeLinkedAccount(account) {
@@ -1031,6 +1142,7 @@
           if (!response.ok) throw new Error(data.error ?? 'Failed to switch account');
 
           applyLinkedAccounts(data.accounts ?? linkedXAccounts, data.activeXAccount ?? xUsername);
+          applyXSessionHealth(data);
           closeAccountMenu();
         } catch (error) {
           if (generation !== authStateGeneration) return;
@@ -1061,6 +1173,7 @@
             ? data.activeXAccount
             : nextActive;
           applyLinkedAccounts(data.accounts ?? remainingAccounts, serverActive);
+          applyXSessionHealth(data);
           setText('auth-msg', `Unlinked @${xUsername}.`, 'ok');
         } catch (error) {
           if (generation !== authStateGeneration) return;
@@ -1108,10 +1221,20 @@
             return;
           }
           if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          const reauthenticated = sessionImportReauthenticate;
           applyLinkedAccounts(data.accounts, data.activeXAccount);
+          applyXSessionHealth(data);
           closeSessionImport();
-          setText('auth-msg', `Imported session for @${data.username}.`, 'ok');
-          setStatus('Session imported', 'ok', 'The account is active. X will check the cookies when the bot runs.');
+          setText('auth-msg', reauthenticated
+            ? `Re-authenticated @${data.username}.`
+            : `Imported session for @${data.username}.`, 'ok');
+          setStatus(
+            data.xSessionValid === true ? 'X connection verified' : 'Session imported',
+            'ok',
+            data.xSessionValid === true
+              ? 'X confirmed the connection is active.'
+              : 'X could not be reached; the connection will be checked again before publishing.',
+          );
         } catch (error) {
           if (generation !== authStateGeneration || sessionImportRequest !== request) return;
           if (error.name !== 'AbortError') {
@@ -1144,6 +1267,9 @@
         currentAppUsername = null;
         currentUserEmail = '';
         activeXAccount = null;
+        xSessionStatus = 'none';
+        xSessionCheckedAt = null;
+        sessionImportReauthenticate = false;
 
         localStorage.removeItem('x-engine-session-token');
         clearTargetUrls({ clearFile: true, focus: false });
@@ -1155,6 +1281,9 @@
         $('who').textContent = 'Not connected';
         $('avatar').textContent = '?';
         $('active-account-label').textContent = 'No X account selected';
+        $('active-account-label').className = 'state';
+        $('account-chip').classList.remove('expired');
+        $('x-session-warning').classList.add('hidden');
         $('menu-username').textContent = 'Not connected';
         $('menu-user-email').textContent = '';
         $('linked-accounts-list').replaceChildren();
@@ -1198,6 +1327,7 @@
           displayActiveXAccount(selectedAccount);
           loadLinkedAccounts();
         }
+        applyXSessionHealth(data);
         $('signin').classList.add('hidden');
         $('account-chip').classList.remove('hidden');
         closeAccountMenu();
@@ -1233,6 +1363,7 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
+        $('x-session-reconnect').addEventListener('click', openReauthentication);
         $('session-import-form').addEventListener('submit', importSession);
         $('session-import-close').addEventListener('click', () => closeSessionImport());
         window.addEventListener('pagehide', () => closeSessionImport({ restoreFocus: false }));
@@ -1394,7 +1525,7 @@
       }
 
       function setRunning(running) {
-        $('run').disabled = running;
+        $('run').disabled = running || sessionBlocksPublishing();
         $('dry-run-btn').disabled = running;
         $('run-url').disabled = running;
         $('file-upload').disabled = running;
@@ -1513,6 +1644,16 @@
 
       async function startRun(dryRun) {
         if (controller || sessionImportRequest) return;
+        if (!dryRun && sessionBlocksPublishing()) {
+          setStatus(
+            'Reconnection needed',
+            'err',
+            `The X session for @${activeXAccount} expired. Re-authenticate the account before publishing.`,
+          );
+          setText('auth-msg', 'X connection expired. Re-authenticate the account before publishing.', 'err');
+          $('x-session-reconnect').focus();
+          return;
+        }
         const generation = authStateGeneration;
         syncTargetUrlsFromInput();
         const urls = [...targetUrls];
@@ -1559,7 +1700,9 @@
 
           if (!response.ok) {
             const data = await response.json().catch(() => ({}));
-            throw new Error(data.error ?? `HTTP ${response.status}`);
+            const error = new Error(data.error ?? `HTTP ${response.status}`);
+            error.code = data.code;
+            throw error;
           }
 
           const reader = response.body.getReader();
@@ -1592,6 +1735,12 @@
           if (error.name === 'AbortError') {
             setStatus('Stopped', 'warn', 'Stopped by user.');
             setInspectorStats('Stopped', 'Stopped by user.');
+          } else if (error.code === 'X_SESSION_EXPIRED') {
+            applyXSessionHealth({ xSessionStatus: 'invalid' });
+            setStatus('Reconnection needed', 'err', error.message);
+            setInspectorStats('Reconnection needed', error.message);
+            setText('auth-msg', 'X connection expired. Re-authenticate the account before publishing.', 'err');
+            $('x-session-reconnect').focus();
           } else {
             setStatus('Run failed', 'err', error.message);
             setInspectorStats('Run failed', error.message);

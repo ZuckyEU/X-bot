@@ -16,7 +16,7 @@ import {
   query,
   withTransaction,
 } from './lib/database.js';
-import { createTrustedLoginProfile, X_LOGIN_URL } from './lib/browser.js';
+import { CHROME_USER_AGENT, createTrustedLoginProfile, X_LOGIN_URL } from './lib/browser.js';
 
 /**
  * Local service for the X reply automation.
@@ -50,6 +50,7 @@ const DEFAULT_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || '');
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const IS_TEST = process.env.NODE_ENV === 'test';
 const MAX_BODY = '16kb';
 
 /** Only these cookies can be written through the API. */
@@ -87,6 +88,31 @@ if (!IS_PRODUCTION && !process.env.SESSION_SECRET) {
 /** Same shape main.js accepts; keeps anything else out of argv. */
 const TWEET_URL = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
+
+function envInteger(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(Math.trunc(value), min), max);
+}
+
+/**
+ * The dashboard health check uses X's authenticated settings endpoint. It is a
+ * cheap HTTP request (no browser) and distinguishes rejected cookies from
+ * transient X/network failures so an outage never marks a session expired.
+ */
+const X_SESSION_CHECK_URL = String(
+  process.env.X_SESSION_CHECK_URL || 'https://x.com/i/api/1.1/account/settings.json',
+).trim();
+const X_SESSION_CHECK_TIMEOUT_MS = envInteger('X_SESSION_CHECK_TIMEOUT_MS', 3_500, 500, 15_000);
+const X_SESSION_CHECK_CACHE_MS = envInteger('X_SESSION_CHECK_CACHE_MS', 60_000, 0, 15 * 60_000);
+const X_SESSION_CHECK_DISABLED = process.env.X_SESSION_CHECK_DISABLED === '1'
+  || (IS_TEST && !process.env.X_SESSION_CHECK_URL);
+// Public web-app bearer used by x.com itself; overridable in case X rotates it.
+const X_WEB_BEARER = String(
+  process.env.X_SESSION_CHECK_BEARER
+    || 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
+).trim();
+const X_SESSION_INVALID_ERROR_CODES = new Set([32, 89, 239, 326, 353]);
 
 const HISTORY_FILE = join(DATA_DIR, 'history.json');
 const REPLY_OUT_FILE = join(tmpdir(), 'playwright-gemini-reply.txt');
@@ -998,6 +1024,139 @@ function xSessionCredentials(storageState) {
   return { auth_token: valueFor('auth_token'), ct0: valueFor('ct0') };
 }
 
+/** Rebuild a minimal storage state from the credentials exposed by hydration. */
+function credentialsStorageState(credentials) {
+  return {
+    cookies: Object.entries(COOKIE_SPEC).map(([name, spec]) => ({
+      name,
+      value: credentials?.[name] ?? '',
+      domain: '.x.com',
+      path: '/',
+      secure: true,
+      httpOnly: spec.httpOnly,
+      sameSite: 'Lax',
+    })),
+    origins: [],
+  };
+}
+
+function xSessionErrorCode(payload) {
+  const code = payload?.errors?.[0]?.code ?? payload?.error?.code ?? payload?.code;
+  return Number.isFinite(Number(code)) ? Number(code) : null;
+}
+
+function xSessionHealth(status, checkedAt = new Date().toISOString()) {
+  return {
+    xSessionValid: status === 'valid' ? true : status === 'invalid' ? false : null,
+    xSessionStatus: status,
+    xSessionCheckedAt: checkedAt,
+  };
+}
+
+/**
+ * Ask X whether the saved cookies still represent a signed-in account.
+ * Returns `valid`, `invalid` (X rejected the cookies), or `unknown` (timeout,
+ * network error, rate limit, or an ambiguous response). Unknown is deliberately
+ * non-blocking so a temporary X outage does not look like an expired session.
+ */
+async function verifyXSession(storageState, { timeoutMs = X_SESSION_CHECK_TIMEOUT_MS, url = X_SESSION_CHECK_URL } = {}) {
+  const credentials = xSessionCredentials(storageState);
+  if (!credentials.auth_token || !credentials.ct0) return { status: 'invalid', reason: 'missing-cookies' };
+  if (X_SESSION_CHECK_DISABLED) return { status: 'unknown', reason: 'disabled' };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json, text/plain, */*',
+        authorization: `Bearer ${X_WEB_BEARER}`,
+        cookie: `auth_token=${credentials.auth_token}; ct0=${credentials.ct0}`,
+        'user-agent': CHROME_USER_AGENT,
+        'x-csrf-token': credentials.ct0,
+        'x-twitter-active-user': 'yes',
+        'x-twitter-auth-type': 'OAuth2Session',
+      },
+    });
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      // Responses such as Cloudflare challenges are not JSON.
+    }
+    const errorCode = xSessionErrorCode(payload);
+
+    if (response.status === 401 || (errorCode !== null && X_SESSION_INVALID_ERROR_CODES.has(errorCode))) {
+      return { status: 'invalid', httpStatus: response.status, errorCode };
+    }
+    if (response.ok) {
+      // A 200 response that still carries an X error payload is ambiguous.
+      if (errorCode !== null) return { status: 'unknown', httpStatus: response.status, errorCode };
+      return { status: 'valid', httpStatus: response.status };
+    }
+    return { status: 'unknown', httpStatus: response.status, errorCode };
+  } catch (error) {
+    return {
+      status: 'unknown',
+      reason: error?.name === 'AbortError' ? 'timeout' : 'network',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const xSessionHealthCache = new Map();
+const xSessionHealthInflight = new Map();
+
+/** Cached/single-flight wrapper so dashboard refreshes do not hammer X. */
+async function checkXSessionHealth(storageState, { handle = null, force = false } = {}) {
+  const credentials = xSessionCredentials(storageState);
+  if (!credentials.auth_token || !credentials.ct0) return xSessionHealth('invalid');
+
+  const key = crypto
+    .createHash('sha256')
+    .update(`${credentials.auth_token}\0${credentials.ct0}`)
+    .digest('hex');
+  const cached = xSessionHealthCache.get(key);
+  if (!force && cached && cached.expiresAt > Date.now()) return cached.result;
+  if (!force && xSessionHealthInflight.has(key)) return xSessionHealthInflight.get(key);
+
+  const pending = (async () => {
+    const outcome = await verifyXSession(storageState);
+    const result = xSessionHealth(outcome.status);
+    if (X_SESSION_CHECK_CACHE_MS > 0) {
+      if (xSessionHealthCache.size > 512) xSessionHealthCache.clear();
+      xSessionHealthCache.set(key, { expiresAt: Date.now() + X_SESSION_CHECK_CACHE_MS, result });
+    }
+    if (outcome.status !== 'valid') {
+      const account = handle ? `@${handle}` : 'the active X account';
+      const reason = outcome.reason ?? (outcome.httpStatus ? `HTTP ${outcome.httpStatus}` : 'no response');
+      console.warn(`[x-session] Health check for ${account} is ${outcome.status} (${reason}).`);
+    }
+    return result;
+  })().finally(() => xSessionHealthInflight.delete(key));
+
+  xSessionHealthInflight.set(key, pending);
+  return pending;
+}
+
+/** Health for the hydrated active session, including "no account" and missing-cookie states. */
+async function activeXSessionHealth(active, user, { force = false } = {}) {
+  if (active?.xSession) {
+    return checkXSessionHealth(credentialsStorageState(active.xSession), {
+      handle: active.xSession.handle,
+      force,
+    });
+  }
+  const account = active?.activeXAccount ?? user?.preferences?.defaultXAccount ?? null;
+  return xSessionHealth(account ? 'invalid' : 'none');
+}
+
 /**
  * Resolve the user's saved X account, optionally restage auth.json, and return
  * the credentials for the authenticated dashboard. PostgreSQL remains the
@@ -1077,6 +1236,14 @@ app.post('/api/auth/import-session', async (req, res, next) => {
       throw new HttpError(409, 'A run is already in progress');
     }
 
+    // Validate before writing anything. Rejected cookies should keep the
+    // previous session intact and return the user to the re-authentication
+    // dialog with a clear message; transient X failures are allowed through.
+    const health = await checkXSessionHealth(storageState, { handle: username });
+    if (health.xSessionValid === false) {
+      throw new HttpError(422, 'X rejected these cookies. Sign in to X again and copy fresh auth_token and ct0 values.');
+    }
+
     const result = await withWriteLock(async () => {
       const users = await loadUserDb();
       const current = users.find((user) => user.id === auth.user.id && user.sessionToken === auth.token);
@@ -1101,7 +1268,9 @@ app.post('/api/auth/import-session', async (req, res, next) => {
       activeRun = handle;
       attachRunCleanup(res, handle);
       const assertOpen = () => {
-        if (request.signal.aborted || res.destroyed) throw new HttpError(410, 'Session import was cancelled');
+        if (request.signal.aborted || res.destroyed || req.aborted || req.socket?.destroyed) {
+          throw new HttpError(410, 'Session import was cancelled');
+        }
       };
       const previousUsers = structuredClone(users);
       let previousSession;
@@ -1147,7 +1316,7 @@ app.post('/api/auth/import-session', async (req, res, next) => {
         completion.resolve();
       }
     });
-    res.status(201).json({ ok: true, authenticated: true, cookieCount: storageState.cookieCount, ...result });
+    res.status(201).json({ ok: true, authenticated: true, cookieCount: storageState.cookieCount, ...result, ...health });
   } catch (error) {
     // Storage/parser errors can contain snippets of existing session files.
     // Keep those details out of both the response and the shared error logger.
@@ -1337,11 +1506,13 @@ app.post('/api/auth/login', async (req, res, next) => {
     await stopActiveRunForUser(user.id, { type: 'x-auth' });
     setSessionCookie(res, user.sessionToken);
     const active = await hydrateUserXSession(user, { sessionToken: user.sessionToken });
+    const health = await activeXSessionHealth(active, user);
     return res.json({
       user: publicUser(user),
       activeXAccount: active?.activeXAccount ?? user.preferences.defaultXAccount ?? null,
       xAccounts: user.xAccounts,
       accounts: await accountSummaries(user),
+      ...health,
     });
   } catch (error) {
     next(error);
@@ -1357,6 +1528,9 @@ app.get('/api/auth/me', async (req, res, next) => {
     activeXAccount: null,
     xAccounts: [],
     accounts: [],
+    xSessionValid: null,
+    xSessionStatus: 'none',
+    xSessionCheckedAt: null,
   };
 
   try {
@@ -1374,6 +1548,7 @@ app.get('/api/auth/me', async (req, res, next) => {
 
     normalizeUserAccounts(auth.user);
     const active = await hydrateUserXSession(auth.user, { sessionToken: auth.token });
+    const health = await activeXSessionHealth(active, auth.user);
     return res.json({
       authenticated: true,
       userAuthenticated: true,
@@ -1383,6 +1558,7 @@ app.get('/api/auth/me', async (req, res, next) => {
       xAccounts: auth.user.xAccounts,
       accounts: await accountSummaries(auth.user),
       ...(active?.xSession ? { xSession: active.xSession } : {}),
+      ...health,
     });
   } catch (error) {
     next(error);
@@ -1438,7 +1614,7 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
       throw new HttpError(404, `No saved session for @${xUsername}`);
     }
 
-    const user = await withWriteLock(async () => {
+    const switched = await withWriteLock(async () => {
       const users = await loadUserDb();
       const current = users.find((candidate) => candidate.id === auth.user.id);
       if (!current) throw new HttpError(401, 'User account no longer exists');
@@ -1450,14 +1626,15 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
       current.preferences.defaultXAccount = xUsername;
       await saveUserDb(users);
       await writeAuthFile(state, AUTH_FILE);
-      return current;
+      return { user: current, state };
     });
 
     return res.json({
       ok: true,
       activeXAccount: xUsername,
       defaultXAccount: xUsername,
-      accounts: await accountSummaries(user),
+      accounts: await accountSummaries(switched.user),
+      ...(await checkXSessionHealth(switched.state, { handle: xUsername })),
     });
   } catch (error) {
     next(error);
@@ -1534,14 +1711,22 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
       return { user: current, wasActive, sessionDeleted, activeSessionStaged };
     });
 
+    const activeXAccount = result.user.preferences.defaultXAccount;
+    let health = xSessionHealth(activeXAccount ? 'invalid' : 'none');
+    if (activeXAccount) {
+      const state = await readXSession(result.user.id, activeXAccount);
+      if (state) health = await checkXSessionHealth(state, { handle: activeXAccount });
+    }
+
     return res.json({
       ok: true,
       deletedXAccount: xUsername,
       sessionDeleted: result.sessionDeleted,
       wasActive: result.wasActive,
       activeSessionStaged: result.activeSessionStaged,
-      activeXAccount: result.user.preferences.defaultXAccount,
+      activeXAccount,
       accounts: await accountSummaries(result.user),
+      ...health,
     });
   } catch (error) {
     next(error);
@@ -1755,6 +1940,18 @@ app.post('/api/run', async (req, res) => {
       selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
+
+      const health = await checkXSessionHealth(selectedSession.state, {
+        handle: selectedSession.xUsername,
+        force: true,
+      });
+      if (health.xSessionValid === false) {
+        return res.status(409).json({
+          error: `X connection expired for @${selectedSession.xUsername}. Re-authenticate the account before publishing.`,
+          code: 'X_SESSION_EXPIRED',
+          ...health,
+        });
+      }
     } catch (error) {
       return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
     }

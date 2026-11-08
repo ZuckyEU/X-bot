@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -55,6 +56,9 @@ async function startServer(t, extraEnv = {}, options = {}) {
       PORT: String(port),
       SESSION_SECRET,
       BCRYPT_ROUNDS: '10',
+      // Tests must never call X. Individual health-check tests opt back in
+      // with X_SESSION_CHECK_DISABLED=0 and a local fixture URL.
+      X_SESSION_CHECK_DISABLED: '1',
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -151,6 +155,38 @@ function importSession(baseUrl, cookie, body) {
   return fetch(`${baseUrl}/api/auth/import-session`, {
     method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify(body),
   });
+}
+
+/**
+ * Stand-in for X's authenticated settings endpoint. Cookies containing
+ * "expired" are rejected, "flaky" produces a server error, and everything else
+ * is accepted. This keeps the health-check tests deterministic and offline.
+ */
+async function startXHealthFixture(t) {
+  const requests = [];
+  const server = createHttpServer((req, res) => {
+    const cookie = String(req.headers.cookie ?? '');
+    requests.push({ cookie, csrf: req.headers['x-csrf-token'], authorization: req.headers.authorization });
+    if (cookie.includes('expired')) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ code: 32, message: 'Could not authenticate you.' }] }));
+    }
+    if (cookie.includes('flaky')) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ code: 130, message: 'Over capacity' }] }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ screen_name: 'fixture' }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => {
+    server.closeAllConnections();
+    server.close(resolve);
+  }));
+  return { url: `http://127.0.0.1:${server.address().port}/i/api/1.1/account/settings.json`, requests };
 }
 
 async function until(check, message = 'condition did not become true', timeoutMs = 5_000) {
@@ -561,11 +597,23 @@ test('disconnecting during import rolls back the prior session and staging block
   const paths = [join(dataDir, 'user-db.json'), join(dataDir, 'auth.json'), join(dataDir, 'sessions', owner.body.user.id, 'alice.json')];
   const previous = await Promise.all(paths.map((path) => readFile(path, 'utf8')));
   await writeFile(marker, 'pause');
-  const request = new AbortController();
-  const saving = fetch(`${baseUrl}/api/auth/import-session`, {
-    method: 'POST', headers: jsonHeaders(owner.cookie),
-    body: JSON.stringify(importPayload('alice', 'updated')), signal: request.signal,
-  }).catch((error) => error);
+  // Use a dedicated HTTP socket rather than fetch abort. Undici may keep its
+  // pooled connection open after abort, so the server would not always observe
+  // the disconnect and the rollback assertion became flaky on Windows.
+  const importBody = JSON.stringify(importPayload('alice', 'updated'));
+  let importRequest;
+  const saving = new Promise((resolve) => {
+    importRequest = httpRequest(`${baseUrl}/api/auth/import-session`, {
+      method: 'POST',
+      headers: { ...jsonHeaders(owner.cookie), 'content-length': Buffer.byteLength(importBody) },
+      agent: false,
+    }, (response) => {
+      response.resume();
+      response.on('end', () => resolve({ completed: true, status: response.statusCode }));
+    });
+    importRequest.on('error', (error) => resolve({ completed: false, error }));
+    importRequest.end(importBody);
+  });
   await until(() => stat(`${marker}.entered`).then(() => true, () => false), 'The import did not reach session staging');
   const browserStart = await fetch(`${baseUrl}/auth/x`, {
     method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
@@ -575,9 +623,10 @@ test('disconnecting during import rolls back the prior session and staging block
     method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true }),
   });
   assert.equal(run.status, 409);
-  request.abort();
-  assert.equal((await saving).name, 'AbortError');
-  await delay(50);
+  importRequest.destroy();
+  const saved = await saving;
+  assert.equal(saved.completed, false);
+  await delay(100);
   await unlink(marker);
   await until(async () => (await readFile(paths[1], 'utf8')) === previous[1] &&
     (await readFile(paths[2], 'utf8')) === previous[2], 'Cancelled import did not restore the prior session');
@@ -945,9 +994,98 @@ test('PostgreSQL stores users and X sessions and restores them after login', asy
     activeXAccount: null,
     xAccounts: [],
     accounts: [],
+    xSessionValid: null,
+    xSessionStatus: 'none',
+    xSessionCheckedAt: null,
   });
 
   await assert.rejects(stat(join(dataDir, 'user-db.json')), { code: 'ENOENT' });
+});
+
+test('X session health rejects expired cookies, blocks live runs, and re-authenticates', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0',
+    X_SESSION_CHECK_URL: x.url,
+    X_SESSION_CHECK_TIMEOUT_MS: '2000',
+    X_SESSION_CHECK_CACHE_MS: '0',
+  });
+  const owner = await register(baseUrl, 'health');
+  const good = { handle: 'alpha', auth_token: 'good_auth_token_value', ct0: 'good_ct0_value' };
+  const expired = { handle: 'alpha', auth_token: 'expired_auth_token_value', ct0: 'expired_ct0_value' };
+
+  const imported = await importSession(baseUrl, owner.cookie, good);
+  const importedText = await imported.text();
+  assert.equal(imported.status, 201, importedText);
+  const importedBody = JSON.parse(importedText);
+  assert.equal(importedBody.xSessionValid, true);
+  assert.equal(importedBody.xSessionStatus, 'valid');
+  assert.ok(importedBody.xSessionCheckedAt);
+
+  // The probe carries the cookies, CSRF header, and X web bearer.
+  const probe = x.requests.at(-1);
+  assert.match(probe.cookie, /auth_token=good_auth_token_value/);
+  assert.match(probe.cookie, /ct0=good_ct0_value/);
+  assert.equal(probe.csrf, 'good_ct0_value');
+  assert.match(probe.authorization, /^Bearer /);
+
+  const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } });
+  assert.equal(me.status, 200);
+  const meBody = await me.json();
+  assert.equal(meBody.xSessionValid, true);
+  assert.equal(meBody.xSessionStatus, 'valid');
+
+  const key = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ apiKey: 'test-only-groq-key-no-external-requests' }),
+  });
+  assert.equal(key.status, 200);
+
+  // Rejected cookies never replace the working saved session.
+  const rejected = await importSession(baseUrl, owner.cookie, expired);
+  assert.equal(rejected.status, 422);
+  assert.match((await rejected.json()).error, /rejected these cookies/);
+  const stillGood = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(stillGood.xSession.auth_token, 'good_auth_token_value');
+  assert.equal(stillGood.xSessionValid, true);
+
+  // Rotate the saved session to rejected cookies and confirm a live run is blocked.
+  const rotated = await fetch(`${baseUrl}/api/auth`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ auth_token: expired.auth_token, ct0: expired.ct0 }),
+  });
+  assert.equal(rotated.status, 200);
+  const blocked = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1' }),
+  });
+  assert.equal(blocked.status, 409);
+  const blockedBody = await blocked.json();
+  assert.equal(blockedBody.code, 'X_SESSION_EXPIRED');
+  assert.equal(blockedBody.xSessionValid, false);
+  assert.match(blockedBody.error, /Re-authenticate/);
+
+  // Re-authentication with fresh cookies restores the verified badge.
+  const restored = await importSession(baseUrl, owner.cookie, good);
+  const restoredText = await restored.text();
+  assert.equal(restored.status, 201, restoredText);
+  const restoredBody = JSON.parse(restoredText);
+  assert.equal(restoredBody.xSessionValid, true);
+  assert.equal(restoredBody.xSessionStatus, 'valid');
+
+  // A transient X failure is reported as unknown and does not mark the account
+  // expired or get rejected during import.
+  const flaky = await importSession(baseUrl, owner.cookie, {
+    handle: 'beta', auth_token: 'flaky_auth_token_value', ct0: 'flaky_ct0_value',
+  });
+  const flakyText = await flaky.text();
+  assert.equal(flaky.status, 201, flakyText);
+  const flakyBody = JSON.parse(flakyText);
+  assert.equal(flakyBody.xSessionValid, null);
+  assert.equal(flakyBody.xSessionStatus, 'unknown');
+  const transientMe = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(transientMe.xSessionValid, null);
+  assert.equal(transientMe.xSessionStatus, 'unknown');
 });
 
 test('production allows Render origins and rejects unknown origins', async (t) => {

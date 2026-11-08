@@ -33,8 +33,17 @@ async function fixture(t, options = {}) {
     accounts: options.accounts ?? [],
     groqConfigured: options.groqConfigured ?? false,
     importStatus: options.importStatus ?? 201,
+    xSessionStatus: options.xSessionStatus ?? 'valid',
+    runStatus: options.runStatus ?? 200,
+    runs: [],
     imports: [], switches: [], requests: [], replies: 0, logouts: 0,
   };
+  const health = () => ({
+    xSessionValid: state.xSessionStatus === 'valid' ? true
+      : state.xSessionStatus === 'invalid' ? false : null,
+    xSessionStatus: state.xSessionStatus,
+    xSessionCheckedAt: new Date().toISOString(),
+  });
   const errors = [];
   let baseUrl;
   const activate = (handle) => {
@@ -67,7 +76,12 @@ async function fixture(t, options = {}) {
         username: activeHandle(), activeXAccount: activeHandle(),
         xAccounts: state.accounts.map((account) => account.xUsername),
         accounts: state.accounts,
-      } : { authenticated: false, userAuthenticated: false, user: null, username: null, activeXAccount: null, xAccounts: [], accounts: [] });
+        ...health(),
+      } : {
+        authenticated: false, userAuthenticated: false, user: null, username: null,
+        activeXAccount: null, xAccounts: [], accounts: [],
+        xSessionValid: null, xSessionStatus: 'none', xSessionCheckedAt: null,
+      });
     }
     if (url.pathname === '/api/config/groq') {
       if (req.method === 'DELETE') {
@@ -82,6 +96,15 @@ async function fixture(t, options = {}) {
     }
     if (url.pathname === '/api/history') return json([]);
     if (url.pathname === '/api/auth/x-accounts') return json(state.accounts);
+    if (url.pathname === '/api/run' && req.method === 'POST') {
+      state.runs.push(JSON.parse(raw || '{}'));
+      return json(options.runBody ?? {
+        error: 'X connection expired for @alice. Re-authenticate the account before publishing.',
+        code: 'X_SESSION_EXPIRED',
+        xSessionValid: false,
+        xSessionStatus: 'invalid',
+      }, state.runStatus);
+    }
     if (url.pathname === '/api/auth/import-session' && req.method === 'POST') {
       const body = JSON.parse(raw);
       const index = state.imports.length;
@@ -97,7 +120,10 @@ async function fixture(t, options = {}) {
         state.accounts.push({ xUsername: handle, active: false, status: 'ready' });
       }
       activate(handle);
-      return json({ ok: true, username: handle, activeXAccount: handle, accounts: state.accounts }, 201);
+      state.xSessionStatus = options.importSessionStatus ?? 'valid';
+      return json({
+        ok: true, username: handle, activeXAccount: handle, accounts: state.accounts, ...health(),
+      }, 201);
     }
     if (url.pathname === '/api/auth/switch-account' && req.method === 'POST') {
       const { xUsername } = JSON.parse(raw);
@@ -173,7 +199,7 @@ test('dashboard imports only masked cookie values and immediately activates the 
   assert.match(state.imports[0].cookie, /x_engine_session=synthetic-app-session/);
   assert.equal(await page.locator('#who').textContent(), '@alice');
   assert.match(await page.locator('#auth-msg').textContent(), /Imported session for @alice/);
-  assert.match(await page.locator('#status-detail').textContent(), /X will check the cookies/);
+  assert.match(await page.locator('#status-detail').textContent(), /connection is active/);
   assert.equal(await page.locator('.linked-account-item.active').count(), 1);
   assert.equal(await page.locator('#session-import-modal').getAttribute('aria-hidden'), 'true');
   assert.equal(await page.locator('#session-handle').inputValue(), '');
@@ -369,5 +395,112 @@ test('dashboard clears a Groq key without retaining a late response after logout
   await delay(100);
   assert.match(await page.locator('#groq-key-status').textContent(), /Sign in to configure/);
   assert.equal(await page.locator('#clear-groq-key').isDisabled(), true);
+  assert.deepEqual(errors, []);
+});
+
+test('expired X session shows the reconnection badge, disables publishing, and re-authenticates', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, submit } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    xSessionStatus: 'invalid',
+  });
+
+  assert.equal(await page.locator('#x-session-warning').isVisible(), true);
+  assert.match(await page.locator('#x-session-warning').innerText(), /X Connection Expired — Reconnection Needed/);
+  assert.match(await page.locator('#x-session-warning-detail').textContent(), /@alice/);
+  assert.equal(await page.locator('#run').isDisabled(), true);
+  assert.equal(await page.locator('#dry-run-btn').isEnabled(), true);
+  assert.equal(await page.locator('#active-account-label').textContent(), 'X session expired');
+  assert.equal(await page.locator('#account-chip').evaluate((chip) => chip.classList.contains('expired')), true);
+
+  await page.locator('#x-session-reconnect').click();
+  await page.locator('#session-import-modal').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#session-import-title').textContent(), 'Re-authenticate X account');
+  assert.equal(
+    await page.locator('#session-import-subtitle').textContent(),
+    'Update the cookies for @alice to restore publishing.',
+  );
+  assert.equal(await page.locator('#session-handle').inputValue(), 'alice');
+  assert.equal(await page.locator('#session-handle').evaluate((input) => input.readOnly), true);
+  assert.equal(await page.locator('#session-import-submit').textContent(), 'Re-authenticate account');
+  assert.equal(
+    await page.locator('#session-auth-token').evaluate((input) => document.activeElement === input),
+    true,
+  );
+
+  const values = cookieValues('alice');
+  await page.locator('#session-auth-token').fill(values.auth_token);
+  await page.locator('#session-ct0').fill(values.ct0);
+  await submit();
+  await page.locator('#session-import-modal').waitFor({ state: 'hidden' });
+  assert.equal(state.imports[0].body.handle, 'alice');
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  assert.equal(await page.locator('#run').isEnabled(), true);
+  assert.equal(await page.locator('#active-account-label').textContent(), 'X connection verified');
+  assert.match(await page.locator('#auth-msg').textContent(), /Re-authenticated @alice/);
+  assert.equal(await page.locator('#session-handle').evaluate((input) => input.readOnly), false);
+  assert.deepEqual(errors, []);
+});
+
+test('a rejected re-authentication keeps the expired badge and the dialog open', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    xSessionStatus: 'invalid',
+    importStatus: 422,
+    importError: 'X rejected these cookies. Sign in to X again and copy fresh auth_token and ct0 values.',
+  });
+
+  await page.locator('#x-session-reconnect').click();
+  await page.locator('#session-import-modal').waitFor({ state: 'visible' });
+  const values = cookieValues('alice');
+  await page.locator('#session-auth-token').fill(values.auth_token);
+  await page.locator('#session-ct0').fill(values.ct0);
+  const count = state.imports.length;
+  await page.locator('#session-import-submit').click();
+  await until(() => state.imports.length === count + 1);
+  await page.waitForFunction(() =>
+    document.getElementById('session-import-error').textContent.includes('X rejected these cookies'),
+  );
+
+  assert.equal(await page.locator('#session-import-modal').isVisible(), true);
+  assert.equal(await page.locator('#x-session-warning').isVisible(), true);
+  assert.equal(await page.locator('#run').isDisabled(), true);
+  assert.equal(await page.locator('#session-import-submit').isEnabled(), true);
+  assert.deepEqual(errors, []);
+});
+
+test('an unknown X health result does not mark the session expired', { timeout: 20_000 }, async (t) => {
+  const { page, errors } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    xSessionStatus: 'unknown',
+  });
+
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  assert.equal(await page.locator('#run').isEnabled(), true);
+  assert.equal(await page.locator('#active-account-label').textContent(), 'Active X account');
+  assert.equal(await page.locator('#account-chip').evaluate((chip) => chip.classList.contains('expired')), false);
+
+  await page.locator('#account-chip').click();
+  await page.waitForFunction(() => document.getElementById('who').textContent === '@alice');
+  assert.deepEqual(errors, []);
+});
+
+test('a backend X_SESSION_EXPIRED response switches the dashboard to reconnection mode', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    xSessionStatus: 'valid',
+    groqConfigured: true,
+    runStatus: 409,
+  });
+
+  await page.locator('#run-url').fill('https://x.com/alice/status/1');
+  await page.locator('#run').click();
+  await until(() => state.runs.length === 1);
+  await page.waitForFunction(() => document.getElementById('x-session-warning').classList.contains('hidden') === false);
+
+  assert.equal(await page.locator('#status').textContent(), 'Reconnection needed');
+  assert.match(await page.locator('#status-detail').textContent(), /Re-authenticate the account/);
+  assert.match(await page.locator('#auth-msg').textContent(), /X connection expired/);
+  assert.equal(await page.locator('#run').isDisabled(), true);
+  assert.equal(await page.locator('#active-account-label').textContent(), 'X session expired');
   assert.deepEqual(errors, []);
 });

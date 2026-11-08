@@ -137,9 +137,13 @@ The credentials are upserted into PostgreSQL (`x_sessions`), the account is link
 
 Imports require a current app session, reject changes while a browser run is active, and use serialized writes with rollback if saving fails. Account switching is also blocked until the active run finishes. Import and switch responses contain only account metadata; raw cookie values are returned only by the authenticated `GET /api/auth/me` bootstrap response so a new device can restore its active X account. The form uses masked inputs, does not write cookies to browser storage, and clears pasted values on submission, close, navigation, or app logout.
 
-After login and on every dashboard bootstrap, `GET /api/auth/me` reads the user's active row from `x_sessions`, returns `activeXAccount` plus `xSession.auth_token`/`xSession.ct0`, and restages `auth.json` when no browser run is active. A missing or stale `auth.json` therefore no longer requires re-pasting cookies on a new device.
+Before saving, the server asks X's lightweight authenticated settings endpoint whether the cookies are still valid. Rejected cookies return **422** and leave the previous saved session untouched. A timeout, network error, rate limit, or ambiguous X response is treated as **unknown** and does not block the import or a later run; only an explicit rejection is treated as expired.
 
-**Cookies grant account access.** Use HTTPS in production and protect the PostgreSQL connection string and `auth.json`. `auth_token` and `ct0` are stored as plain text in `x_sessions` and in the staged `auth.json`; they are not encrypted at the application layer. The import checks syntax, not validity or ownership with X. Expired/revoked cookies, a mismatched handle, or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
+After login and on every dashboard bootstrap, `GET /api/auth/me` reads the user's active row from `x_sessions`, returns `activeXAccount` plus `xSession.auth_token`/`xSession.ct0`, and restages `auth.json` when no browser run is active. It also returns `xSessionStatus` (`valid`, `invalid`, `unknown`, or `none`), `xSessionValid` (`true`/`false`/`null`), and `xSessionCheckedAt`. Results are cached per cookie pair for 60 seconds by default. A missing or stale `auth.json` therefore no longer requires re-pasting cookies on a new device.
+
+When the active session is invalid, the dashboard shows a **X Connection Expired — Reconnection Needed** banner and disables **Publish Live Action**. `POST /api/run` re-checks the session immediately and returns **409** with `code: "X_SESSION_EXPIRED"` if X rejects it. The banner and account menu open the **Re-authenticate Account** dialog, which accepts fresh `auth_token` and `ct0` values, updates PostgreSQL, re-validates the badge, and immediately re-enables publishing when X accepts the new cookies. Transient failures show no expired banner and remain allowed, so an X outage cannot lock the account.
+
+**Cookies grant account access.** Use HTTPS in production and protect the PostgreSQL connection string and `auth.json`. `auth_token` and `ct0` are stored as plain text in `x_sessions` and in the staged `auth.json`; they are not encrypted at the application layer. Health checks confirm that X still accepts the cookies, not that the handle matches the account or that the cookies were obtained with permission. A mismatched handle or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
 
 Run `npm test` for API, tenant-isolation, persistence, rollback, and runner regression checks. Run `npm run test:ui` after installing local Chromium for form submission, secret cleanup, error handling, and stale-response checks. Tests use synthetic cookies and local fixtures, not a credentialed X login.
 
@@ -181,9 +185,9 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 |---|---|
 | `GET /` | Dashboard UI from `public/index.html` |
 | `GET /api/auth` | Authentication status and active-account metadata; no raw cookie values |
-| `GET /api/auth/me` | App user profile plus active X account, saved `xSession.auth_token`/`ct0`, and account summaries; restages `auth.json` when idle |
+| `GET /api/auth/me` | App user profile plus active X account, saved `xSession.auth_token`/`ct0`, account summaries, and `xSessionStatus`/`xSessionValid`; restages `auth.json` when idle |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
-| `POST /api/auth/import-session` | Body `{"handle": "…", "auth_token": "…", "ct0": "…"}` — save, link, and activate an X session |
+| `POST /api/auth/import-session` | Body `{"handle": "…", "auth_token": "…", "ct0": "…"}` — validate with X, then save, link, and activate an X session |
 | `GET /api/auth/x-accounts` | List the authenticated user's linked accounts |
 | `POST /api/auth/switch-account` | Body `{"xUsername": "…"}` — stage a linked account for the bot |
 | `DELETE /api/auth/x-accounts/:xUsername` | Unlink an account and remove its saved session |
@@ -192,7 +196,7 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 | `DELETE /api/history` | Clear the local `history.json` run log |
 | `POST /auth/x` | Retired interactive sign-in; authenticated 410 response directs clients to cookie import |
 | `POST /auth/x/cancel` | Authenticated compatibility no-op; does not cancel automation |
-| `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — spawns `main.js` and streams its output |
+| `POST /api/run` | Body `{"url": "…", "dryRun": true, "headless": true, "reply": true, "like": true, "repost": true}` — validates the X session, spawns `main.js`, and streams its output |
 
 `POST /api/run` responds with `application/x-ndjson`; each line is one event:
 
