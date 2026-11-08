@@ -412,6 +412,13 @@ test('expired X session shows the reconnection badge, disables publishing, and r
   assert.equal(await page.locator('#active-account-label').textContent(), 'X session expired');
   assert.equal(await page.locator('#account-chip').evaluate((chip) => chip.classList.contains('expired')), true);
 
+  await page.locator('#account-chip').click();
+  const account = page.locator('.linked-account-item[data-x-username="alice"]');
+  assert.equal(await account.locator('.session-expired').textContent(), 'Session Expired');
+  assert.equal(await account.locator('.account-check').count(), 0);
+  assert.equal(await account.getByRole('button', { name: 'Update session for @alice', exact: true }).isVisible(), true);
+  await page.locator('#account-chip').click();
+
   await page.locator('#x-session-reconnect').click();
   await page.locator('#session-import-modal').waitFor({ state: 'visible' });
   assert.equal(await page.locator('#session-import-title').textContent(), 'Re-authenticate X account');
@@ -438,6 +445,111 @@ test('expired X session shows the reconnection badge, disables publishing, and r
   assert.equal(await page.locator('#active-account-label').textContent(), 'X connection verified');
   assert.match(await page.locator('#auth-msg').textContent(), /Re-authenticated @alice/);
   assert.equal(await page.locator('#session-handle').evaluate((input) => input.readOnly), false);
+  await page.locator('#account-chip').click();
+  assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
+  assert.equal(await account.locator('.update-x-session').count(), 0);
+  assert.equal(await account.locator('.account-check').textContent(), '✓');
+  assert.deepEqual(errors, []);
+});
+
+for (const [source, accountState] of [
+  ['xSessionValid=false', { status: 'ready', xSessionValid: false }],
+  ['status=expired', { status: 'expired' }],
+]) {
+  test(`the account dropdown offers Update Session for ${source} and restores Active after validation`, { timeout: 20_000 }, async (t) => {
+    const importGate = deferred();
+    const { page, state, errors, submit } = await fixture(t, {
+      accounts: [{ xUsername: 'zuckyeu', active: true, ...accountState }],
+      xSessionStatus: 'unknown',
+      importGate,
+    });
+    await page.locator('#account-chip').click();
+    const account = page.locator('.linked-account-item[data-x-username="zuckyeu"]');
+    const update = account.getByRole('button', { name: 'Update session for @zuckyeu', exact: true });
+    assert.equal(await account.locator('.session-expired').textContent(), 'Session Expired');
+    assert.equal(await account.locator('.session-expired').evaluate((tag) => getComputedStyle(tag).color), 'rgb(255, 116, 126)');
+    assert.equal(await account.locator('.account-check').count(), 0);
+    assert.equal(await update.textContent(), 'Update Session');
+    assert.equal(await page.locator('#run').isDisabled(), true);
+
+    await update.click();
+    await page.locator('#session-import-modal').waitFor({ state: 'visible' });
+    assert.equal(await page.locator('#account-dropdown').isVisible(), false);
+    assert.equal(await page.locator('#session-import-title').textContent(), 'Re-authenticate X account');
+    assert.equal(await page.locator('#session-handle').inputValue(), 'zuckyeu');
+    assert.equal(await page.locator('#session-handle').evaluate((input) => input.readOnly), true);
+    assert.match(await page.locator('#session-import-subtitle').textContent(), /@zuckyeu/);
+    assert.equal(await page.locator('#session-auth-token').inputValue(), '');
+    assert.equal(await page.locator('#session-ct0').inputValue(), '');
+    assert.equal(await page.locator('#session-auth-token').evaluate((input) => document.activeElement === input), true);
+    assert.deepEqual(state.switches, []);
+    assert.equal(state.imports.length, 0);
+
+    const values = cookieValues('zuckyeu');
+    await page.locator('#session-auth-token').fill(values.auth_token);
+    await page.locator('#session-ct0').fill(values.ct0);
+    await submit();
+    assert.equal(await account.locator('.update-x-session').isDisabled(), true);
+    assert.equal(await account.locator('.session-expired').textContent(), 'Session Expired');
+    assert.equal(await account.locator('.account-check').count(), 0);
+    importGate.resolve();
+    await page.locator('#session-import-modal').waitFor({ state: 'hidden' });
+    assert.deepEqual(state.imports[0].body, values);
+    assert.deepEqual(state.switches, []);
+    assert.equal(await page.locator('#account-chip').evaluate((button) => document.activeElement === button), true);
+    await page.locator('#account-chip').click();
+    assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
+    assert.equal(await account.locator('.session-expired').count(), 0);
+    assert.equal(await account.locator('.update-x-session').count(), 0);
+    assert.equal(await account.locator('.account-check').textContent(), '✓');
+    assert.equal(await account.locator('.account-check').evaluate((check) => getComputedStyle(check).color), 'rgb(77, 141, 255)');
+    assert.equal(await page.locator('#run').isEnabled(), true);
+    assert.deepEqual(errors, []);
+  });
+}
+
+test('Update Session targets an inactive account without switching before cookie submission', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, submit } = await fixture(t, {
+    accounts: [
+      { xUsername: 'alice', active: true, status: 'ready' },
+      { xUsername: 'zuckyeu', active: false, status: 'expired' },
+      { xUsername: 'bob', active: false, status: 'ready', xSessionValid: false },
+    ],
+    viewport: { width: 390, height: 844 },
+  });
+  const account = page.locator('.linked-account-item[data-x-username="zuckyeu"]');
+  const otherExpired = page.locator('.linked-account-item[data-x-username="bob"]');
+  await page.locator('#account-chip').click();
+  const update = account.getByRole('button', { name: 'Update session for @zuckyeu', exact: true });
+  assert.equal(await account.locator('.session-expired').textContent(), 'Session Expired');
+  assert.equal(await page.locator('#run').isEnabled(), true);
+  const menuBounds = await page.locator('#account-dropdown').boundingBox();
+  const updateBounds = await update.boundingBox();
+  assert.ok(updateBounds.x >= menuBounds.x && updateBounds.x + updateBounds.width <= menuBounds.x + menuBounds.width);
+  await update.click();
+  await page.locator('#session-import-modal').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#session-handle').inputValue(), 'zuckyeu');
+  assert.equal(await page.locator('#who').textContent(), '@alice');
+  assert.deepEqual(state.switches, []);
+
+  await page.locator('#session-import-close').click();
+  assert.equal(await page.locator('#account-chip').evaluate((button) => document.activeElement === button), true);
+  await page.locator('#account-chip').click();
+  await update.click();
+  const values = cookieValues('zuckyeu');
+  await page.locator('#session-auth-token').fill(values.auth_token);
+  await page.locator('#session-ct0').fill(values.ct0);
+  await submit();
+  await page.locator('#session-import-modal').waitFor({ state: 'hidden' });
+  assert.deepEqual(state.imports[0].body, values);
+  assert.equal(await page.locator('#who').textContent(), '@zuckyeu');
+  assert.deepEqual(state.switches, []);
+  await page.locator('#account-chip').click();
+  assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
+  assert.equal(await account.locator('.account-check').textContent(), '✓');
+  assert.equal(await account.locator('.update-x-session').count(), 0);
+  assert.equal(await otherExpired.locator('.session-expired').textContent(), 'Session Expired');
+  assert.equal(await otherExpired.locator('.update-x-session').count(), 1);
   assert.deepEqual(errors, []);
 });
 
@@ -449,7 +561,9 @@ test('a rejected re-authentication keeps the expired badge and the dialog open',
     importError: 'X rejected these cookies. Sign in to X again and copy fresh auth_token and ct0 values.',
   });
 
-  await page.locator('#x-session-reconnect').click();
+  await page.locator('#account-chip').click();
+  const account = page.locator('.linked-account-item[data-x-username="alice"]');
+  await account.getByRole('button', { name: 'Update session for @alice', exact: true }).click();
   await page.locator('#session-import-modal').waitFor({ state: 'visible' });
   const values = cookieValues('alice');
   await page.locator('#session-auth-token').fill(values.auth_token);
@@ -465,6 +579,9 @@ test('a rejected re-authentication keeps the expired badge and the dialog open',
   assert.equal(await page.locator('#x-session-warning').isVisible(), true);
   assert.equal(await page.locator('#run').isDisabled(), true);
   assert.equal(await page.locator('#session-import-submit').isEnabled(), true);
+  assert.equal(await account.locator('.session-expired').textContent(), 'Session Expired');
+  assert.equal(await account.locator('.account-check').count(), 0);
+  assert.equal(await account.locator('.update-x-session').isEnabled(), true);
   assert.deepEqual(errors, []);
 });
 
@@ -481,6 +598,10 @@ test('an unknown X health result does not mark the session expired', { timeout: 
 
   await page.locator('#account-chip').click();
   await page.waitForFunction(() => document.getElementById('who').textContent === '@alice');
+  const account = page.locator('.linked-account-item[data-x-username="alice"]');
+  assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
+  assert.equal(await account.locator('.account-check').count(), 1);
+  assert.equal(await account.locator('.update-x-session').count(), 0);
   assert.deepEqual(errors, []);
 });
 
@@ -502,5 +623,10 @@ test('a backend X_SESSION_EXPIRED response switches the dashboard to reconnectio
   assert.match(await page.locator('#auth-msg').textContent(), /X connection expired/);
   assert.equal(await page.locator('#run').isDisabled(), true);
   assert.equal(await page.locator('#active-account-label').textContent(), 'X session expired');
+  await page.locator('#account-chip').click();
+  const account = page.locator('.linked-account-item[data-x-username="alice"]');
+  assert.equal(await account.locator('.session-expired').textContent(), 'Session Expired');
+  assert.equal(await account.locator('.account-check').count(), 0);
+  assert.equal(await account.locator('.update-x-session').isEnabled(), true);
   assert.deepEqual(errors, []);
 });

@@ -223,13 +223,17 @@
       .linked-account-item { width: 100%; display: flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text); }
       .linked-account-item:hover { background: rgba(77, 141, 255, 0.07); border-color: #2e3b56; }
       .linked-account-item.active { background: rgba(77, 141, 255, 0.11); border-color: rgba(77, 141, 255, 0.38); }
+      .linked-account-item.expired { background: rgba(248, 113, 113, 0.06); border-color: rgba(248, 113, 113, 0.3); }
       .linked-account-select { min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px; padding: 5px; border: 0; background: transparent; color: var(--text); text-align: left; box-shadow: none; }
       .linked-account-select:hover { transform: none; background: transparent; }
       .linked-account-avatar { width: 32px; height: 32px; flex: 0 0 32px; border-radius: 5px; border: 1px solid var(--border); background: linear-gradient(135deg, #26344b, #111722); display: grid; place-items: center; color: var(--accent-hover); font-weight: 750; }
       .linked-account-copy { min-width: 0; flex: 1; display: grid; }
       .linked-account-copy strong { overflow: hidden; text-overflow: ellipsis; }
       .linked-account-copy span { color: var(--muted); font-size: 11px; }
+      .linked-account-copy .session-expired { color: var(--err); font-weight: 600; }
       .account-check { color: var(--accent); font-size: 15px; }
+      .update-x-session { flex: 0 0 auto; padding: 6px 8px; border: 1px solid rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.08); color: var(--err); font-size: 11px; white-space: nowrap; box-shadow: none; }
+      .update-x-session:hover { border-color: var(--err); background: rgba(248, 113, 113, 0.15); }
       .unlink-x-account { flex: 0 0 auto; padding: 6px 8px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 11px; box-shadow: none; }
       .unlink-x-account:hover { border-color: rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.1); color: var(--err); }
       .account-dropdown-add { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border); }
@@ -856,10 +860,14 @@
         $('add-x-account').disabled = busy || Boolean(controller);
         $('run').disabled = busy || Boolean(controller) || sessionBlocksPublishing();
         $('dry-run-btn').disabled = busy || Boolean(controller);
+        for (const button of document.querySelectorAll('.update-x-session')) {
+          button.disabled = busy || Boolean(controller);
+        }
       }
 
       function sessionBlocksPublishing() {
-        return xSessionStatus === 'invalid' && Boolean(activeXAccount);
+        return Boolean(activeXAccount) && (xSessionStatus === 'invalid'
+          || linkedXAccounts.some((account) => account.active && linkedAccountSessionExpired(account)));
       }
 
       function renderXSessionStatus() {
@@ -892,34 +900,36 @@
       }
 
       function applyXSessionHealth(data) {
-        const status = data?.xSessionStatus
-          ?? (data?.xSessionValid === true ? 'valid' : data?.xSessionValid === false ? 'invalid' : 'unknown');
-        xSessionStatus = ['valid', 'invalid', 'unknown', 'none'].includes(status) ? status : 'unknown';
+        const status = data?.xSessionValid === false ? 'invalid' : data?.xSessionStatus
+          ?? (data?.xSessionValid === true ? 'valid' : 'unknown');
+        xSessionStatus = status === 'expired' ? 'invalid'
+          : ['valid', 'invalid', 'unknown', 'none'].includes(status) ? status : 'unknown';
         xSessionCheckedAt = data?.xSessionCheckedAt ?? null;
         renderXSessionStatus();
+        renderLinkedAccounts();
       }
 
-      function openReauthentication() {
+      function openReauthentication(xUsername = activeXAccount, returnFocus = $('x-session-reconnect')) {
         if (!currentAppUsername) return showAuthOverlay();
-        if (!activeXAccount) return openSessionImport();
+        if (!xUsername) return openSessionImport();
         closeAccountMenu();
-        openSessionImport({ reauthenticate: true });
+        openSessionImport({ reauthenticate: true, xUsername, returnFocus });
       }
 
-      function openSessionImport({ reauthenticate = false } = {}) {
+      function openSessionImport({ reauthenticate = false, xUsername = activeXAccount, returnFocus = null } = {}) {
         if (!currentAppUsername) return showAuthOverlay();
         if (controller || sessionImportRequest) return;
-        sessionImportReturnFocus = reauthenticate ? $('x-session-reconnect') : $('account-chip');
+        sessionImportReturnFocus = returnFocus ?? (reauthenticate ? $('x-session-reconnect') : $('account-chip'));
         $('session-import-form').reset();
-        sessionImportReauthenticate = Boolean(reauthenticate && activeXAccount);
+        sessionImportReauthenticate = Boolean(reauthenticate && xUsername);
         $('session-import-title').textContent = sessionImportReauthenticate
           ? 'Re-authenticate X account'
           : 'Import X session';
         $('session-import-subtitle').textContent = sessionImportReauthenticate
-          ? `Update the cookies for @${activeXAccount} to restore publishing.`
+          ? `Update the cookies for @${xUsername} to restore publishing.`
           : 'Connect an account using cookies from your signed-in browser.';
         $('session-handle').readOnly = sessionImportReauthenticate;
-        if (sessionImportReauthenticate) $('session-handle').value = activeXAccount;
+        if (sessionImportReauthenticate) $('session-handle').value = xUsername;
         $('session-import-error').textContent = '';
         setSessionImportBusy(false);
         $('session-import-modal').classList.remove('hidden');
@@ -1042,7 +1052,16 @@
           xUsername,
           active: Boolean(account?.active),
           status: String(account?.status ?? 'Linked'),
+          xSessionValid: account?.xSessionValid ?? null,
+          xSessionStatus: account?.xSessionStatus ?? 'unknown',
         };
+      }
+
+      function linkedAccountSessionExpired(account) {
+        return account.xSessionValid === false
+          || ['invalid', 'expired'].includes(account.status)
+          || ['invalid', 'expired'].includes(account.xSessionStatus)
+          || (account.active && xSessionStatus === 'invalid');
       }
 
       function renderLinkedAccounts() {
@@ -1051,8 +1070,9 @@
 
         for (const account of linkedXAccounts) {
           const username = account.xUsername;
+          const expired = linkedAccountSessionExpired(account);
           const accountItem = document.createElement('div');
-          accountItem.className = `account-dropdown-row linked-account-item${account.active ? ' active' : ''}`;
+          accountItem.className = `account-dropdown-row linked-account-item${account.active ? ' active' : ''}${expired ? ' expired' : ''}`;
           accountItem.dataset.xUsername = username;
 
           const selectButton = document.createElement('button');
@@ -1069,11 +1089,12 @@
           const handle = document.createElement('strong');
           handle.textContent = `@${username}`;
           const status = document.createElement('span');
-          status.textContent = account.active ? 'Active' : account.status;
+          status.textContent = expired ? 'Session Expired' : account.active ? 'Active' : account.status;
+          status.className = expired ? 'session-expired' : '';
           copy.append(handle, status);
           selectButton.append(avatar, copy);
 
-          if (account.active) {
+          if (account.active && !expired) {
             const check = document.createElement('span');
             check.className = 'account-check';
             check.setAttribute('aria-hidden', 'true');
@@ -1088,11 +1109,25 @@
           unlinkButton.setAttribute('aria-label', `Unlink @${username}`);
 
           selectButton.addEventListener('click', () => switchXAccount(username));
+          accountItem.appendChild(selectButton);
+          if (expired) {
+            const updateButton = document.createElement('button');
+            updateButton.type = 'button';
+            updateButton.className = 'update-x-session';
+            updateButton.textContent = 'Update Session';
+            updateButton.setAttribute('aria-label', `Update session for @${username}`);
+            updateButton.disabled = Boolean(controller || sessionImportRequest);
+            updateButton.addEventListener('click', (event) => {
+              event.stopPropagation();
+              openReauthentication(username, $('account-chip'));
+            });
+            accountItem.appendChild(updateButton);
+          }
           unlinkButton.addEventListener('click', (event) => {
             event.stopPropagation();
             unlinkXAccount(username);
           });
-          accountItem.append(selectButton, unlinkButton);
+          accountItem.appendChild(unlinkButton);
           accountsList.appendChild(accountItem);
         }
       }
@@ -1223,6 +1258,14 @@
           if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
           const reauthenticated = sessionImportReauthenticate;
           applyLinkedAccounts(data.accounts, data.activeXAccount);
+          if (data.xSessionValid === true) {
+            const updated = linkedXAccounts.find((account) => account.xUsername === activeXAccount);
+            if (updated) {
+              updated.xSessionValid = true;
+              updated.xSessionStatus = 'valid';
+              if (['invalid', 'expired'].includes(updated.status)) updated.status = 'ready';
+            }
+          }
           applyXSessionHealth(data);
           closeSessionImport();
           setText('auth-msg', reauthenticated
@@ -1363,7 +1406,7 @@
           $('#auth-password').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
-        $('x-session-reconnect').addEventListener('click', openReauthentication);
+        $('x-session-reconnect').addEventListener('click', () => openReauthentication());
         $('session-import-form').addEventListener('submit', importSession);
         $('session-import-close').addEventListener('click', () => closeSessionImport());
         window.addEventListener('pagehide', () => closeSessionImport({ restoreFocus: false }));
@@ -1541,6 +1584,9 @@
         $('clear-groq-key').disabled = running || !groqConfigured;
         $('stop').disabled = !running;
         $('add-x-account').disabled = running || Boolean(sessionImportRequest);
+        for (const button of document.querySelectorAll('.update-x-session')) {
+          button.disabled = running || Boolean(sessionImportRequest);
+        }
       }
 
       function setDraft(data) {
