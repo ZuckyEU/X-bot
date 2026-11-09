@@ -759,6 +759,7 @@ async function readXSession(userId, xUsername) {
     `SELECT user_id, handle, auth_token, ct0, updated_at
        FROM x_sessions
       WHERE user_id = $1 AND handle = $2
+      ORDER BY updated_at DESC, id DESC
       LIMIT 1`,
     [userId, xUsername],
   );
@@ -1015,6 +1016,21 @@ async function activeSessionFor(user, { required = false } = {}) {
   return { xUsername, state };
 }
 
+/** Runs always resolve saved cookies from the user's session source, never auth.json. */
+async function activeSessionForRun(user) {
+  const session = await activeSessionFor(user);
+  const xUsername = session?.xUsername ?? user.preferences.defaultXAccount;
+  const credentials = xSessionCredentials(session?.state);
+  if (isPostgresEnabled() && xUsername && (!credentials.auth_token || !credentials.ct0)) {
+    console.warn(`[RUN] Missing cookies in database for @${xUsername}`);
+  }
+  if (!session) {
+    if (!xUsername) throw new HttpError(409, 'No active X account. Add an X account first.');
+    throw new HttpError(409, `Saved session for @${xUsername} was not found`);
+  }
+  return session;
+}
+
 async function accountSummaries(user) {
   normalizeUserAccounts(user);
   return Promise.all(
@@ -1046,13 +1062,16 @@ async function stageActiveSession(user, { sessionToken = null, onlyWhenIdle = fa
       if (!user) throw new HttpError(401, 'The app session is no longer active');
     }
     assertUserProfileAvailable(user.id);
-    const session = await activeSessionFor(user, { required: true });
+    const session = expectedSession
+      ? await activeSessionForRun(user)
+      : await activeSessionFor(user, { required: true });
     // A mutation that already held the write lock may finish during verification.
     // Never stage a different account or cookie pair than the one just checked.
     if (expectedSession && (session.xUsername !== expectedSession.xUsername
       || xSessionCredentialKey(xSessionCredentials(session.state)) !== xSessionCredentialKey(xSessionCredentials(expectedSession.state)))) {
       throw new HttpError(409, 'X session changed during verification. Retry before publishing.');
     }
+    // Force an atomic rewrite even when a stale staging file already exists.
     await writeAuthFile(session.state, AUTH_FILE);
     return session;
   });
@@ -2169,9 +2188,10 @@ app.post('/api/run', async (req, res) => {
     attachRunCleanup(res, batchHandle);
 
     try {
-      // Verify before staging auth.json or spawning automation. A read-only
-      // browser health probe may run, but rejected cookies cannot start a job.
-      selectedSession = await activeSessionFor(appAuth.user, { required: true });
+      // Reload the latest cookies for this user/handle before verification;
+      // auth.json may be stale, absent, or staged for another app user.
+      // A read-only browser probe may run, but rejected cookies cannot start a job.
+      selectedSession = await activeSessionForRun(appAuth.user);
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
 

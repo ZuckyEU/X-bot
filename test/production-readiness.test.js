@@ -180,7 +180,7 @@ async function saveGroqKey(baseUrl, cookie, apiKey = 'test-only-groq-key-no-exte
   assert.equal(response.status, 200, await response.text());
 }
 
-function profileDatabaseCommand(child, action, userId) {
+function databaseFixtureCommand(child, fixture, command) {
   const requestId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -195,15 +195,19 @@ function profileDatabaseCommand(child, action, userId) {
     };
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error('Profile deletion database fixture timed out'));
+      reject(new Error(`${fixture} fixture timed out`));
     }, 5_000);
     child.on('message', receive);
-    child.send({ fixture: 'profile-deletion-database', requestId, action, userId }, (error) => {
+    child.send({ fixture, requestId, ...command }, (error) => {
       if (!error) return;
       cleanup();
       reject(error);
     });
   });
+}
+
+function profileDatabaseCommand(child, action, userId) {
+  return databaseFixtureCommand(child, 'profile-deletion-database', { action, userId });
 }
 
 async function assertDeletedProfileCannotAuthenticate(baseUrl, account) {
@@ -249,6 +253,7 @@ async function startXHealthFixture(t) {
       authType: req.headers['x-twitter-auth-type'], activeUser: req.headers['x-twitter-active-user'],
     });
     if (override) {
+      if (typeof override === 'function') return override(req, res);
       res.writeHead(override.status, { 'content-type': 'application/json' });
       return res.end(JSON.stringify(override.body));
     }
@@ -1584,6 +1589,180 @@ test('PostgreSQL stores users and X sessions and restores them after login', asy
   });
 
   await assert.rejects(stat(join(dataDir, 'user-db.json')), { code: 'ENOENT' });
+});
+
+test('PostgreSQL runs reload the latest active cookies before spawning despite stale or missing auth.json', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-pg-run-hydration-'));
+  const runMarker = join(dataDir, 'run-gate');
+  t.after(() => unlink(runMarker).catch(() => {}));
+  const { baseUrl, child, output } = await startServer(t, {
+    DATABASE_URL: 'pg-mem://',
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+    X_SESSION_CHECK_CACHE_MS: '60000', SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true, ipc: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs'),
+      '--import', new URL('./fixtures/run-session-database.js', import.meta.url).href],
+  });
+  const owner = await register(baseUrl, 'pg_run_hydration');
+  const other = await register(baseUrl, 'pg_run_hydration_other');
+  await saveGroqKey(baseUrl, owner.cookie);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('inactive'))).status, 201);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('@ZuckyEU', 'old_owner'))).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('zuckyeu', 'other_owner'))).status, 201);
+  const authPath = join(dataDir, 'auth.json');
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).appUserId, other.body.user.id);
+
+  let staged;
+  for (const staging of ['stale', 'missing']) {
+    const fresh = importPayload('zuckyeu', `latest_${staging}`);
+    assert.equal((await databaseFixtureCommand(child, 'run-session-database', {
+      action: 'replace-session', userId: owner.body.user.id, ...fresh,
+    })).rowCount, 1);
+    if (staging === 'missing') await unlink(authPath);
+    const requestCount = x.requests.length;
+    await writeFile(runMarker, 'pause');
+    const response = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ url: 'https://x.com/zuckyeu/status/1', dryRun: true }),
+    });
+    assert.equal(response.status, 200);
+    await until(() => stat(`${runMarker}.entered`).then(() => true, () => false), 'The runner did not receive the database session');
+    staged = JSON.parse(await readFile(`${runMarker}.entered`, 'utf8'));
+    assert.equal(staged.username, 'zuckyeu');
+    assert.equal(staged.state.username, 'zuckyeu');
+    assert.equal(staged.state.appUserId, owner.body.user.id);
+    assert.equal(staged.state.source, 'postgres');
+    assert.deepEqual(staged.state.cookies, [
+      { name: 'auth_token', value: fresh.auth_token, domain: '.x.com', path: '/', expires: -1, secure: true, httpOnly: true, sameSite: 'Lax' },
+      { name: 'ct0', value: fresh.ct0, domain: '.x.com', path: '/', expires: -1, secure: true, httpOnly: false, sameSite: 'Lax' },
+    ]);
+    assert.deepEqual(JSON.parse(await readFile(authPath, 'utf8')), staged.state);
+    assert.equal(x.requests.length, requestCount + 1);
+    assert.equal(x.requests.at(-1).cookie, `auth_token=${fresh.auth_token}; ct0=${fresh.ct0}`);
+    assert.equal(x.requests.at(-1).csrf, fresh.ct0);
+    assert.equal(output().includes(fresh.auth_token), false);
+    assert.equal(output().includes(fresh.ct0), false);
+    await unlink(runMarker);
+    const events = (await response.text()).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    const completed = events.find((event) => event.type === 'batch-complete');
+    assert.equal(completed.succeeded, 1);
+    assert.equal(completed.failed, 0);
+    await unlink(`${runMarker}.entered`);
+  }
+
+  // Exercise the same cookie-restoration helper as main.js in real local
+  // Chromium, without navigating to X or sending any network requests.
+  const browser = await connectBrowser();
+  try {
+    const context = await getDefaultContext(browser);
+    await restoreStorageState(context, staged.state, { clearCookies: true });
+    const cookies = await context.cookies('https://x.com/home');
+    for (const expected of staged.state.cookies) {
+      const restored = cookies.find((cookie) => cookie.name === expected.name);
+      for (const property of ['value', 'domain', 'path', 'secure', 'httpOnly', 'sameSite']) {
+        assert.equal(restored[property], expected[property], `${expected.name}.${property}`);
+      }
+    }
+  } finally {
+    await closeBrowser(browser);
+  }
+  assert.equal(output().includes('[RUN] Missing cookies in database'), false);
+});
+
+for (const missing of ['auth_token', 'ct0', 'both', 'row']) {
+  test(`PostgreSQL runs warn and never stage or spawn when ${missing} is missing`, { timeout: 20_000 }, async (t) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-pg-run-missing-'));
+    const stageMarker = join(dataDir, 'stage-gate');
+    const runMarker = join(dataDir, 'run-gate');
+    const { baseUrl, child, output } = await startServer(t, {
+      DATABASE_URL: 'pg-mem://', SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
+    }, {
+      dataDir, cleanupData: true, ipc: true,
+      nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs'),
+        '--import', new URL('./fixtures/run-session-database.js', import.meta.url).href],
+    });
+    const owner = await register(baseUrl, `pg_m_${missing}`);
+    const other = await register(baseUrl, `pg_m_${missing}_other`);
+    await saveGroqKey(baseUrl, owner.cookie);
+    const good = importPayload('zuckyeu', 'saved_owner');
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('inactive'))).status, 201);
+    assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201);
+    assert.equal((await importSession(baseUrl, other.cookie, importPayload('zuckyeu', 'other_owner'))).status, 201);
+    const beforeRun = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    const changed = { ...good };
+    if (missing !== 'row') {
+      for (const name of missing === 'both' ? ['auth_token', 'ct0'] : [missing]) changed[name] = '';
+    }
+    assert.equal((await databaseFixtureCommand(child, 'run-session-database', {
+      action: missing === 'row' ? 'delete-session' : 'replace-session', userId: owner.body.user.id, ...changed,
+    })).rowCount, 1);
+    await writeFile(stageMarker, 'fail');
+    const blocked = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ url: 'https://x.com/zuckyeu/status/1', dryRun: true }),
+    });
+    const body = await blocked.json();
+    assert.equal(blocked.status, 409, JSON.stringify(body));
+    if (missing === 'row') assert.match(body.error, /Saved session for @zuckyeu was not found/);
+    else assert.equal(body.code, 'X_SESSION_EXPIRED');
+    await until(() => output().includes('[RUN] Missing cookies in database for @zuckyeu'), 'The missing database cookie warning was not logged');
+    assert.equal(output().includes(good.auth_token), false);
+    assert.equal(output().includes(good.ct0), false);
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), beforeRun);
+    assert.equal(await readFile(stageMarker, 'utf8'), 'fail', 'Missing cookies must not reach staging');
+    await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+    await unlink(stageMarker);
+    assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201, 'The blocked run must release its reservation');
+  });
+}
+
+test('PostgreSQL run staging rechecks missing cookies after verification without replacing auth.json', { timeout: 20_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-pg-run-recheck-'));
+  const stageMarker = join(dataDir, 'stage-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl, child, output } = await startServer(t, {
+    DATABASE_URL: 'pg-mem://', X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+    SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true, ipc: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs'),
+      '--import', new URL('./fixtures/run-session-database.js', import.meta.url).href],
+  });
+  const owner = await register(baseUrl, 'pg_run_recheck');
+  await saveGroqKey(baseUrl, owner.cookie);
+  const good = importPayload('zuckyeu', 'before_verification');
+  assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201);
+  const beforeRun = await readFile(join(dataDir, 'auth.json'), 'utf8');
+  let releaseProbe;
+  x.setResponse((_req, res) => {
+    releaseProbe = () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ screen_name: 'zuckyeu' }));
+    };
+  });
+  t.after(() => releaseProbe?.());
+  await writeFile(stageMarker, 'fail');
+  const starting = fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/zuckyeu/status/1', dryRun: true }),
+  });
+  await until(() => Boolean(releaseProbe), 'The run did not verify the saved database cookies');
+  assert.equal((await databaseFixtureCommand(child, 'run-session-database', {
+    action: 'replace-session', userId: owner.body.user.id, ...good, ct0: '',
+  })).rowCount, 1);
+  releaseProbe();
+  releaseProbe = null;
+  const blocked = await starting;
+  const body = await blocked.json();
+  assert.equal(blocked.status, 409, JSON.stringify(body));
+  assert.match(body.error, /session changed during verification/i);
+  await until(() => output().includes('[RUN] Missing cookies in database for @zuckyeu'), 'The staging recheck did not log the missing database cookies');
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), beforeRun);
+  assert.equal(await readFile(stageMarker, 'utf8'), 'fail');
+  await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
 });
 
 test('X session health rejects expired cookies, blocks live runs, and re-authenticates', { timeout: 30_000 }, async (t) => {
