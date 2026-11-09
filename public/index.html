@@ -115,6 +115,8 @@
       button.ghost:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
       button.primary { background: var(--accent); border-color: #639bff; box-shadow: 0 8px 24px rgba(24, 91, 214, 0.22); }
       button.primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 10px 28px rgba(24, 91, 214, 0.3); }
+      button.danger { color: var(--err); background: rgba(248, 113, 113, 0.09); border-color: rgba(248, 113, 113, 0.4); }
+      button.danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.18); border-color: var(--err); }
       button:disabled { opacity: 0.5; cursor: default; pointer-events: none; }
 
       #msg { font-size: 13px; color: var(--muted); }
@@ -242,6 +244,7 @@
       .add-account-icon { width: 22px; height: 22px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 4px; color: var(--accent-hover); font-size: 16px; line-height: 1; }
       .account-dropdown-footer { border-top: 1px solid var(--border); margin-top: 7px; padding-top: 7px; }
       .account-dropdown-footer .ghost { width: 100%; }
+      .account-dropdown-footer .danger { margin-top: 5px; color: var(--err); }
       #add-x-account { white-space: nowrap; }
       .inspector-value { font-size: 13px; color: var(--text-soft); white-space: pre-wrap; word-break: break-word; }
       .hidden { display: none !important; }
@@ -376,6 +379,12 @@
       }
       .session-import-hint { margin: 0; color: var(--muted); font-size: 12px; }
       body.import-open { overflow: hidden; }
+
+      .profile-delete-dialog { width: min(480px, calc(100vw - 32px)); max-height: calc(100vh - 48px); padding: 24px; color: var(--text); background: var(--surface-raised); border: 1px solid rgba(248, 113, 113, 0.45); border-radius: 9px; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.72); }
+      .profile-delete-dialog::backdrop { background: rgba(3, 5, 8, 0.9); backdrop-filter: blur(8px); }
+      .profile-delete-dialog h2 { margin: 0 0 12px; color: var(--err); }
+      .profile-delete-dialog p { color: var(--text-soft); font-size: 13px; }
+      .toast { position: fixed; right: 20px; bottom: 20px; z-index: 12000; max-width: min(480px, calc(100vw - 40px)); padding: 14px 18px; border: 1px solid var(--ok); border-radius: 8px; background: #10251c; color: var(--text); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6); font-size: 13px; }
 
       .panel { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(17, 23, 32, 0.98), rgba(11, 15, 21, 0.98)); padding: 20px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.025); }
       .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
@@ -531,6 +540,18 @@
       </div>
     </div>
 
+    <dialog id="delete-profile-dialog" class="profile-delete-dialog" aria-labelledby="delete-profile-title" aria-describedby="delete-profile-warning" tabindex="-1">
+      <h2 id="delete-profile-title">Delete Local User Profile</h2>
+      <p id="delete-profile-warning">Are you sure you want to permanently delete your app profile? This will permanently remove your saved Groq API Key, X accounts, and all dashboard settings.</p>
+      <p>This cannot be undone. Any automation for your profile will be stopped. Your actual X accounts will not be deleted.</p>
+      <div id="delete-profile-error" class="auth-error" role="alert" aria-live="polite"></div>
+      <div class="session-import-actions">
+        <button id="cancel-delete-profile" class="ghost" type="button" autofocus>Cancel</button>
+        <button id="confirm-delete-profile" class="danger" type="button">Permanently Delete Profile</button>
+      </div>
+    </dialog>
+    <div id="profile-toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark">X</span>
@@ -562,6 +583,7 @@
               </div>
               <div class="account-dropdown-footer">
                 <button id="signout" class="ghost" type="button">Sign out of app</button>
+                <button id="delete-profile" class="ghost danger" type="button" role="menuitem" disabled>Delete Profile</button>
               </div>
             </div>
           </div>
@@ -703,6 +725,9 @@
       let batchProgress = { index: 0, completed: 0, total: 0, percent: 0 };
       let sessionImportRequest = null;
       let sessionImportReturnFocus = null;
+      let profileDeletionRequest = null;
+      let toastTimer = null;
+      const profileDeletionMessage = 'User profile, Groq API key, and associated X sessions completely deleted.';
       const targetUrls = [];
 
       // Authentication is cookie-only; remove tokens left by older UI versions.
@@ -716,6 +741,87 @@
         const el = $(id);
         el.textContent = text;
         el.className = kind;
+      }
+
+      function showProfileDeletedToast() {
+        clearTimeout(toastTimer);
+        $('profile-toast').textContent = profileDeletionMessage;
+        $('profile-toast').classList.remove('hidden');
+        toastTimer = setTimeout(() => $('profile-toast').classList.add('hidden'), 8_000);
+      }
+
+      function openProfileDeletion() {
+        if (!currentAppUsername) return showAuthOverlay();
+        if (profileDeletionRequest || $('signout').disabled || $('delete-profile-dialog').open) return;
+        closeAccountMenu();
+        $('delete-profile-error').textContent = '';
+        $('delete-profile-dialog').showModal();
+      }
+
+      function setProfileDeletionBusy(busy) {
+        $('delete-profile-dialog').setAttribute('aria-busy', String(busy));
+        $('confirm-delete-profile').disabled = busy;
+        $('confirm-delete-profile').textContent = busy ? 'Deleting profile…' : 'Permanently Delete Profile';
+        $('cancel-delete-profile').disabled = busy;
+        $('delete-profile').disabled = busy || !currentAppUsername;
+        $('signout').disabled = busy;
+        setRunning(Boolean(controller));
+        if ($('delete-profile-dialog').open) (busy ? $('delete-profile-dialog') : $('cancel-delete-profile')).focus();
+      }
+
+      async function deleteProfile() {
+        if (profileDeletionRequest || !currentAppUsername || $('signout').disabled) return;
+        const request = new AbortController();
+        profileDeletionRequest = request;
+        // Late key, account, and bootstrap responses cannot restore deleted state.
+        const generation = ++authStateGeneration;
+        controller?.abort();
+        controller = null;
+        closeSessionImport({ restoreFocus: false });
+        stopElapsedTimer();
+        $('delete-profile-error').textContent = '';
+        setProfileDeletionBusy(true);
+        setStatus('Deleting profile', 'warn', 'Stopping automation and removing your saved profile data…');
+        const timer = setTimeout(() => request.abort(), 45_000);
+        try {
+          const response = await fetch('/api/auth/me', {
+            method: 'DELETE',
+            headers: appSessionHeaders(),
+            credentials: 'same-origin',
+            signal: request.signal,
+          });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration || profileDeletionRequest !== request) return;
+          if (response.status === 401) {
+            resetSignedOutState();
+            showAuthOverlay();
+            $('auth-error').textContent = 'Your app session expired. Sign in before deleting your profile.';
+            setStatus('Sign in required', 'warn', 'Your app session expired. Sign in before deleting your profile.');
+            return;
+          }
+          if (!response.ok || data.success !== true) throw new Error(data.error ?? 'Profile deletion was not confirmed.');
+
+          localStorage.clear();
+          sessionStorage.clear();
+          resetSignedOutState();
+          showProfileDeletedToast();
+          // Reload the Register/Login screen without cached keys or dashboard state.
+          // The landing page shows the toast again so it survives navigation.
+          window.location.replace('/?profileDeleted=1');
+        } catch (error) {
+          if (generation !== authStateGeneration || profileDeletionRequest !== request) return;
+          const message = request.signal.aborted
+            ? 'Deletion timed out. Reload to check your profile before retrying.'
+            : `Could not delete your profile: ${error.message}`;
+          $('delete-profile-error').textContent = message;
+          setStatus('Profile deletion failed', 'err', message);
+        } finally {
+          clearTimeout(timer);
+          if (profileDeletionRequest === request) {
+            profileDeletionRequest = null;
+            setProfileDeletionBusy(false);
+          }
+        }
       }
 
       /* ------------------------------ status ------------------------------ */
@@ -764,6 +870,7 @@
       }
 
       async function saveGroqApiKey() {
+        if (profileDeletionRequest) return;
         const generation = authStateGeneration;
         const apiKey = $('groq-api-key').value.trim();
         if (!apiKey) {
@@ -794,6 +901,7 @@
       }
 
       async function clearGroqApiKey() {
+        if (profileDeletionRequest) return;
         const generation = authStateGeneration;
         $('clear-groq-key').disabled = true;
         try {
@@ -857,11 +965,12 @@
         $('session-import-submit').textContent = busy
           ? 'Importing…'
           : sessionImportReauthenticate ? 'Re-authenticate account' : 'Import & activate account';
-        $('add-x-account').disabled = busy || Boolean(controller);
-        $('run').disabled = busy || Boolean(controller) || sessionBlocksPublishing();
-        $('dry-run-btn').disabled = busy || Boolean(controller);
+        const blocked = busy || Boolean(controller) || Boolean(profileDeletionRequest);
+        $('add-x-account').disabled = blocked;
+        $('run').disabled = blocked || sessionBlocksPublishing();
+        $('dry-run-btn').disabled = blocked;
         for (const button of document.querySelectorAll('.update-x-session')) {
-          button.disabled = busy || Boolean(controller);
+          button.disabled = blocked;
         }
       }
 
@@ -896,7 +1005,7 @@
         $('active-account-label').title = xSessionCheckedAt
           ? `Connection checked ${new Date(xSessionCheckedAt).toLocaleString()}`
           : '';
-        if (!controller && !sessionImportRequest) $('run').disabled = expired;
+        if (!controller && !sessionImportRequest) $('run').disabled = expired || Boolean(profileDeletionRequest);
       }
 
       function applyXSessionHealth(data) {
@@ -925,7 +1034,7 @@
 
       function openSessionImport({ reauthenticate = false, xUsername = activeXAccount, returnFocus = null } = {}) {
         if (!currentAppUsername) return showAuthOverlay();
-        if (controller || sessionImportRequest) return;
+        if (controller || sessionImportRequest || profileDeletionRequest) return;
         sessionImportReturnFocus = returnFocus ?? (reauthenticate ? $('x-session-reconnect') : $('account-chip'));
         $('session-import-form').reset();
         sessionImportReauthenticate = Boolean(reauthenticate && xUsername);
@@ -983,6 +1092,8 @@
       // Handle authentication
       async function handleAuth(event) {
         event.preventDefault();
+        if (profileDeletionRequest) return;
+        let generation = authStateGeneration;
         const username = $('#auth-username').value.trim();
         const email = $('#auth-email').value.trim();
         const password = $('#auth-password').value;
@@ -1007,9 +1118,10 @@
             body: JSON.stringify(isSignUp ? { email, username, password } : { username, password }),
           });
           const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration) return;
           if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
 
-          authStateGeneration += 1;
+          generation = ++authStateGeneration;
           if (data.user) {
             if (data.user.groq) applyGroqConfiguration(data.user.groq);
             const usernameLabel = String(data.user.username ?? username).replace(/^@/, '');
@@ -1018,21 +1130,26 @@
             $('menu-username').textContent = currentAppUsername;
             $('menu-user-email').textContent = currentUserEmail;
             $('signin').classList.add('hidden');
+            $('delete-profile').disabled = false;
             const selectedAccount = data.activeXAccount ?? data.xSession?.handle ?? data.user.activeXAccount ?? null;
             if (Array.isArray(data.accounts)) applyLinkedAccounts(data.accounts, selectedAccount ?? undefined);
             else {
               displayActiveXAccount(selectedAccount);
               await loadLinkedAccounts();
             }
+            if (generation !== authStateGeneration) return;
             applyXSessionHealth(data);
           }
           await loadGroqConfiguration();
+          if (generation !== authStateGeneration) return;
           await loadHistory();
+          if (generation !== authStateGeneration) return;
           hideAuthOverlay();
         } catch (error) {
+          if (generation !== authStateGeneration) return;
           $('#auth-error').textContent = `${isSignUp ? 'Sign up' : 'Sign in'} failed: ${error.message}`;
         } finally {
-          submit.disabled = false;
+          if (generation === authStateGeneration) submit.disabled = false;
         }
       }
 
@@ -1178,6 +1295,7 @@
       }
 
       async function switchXAccount(xUsername) {
+        if (profileDeletionRequest) return;
         const generation = authStateGeneration;
         try {
           const response = await fetch('/api/auth/switch-account', {
@@ -1199,6 +1317,7 @@
       }
 
       async function unlinkXAccount(xUsername) {
+        if (profileDeletionRequest) return;
         const generation = authStateGeneration;
         const previousAccounts = linkedXAccounts.map((account) => ({ ...account }));
         const previousActive = activeXAccount;
@@ -1237,7 +1356,7 @@
 
       async function importSession(event) {
         event.preventDefault();
-        if (controller || sessionImportRequest) return;
+        if (controller || sessionImportRequest || profileDeletionRequest) return;
         const generation = authStateGeneration;
         const request = new AbortController();
         sessionImportRequest = request;
@@ -1338,6 +1457,9 @@
         $('history-list').innerHTML = '<div class="history-empty">Sign in to view execution history.</div>';
         $('signin').classList.remove('hidden');
         $('signin').disabled = false;
+        $('auth-submit').disabled = false;
+        $('delete-profile').disabled = true;
+        $('delete-profile-dialog').close();
         $('add-x-account').disabled = false;
         $('account-chip').classList.remove('hidden');
         applyGroqConfiguration({ configured: false, source: 'none' });
@@ -1348,6 +1470,7 @@
         $('run-msg').textContent = '';
         $('config-hint').textContent = '';
         closeAccountMenu();
+        setRunning(false);
       }
 
       function applyAuthState(data) {
@@ -1377,6 +1500,7 @@
         }
         applyXSessionHealth(data);
         $('signin').classList.add('hidden');
+        $('delete-profile').disabled = !currentAppUsername || Boolean(profileDeletionRequest);
         $('account-chip').classList.remove('hidden');
         closeAccountMenu();
       }
@@ -1394,6 +1518,7 @@
         const saveGroqKeyBtn = $('#save-groq-key');
         const clearGroqKeyBtn = $('#clear-groq-key');
         const sessionImportModal = $('session-import-modal');
+        const deleteProfileDialog = $('delete-profile-dialog');
 
         signinBtn.addEventListener('click', (event) => {
           event.stopPropagation();
@@ -1409,6 +1534,31 @@
         passwordToggle.addEventListener('click', () => {
           setAuthPasswordVisible($('#auth-password').type === 'password');
           $('#auth-password').focus();
+        });
+        $('delete-profile').addEventListener('click', openProfileDeletion);
+        $('confirm-delete-profile').addEventListener('click', deleteProfile);
+        $('cancel-delete-profile').addEventListener('click', () => deleteProfileDialog.close());
+        deleteProfileDialog.addEventListener('cancel', (event) => {
+          if (profileDeletionRequest) event.preventDefault();
+        });
+        deleteProfileDialog.addEventListener('keydown', (event) => {
+          if (event.key !== 'Tab') return;
+          const controls = [...deleteProfileDialog.querySelectorAll('button:not(:disabled)')];
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (!first) {
+            event.preventDefault();
+            deleteProfileDialog.focus();
+          } else if (event.shiftKey && (document.activeElement === first || !controls.includes(document.activeElement))) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && (document.activeElement === last || !controls.includes(document.activeElement))) {
+            event.preventDefault();
+            first.focus();
+          }
+        });
+        deleteProfileDialog.addEventListener('close', () => {
+          if (currentAppUsername) $('account-chip').focus();
         });
         addXAccountBtn.addEventListener('click', addXAccount);
         $('x-session-reconnect').addEventListener('click', () => openReauthentication());
@@ -1481,6 +1631,12 @@
         if (auth === 'ok') setText('auth-msg', 'Signed in — cookies saved to auth.json.', 'ok');
         else if (auth === 'error') setText('auth-msg', `Sign-in failed: ${reason ?? 'unknown error'}`, 'err');
         if (auth) window.history.replaceState(null, '', window.location.pathname);
+        if (params.get('profileDeleted') === '1' && !currentAppUsername) {
+          showAuthOverlay();
+          toggleAuthMode(true);
+          showProfileDeletedToast();
+          window.history.replaceState(null, '', window.location.pathname);
+        }
       }
 
       $('account-chip').addEventListener('click', (event) => {
@@ -1505,7 +1661,9 @@
       });
 
       $('signout').addEventListener('click', async () => {
+        if (profileDeletionRequest) return;
         $('signout').disabled = true;
+        $('delete-profile').disabled = true;
         authStateGeneration += 1;
         controller?.abort();
         controller = null;
@@ -1527,6 +1685,7 @@
           setStatus('Sign out failed', 'err', error.message);
         } finally {
           $('signout').disabled = false;
+          $('delete-profile').disabled = !currentAppUsername || Boolean(profileDeletionRequest);
           $('signin').disabled = false;
           $('add-x-account').disabled = false;
         }
@@ -1573,24 +1732,25 @@
       }
 
       function setRunning(running) {
-        $('run').disabled = running || sessionBlocksPublishing();
-        $('dry-run-btn').disabled = running;
-        $('run-url').disabled = running;
-        $('file-upload').disabled = running;
-        $('clear-file').disabled = running || !$('file-upload').value;
-        $('clear-urls').disabled = running || !$('run-url').value.trim();
-        $('act-reply').disabled = running;
-        $('act-like').disabled = running;
-        $('audit-mode').disabled = running;
-        $('headless').disabled = running;
-        $('tone').disabled = running;
-        $('groq-api-key').disabled = running;
-        $('save-groq-key').disabled = running;
-        $('clear-groq-key').disabled = running || !groqConfigured;
-        $('stop').disabled = !running;
-        $('add-x-account').disabled = running || Boolean(sessionImportRequest);
+        const busy = running || Boolean(profileDeletionRequest);
+        $('run').disabled = busy || sessionBlocksPublishing();
+        $('dry-run-btn').disabled = busy;
+        $('run-url').disabled = busy;
+        $('file-upload').disabled = busy;
+        $('clear-file').disabled = busy || !$('file-upload').value;
+        $('clear-urls').disabled = busy || !$('run-url').value.trim();
+        $('act-reply').disabled = busy;
+        $('act-like').disabled = busy;
+        $('audit-mode').disabled = busy;
+        $('headless').disabled = busy;
+        $('tone').disabled = busy;
+        $('groq-api-key').disabled = busy;
+        $('save-groq-key').disabled = busy;
+        $('clear-groq-key').disabled = busy || !groqConfigured;
+        $('stop').disabled = !running || Boolean(profileDeletionRequest);
+        $('add-x-account').disabled = busy || Boolean(sessionImportRequest);
         for (const button of document.querySelectorAll('.update-x-session')) {
-          button.disabled = running || Boolean(sessionImportRequest);
+          button.disabled = busy || Boolean(sessionImportRequest);
         }
       }
 
@@ -1694,7 +1854,7 @@
       }
 
       async function startRun(dryRun) {
-        if (controller || sessionImportRequest) return;
+        if (controller || sessionImportRequest || profileDeletionRequest) return;
         if (!dryRun && sessionBlocksPublishing()) {
           setStatus(
             'Reconnection needed',
@@ -1719,7 +1879,7 @@
         else startElapsedTimer();
 
         const groqConfiguration = await loadGroqConfiguration();
-        if (generation !== authStateGeneration || controller || sessionImportRequest) return;
+        if (generation !== authStateGeneration || controller || sessionImportRequest || profileDeletionRequest) return;
         if (!groqConfiguration?.configured) {
           stopElapsedTimer();
           setStatus('Groq key required', 'err', 'Save a session API key in the dashboard.');
@@ -1748,6 +1908,7 @@
             }),
             signal: controller.signal,
           });
+          if (generation !== authStateGeneration) return;
 
           if (!response.ok) {
             const data = await response.json().catch(() => ({}));
@@ -1763,6 +1924,7 @@
 
           for (;;) {
             const { value, done } = await reader.read();
+            if (generation !== authStateGeneration) return;
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             let newline;
@@ -1784,6 +1946,7 @@
             setInspectorStats('Stopped', 'Batch stream ended before 100%.');
           }
         } catch (error) {
+          if (generation !== authStateGeneration) return;
           if (error.name === 'AbortError') {
             setStatus('Stopped', 'warn', 'Stopped by user.');
             setInspectorStats('Stopped', 'Stopped by user.');
@@ -1798,9 +1961,11 @@
             setInspectorStats('Run failed', error.message);
           }
         } finally {
-          stopElapsedTimer();
-          controller = null;
-          setRunning(false);
+          if (generation === authStateGeneration) {
+            stopElapsedTimer();
+            controller = null;
+            setRunning(false);
+          }
         }
       }
 

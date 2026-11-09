@@ -4,7 +4,7 @@ import bodyParser from 'body-parser';
 import cors from 'cors';
 import bcrypt from 'bcrypt';
 import { spawn } from 'node:child_process';
-import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -24,6 +24,7 @@ import { verifyXSessionInBrowser } from './lib/x-session-health.js';
  * Local service for the X reply automation.
  *
  *   POST /api/auth/register, /api/auth/login -> persisted local user authentication
+ *   DELETE /api/auth/me -> delete the profile, configuration, and all saved X sessions
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
  *   POST /api/auth/import-session -> import X cookies -> active per-user session
  *   POST /api/auth/switch-account -> select the X session used by automation
@@ -66,6 +67,7 @@ const MAX_GROQ_API_KEY_LENGTH = 512;
 const MAX_X_ACCOUNTS = 3;
 const APP_SESSION_COOKIE = 'x_engine_session';
 const APP_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const PROFILE_DELETION_MESSAGE = 'User profile, Groq API key, and associated X sessions completely deleted.';
 const DEVELOPMENT_SESSION_SECRET = 'dev-secret-change-in-production';
 const SESSION_SECRET = String(process.env.SESSION_SECRET || DEVELOPMENT_SESSION_SECRET);
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS ?? 12);
@@ -132,6 +134,7 @@ const REPLY_OUT_FILE = join(tmpdir(), 'playwright-gemini-reply.txt');
 
 /** Only one automation / session import at a time; drives the 409 + the Stop button. */
 let activeRun = null;
+const deletingUserProfiles = new Set();
 
 const app = express();
 app.disable('x-powered-by');
@@ -337,6 +340,10 @@ async function loadUserDb() {
     return rows.map(userFromDatabaseRow);
   }
 
+  return loadLocalUserDb();
+}
+
+async function loadLocalUserDb() {
   try {
     const raw = await readFile(USER_DB_FILE, 'utf8');
     const data = JSON.parse(raw);
@@ -618,6 +625,7 @@ async function authenticatedUser(req, { required = true } = {}) {
     if (required) throw new HttpError(401, 'Invalid or expired session');
     return null;
   }
+  assertUserProfileAvailable(users[index].id);
 
   return { token, users, index, user: users[index] };
 }
@@ -701,6 +709,7 @@ async function deleteAuthFile(path = AUTH_FILE) {
 /** Build a minimal Playwright storage state from an x_sessions row. */
 function sessionStateFromRecord(record) {
   return {
+    appUserId: record.user_id,
     cookies: [
       {
         name: 'auth_token',
@@ -742,9 +751,12 @@ async function xSessionExists(userId, xUsername) {
 }
 
 async function readXSession(userId, xUsername) {
-  if (!isPostgresEnabled()) return readAuthFile(sessionFileFor(userId, xUsername));
+  if (!isPostgresEnabled()) {
+    const state = await readAuthFile(sessionFileFor(userId, xUsername));
+    return state ? { ...state, appUserId: userId } : null;
+  }
   const { rows } = await query(
-    `SELECT handle, auth_token, ct0, updated_at
+    `SELECT user_id, handle, auth_token, ct0, updated_at
        FROM x_sessions
       WHERE user_id = $1 AND handle = $2
       LIMIT 1`,
@@ -755,8 +767,9 @@ async function readXSession(userId, xUsername) {
 
 async function writeXSession(userId, xUsername, storageState) {
   if (!isPostgresEnabled()) {
-    await writeAuthFile(storageState, sessionFileFor(userId, xUsername));
-    return storageState;
+    const state = { ...storageState, appUserId: userId };
+    await writeAuthFile(state, sessionFileFor(userId, xUsername));
+    return state;
   }
 
   const cookies = Array.isArray(storageState?.cookies) ? storageState.cookies : [];
@@ -773,7 +786,7 @@ async function writeXSession(userId, xUsername, storageState) {
      DO UPDATE SET auth_token = EXCLUDED.auth_token,
                    ct0 = EXCLUDED.ct0,
                    updated_at = CURRENT_TIMESTAMP
-     RETURNING handle, auth_token, ct0, updated_at`,
+     RETURNING user_id, handle, auth_token, ct0, updated_at`,
     [userId, xUsername, authToken, ct0],
   );
   return sessionStateFromRecord(rows[0]);
@@ -791,7 +804,7 @@ async function deleteXSession(userId, xUsername) {
 async function latestXSessionForUser(userId) {
   if (!isPostgresEnabled()) return null;
   const { rows } = await query(
-    `SELECT handle, auth_token, ct0, updated_at
+    `SELECT user_id, handle, auth_token, ct0, updated_at
        FROM x_sessions
       WHERE user_id = $1
       ORDER BY updated_at DESC, id DESC
@@ -807,7 +820,7 @@ async function latestXSessionForUser(userId) {
 async function latestXSession() {
   if (!isPostgresEnabled()) return null;
   const { rows } = await query(
-    `SELECT s.handle, s.auth_token, s.ct0, s.updated_at
+    `SELECT s.user_id, s.handle, s.auth_token, s.ct0, s.updated_at
        FROM x_sessions s
        JOIN users u ON u.id = s.user_id
       ORDER BY (s.handle = u.default_handle) DESC, s.updated_at DESC, s.id DESC
@@ -861,6 +874,10 @@ class ValidationError extends HttpError {
   }
 }
 
+function assertUserProfileAvailable(userId) {
+  if (deletingUserProfiles.has(userId)) throw new HttpError(409, 'User profile deletion is in progress');
+}
+
 function getGroqConfiguration(user) {
   const apiKey = String(user?.groqApiKey ?? '').trim() || null;
   return {
@@ -885,6 +902,7 @@ async function saveUserGroqApiKey(userId, apiKey) {
     const users = await loadUserDb();
     const user = users.find((candidate) => candidate.id === userId);
     if (!user) throw new HttpError(401, 'User account no longer exists');
+    assertUserProfileAvailable(user.id);
     if (apiKey) user.groqApiKey = apiKey;
     else delete user.groqApiKey;
     await saveUserDb(users);
@@ -1027,6 +1045,7 @@ async function stageActiveSession(user, { sessionToken = null, onlyWhenIdle = fa
       user = users.find((candidate) => candidate.id === user.id && candidate.sessionToken === sessionToken);
       if (!user) throw new HttpError(401, 'The app session is no longer active');
     }
+    assertUserProfileAvailable(user.id);
     const session = await activeSessionFor(user, { required: true });
     // A mutation that already held the write lock may finish during verification.
     // Never stage a different account or cookie pair than the one just checked.
@@ -1308,6 +1327,7 @@ app.post('/api/auth/import-session', async (req, res, next) => {
       const users = await loadUserDb();
       const current = users.find((user) => user.id === auth.user.id && user.sessionToken === auth.token);
       if (!current) throw new HttpError(401, 'The app session is no longer active');
+      assertUserProfileAvailable(current.id);
       normalizeUserAccounts(current);
       if (!current.xAccounts.includes(username) && current.xAccounts.length >= MAX_X_ACCOUNTS) {
         throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
@@ -1431,6 +1451,7 @@ app.put('/api/auth', async (req, res, next) => {
         const users = await loadUserDb();
         const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
         if (!current) throw new HttpError(401, 'The app session is no longer active');
+        assertUserProfileAvailable(current.id);
         selectedSession = await activeSessionFor(current, { required: true });
       }
       const payload = selectedSession
@@ -1485,6 +1506,7 @@ app.post('/api/auth/logout', async (req, res, next) => {
         const users = await loadUserDb();
         const user = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
         if (!user) throw new HttpError(401, 'The app session is no longer active');
+        assertUserProfileAvailable(user.id);
         user.sessionToken = null;
         await saveUserDb(users);
       });
@@ -1564,6 +1586,7 @@ app.post('/api/auth/login', async (req, res, next) => {
     const user = await withWriteLock(async () => {
       const users = await loadUserDb();
       const match = users.find((candidate) => candidate.username.toLowerCase() === username.toLowerCase());
+      if (match) assertUserProfileAvailable(match.id);
       if (!match || !(await verifyPassword(password, match.passwordHash))) {
         throw new HttpError(401, 'Invalid username or password');
       }
@@ -1638,6 +1661,129 @@ app.get('/api/auth/me', async (req, res, next) => {
   }
 });
 
+/** Called under the write lock, after this user's automation/import has stopped. */
+async function deleteUserProfileData(user, users, token) {
+  const postgres = isPostgresEnabled();
+  const localUsers = postgres ? await loadLocalUserDb() : users;
+  // A pre-PostgreSQL copy can have a different ID. Only an exact username/email
+  // identity match authorizes removing that legacy profile and its session files.
+  const ownedLocalUsers = localUsers.filter((candidate) => postgres
+    ? String(candidate.username ?? '').toLowerCase() === user.username.toLowerCase()
+      && Boolean(user.email) && String(candidate.email ?? '').toLowerCase() === user.email.toLowerCase()
+    : candidate.id === user.id);
+  const profileIds = new Set([String(user.id), ...ownedLocalUsers.map((candidate) => String(candidate.id))]);
+  if (postgres && (users.some((candidate) => candidate.id !== user.id && profileIds.has(String(candidate.id)))
+    || localUsers.some((candidate) => !ownedLocalUsers.includes(candidate) && profileIds.has(String(candidate.id))))) {
+    throw new HttpError(503, 'Local storage ownership conflicts with this profile. Check persistent storage before retrying.');
+  }
+  const sessionDirectories = [...profileIds].map(sessionDirectoryFor);
+  const sessionKeys = new Set();
+  const rememberCredentials = (credentials) => {
+    if (credentials.auth_token && credentials.ct0) sessionKeys.add(xSessionCredentialKey(credentials));
+  };
+  if (postgres) {
+    const { rows } = await query('SELECT auth_token, ct0 FROM x_sessions WHERE user_id = $1', [user.id]);
+    rows.forEach(rememberCredentials);
+  }
+  const rememberDirectoryCredentials = async (directory) => {
+    const entries = await readdir(directory, { withFileTypes: true }).catch((error) => {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        await rememberDirectoryCredentials(join(directory, entry.name));
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      // Cookie comparison is only a fallback for older, untagged auth.json files.
+      // Malformed orphan files still belong to this directory and will be removed.
+      const state = await readAuthFile(join(directory, entry.name)).catch((error) => {
+        if (error.code) throw error;
+        return null;
+      });
+      rememberCredentials(xSessionCredentials(state));
+    }
+  };
+  for (const directory of sessionDirectories) await rememberDirectoryCredentials(directory);
+
+  const staged = await readAuthFile(AUTH_FILE);
+  const remainingLocalUsers = localUsers.filter((candidate) => !ownedLocalUsers.includes(candidate));
+  const ownsLegacyStaging = staged && staged.appUserId == null
+    && sessionKeys.has(xSessionCredentialKey(xSessionCredentials(staged)));
+  if (ownsLegacyStaging && activeRun) {
+    throw new HttpError(409, 'Another run is using a legacy staged session. Retry deleting this profile after it finishes.');
+  }
+  const ownsStagedSession = staged && (staged.appUserId != null
+    ? profileIds.has(String(staged.appUserId))
+    : ownsLegacyStaging);
+  const history = await readHistoryFile();
+  const remainingHistory = history.filter((entry) => !profileIds.has(String(entry.userId)));
+
+  // Remove disk copies first, including unlinked sessions and trusted-device data.
+  // Keep the primary profile until cleanup finishes so a storage failure is retryable.
+  // Clear legacy staging before its source files, preserving ownership on retries.
+  if (ownsStagedSession) await deleteAuthFile(AUTH_FILE);
+  for (const directory of sessionDirectories) {
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
+  if (remainingHistory.length !== history.length) {
+    if (remainingHistory.length) await atomicWritePrivateFile(HISTORY_FILE, `${JSON.stringify(remainingHistory, null, 2)}\n`);
+    else await deleteAuthFile(HISTORY_FILE);
+  }
+
+  if (postgres) {
+    if (ownedLocalUsers.length) {
+      await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(remainingLocalUsers, null, 2)}\n`);
+    }
+    await withTransaction(async (tx) => {
+      // Explicitly remove every cookie row, not only handles in linked_handles.
+      // The users FK also cascades, and this covers older database constraints.
+      await tx('DELETE FROM x_sessions WHERE user_id = $1', [user.id]);
+      const { rowCount } = await tx('DELETE FROM users WHERE id = $1 AND session_token = $2', [user.id, token]);
+      if (rowCount !== 1) throw new HttpError(401, 'The app session is no longer active');
+    });
+  } else {
+    await saveUserDb(remainingLocalUsers);
+  }
+  for (const key of sessionKeys) xSessionHealthCache.delete(key);
+}
+
+app.delete('/api/auth/me', async (req, res, next) => {
+  let deletingUserId = null;
+  try {
+    const auth = await authenticatedUser(req);
+    await withWriteLock(async () => {
+      const users = await loadUserDb();
+      const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
+      assertUserProfileAvailable(current.id);
+      deletingUserProfiles.add(current.id);
+      deletingUserId = current.id;
+    });
+
+    // Do not hold the write lock while waiting: a stopping run may still need
+    // it to finish history writes or roll back an interrupted session import.
+    await stopActiveRunForUser(deletingUserId);
+    await withWriteLock(async () => {
+      const users = await loadUserDb();
+      const current = users.find((candidate) => candidate.id === deletingUserId && candidate.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
+      if (activeRun?.userId === current.id) throw new HttpError(409, 'A run is already in progress');
+      await deleteUserProfileData(current, users, auth.token);
+    });
+
+    clearSessionCookie(res);
+    return res.json({ success: true, message: PROFILE_DELETION_MESSAGE });
+  } catch (error) {
+    if (error instanceof HttpError) return next(error);
+    console.error('[storage] User profile deletion could not finish.');
+    return next(new HttpError(503, 'User profile deletion could not finish. Retry to complete the cleanup.'));
+  } finally {
+    if (deletingUserId !== null) deletingUserProfiles.delete(deletingUserId);
+  }
+});
+
 // Link X account
 app.post('/api/auth/x-accounts', async (req, res, next) => {
   try {
@@ -1650,6 +1796,7 @@ app.post('/api/auth/x-accounts', async (req, res, next) => {
       const users = await loadUserDb();
       const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
       if (!current) throw new HttpError(401, 'The app session is no longer active');
+      assertUserProfileAvailable(current.id);
       if (activeRun) throw new HttpError(409, 'A run is already in progress');
       normalizeUserAccounts(current);
 
@@ -1694,6 +1841,7 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
       const users = await loadUserDb();
       const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
       if (!current) throw new HttpError(401, 'The app session is no longer active');
+      assertUserProfileAvailable(current.id);
       normalizeUserAccounts(current);
       if (!current.xAccounts.includes(xUsername)) throw new HttpError(404, 'X account is not linked');
       if (activeRun) throw new HttpError(409, 'A run is already in progress');
@@ -1731,6 +1879,7 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
       const users = await loadUserDb();
       const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
       if (!current) throw new HttpError(401, 'The app session is no longer active');
+      assertUserProfileAvailable(current.id);
       if (activeRun?.userId === current.id && (!activeRun.xUsername || activeRun.xUsername === xUsername)) {
         throw new HttpError(409, 'A run is already in progress');
       }
@@ -1983,6 +2132,9 @@ app.post('/api/run', async (req, res) => {
   }
 
   const groqConfiguration = getGroqConfiguration(appAuth.user);
+  if (deletingUserProfiles.has(appAuth.user.id)) {
+    return res.status(409).json({ error: 'User profile deletion is in progress' });
+  }
   if (!groqConfiguration.configured) {
     return res.status(400).json({ error: 'Groq API key is not configured. Add a saved key in the dashboard.' });
   }
@@ -2402,6 +2554,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  POST ${HOST}:${PORT}/api/auth/register   (create local user)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);
+  console.log(`  DELETE ${HOST}:${PORT}/api/auth/me       (delete profile, Groq configuration, and X sessions)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/x-accounts (list saved X sessions)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/import-session (import and activate X session cookies)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/switch-account (select active X session)`);

@@ -6,6 +6,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
 
 const dashboard = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+const PROFILE_DELETION_MESSAGE = 'User profile, Groq API key, and associated X sessions completely deleted.';
+const PROFILE_DELETION_WARNING = 'Are you sure you want to permanently delete your app profile? This will permanently remove your saved Groq API Key, X accounts, and all dashboard settings.';
 const cookieValues = (handle = 'alice') => ({
   handle,
   auth_token: `${handle.replace(/^@/, '')}_synthetic_auth_token`,
@@ -35,8 +37,9 @@ async function fixture(t, options = {}) {
     importStatus: options.importStatus ?? 201,
     xSessionStatus: options.xSessionStatus ?? 'valid',
     runStatus: options.runStatus ?? 200,
+    deletionStatus: options.deletionStatus ?? 200,
     runs: [],
-    imports: [], switches: [], requests: [], replies: 0, logouts: 0,
+    imports: [], switches: [], requests: [], deletions: [], replies: 0, logouts: 0, authReplies: 0,
   };
   const health = () => ({
     xSessionValid: state.xSessionStatus === 'valid' ? true
@@ -64,24 +67,44 @@ async function fixture(t, options = {}) {
       res.writeHead(200, { 'content-type': 'text/html' });
       return res.end(dashboard);
     }
-    if (url.pathname === '/api/auth/logout') {
+    if (url.pathname === '/api/auth/me' && req.method === 'DELETE') {
+      state.deletions.push({ cookie: req.headers.cookie, body: raw });
+      await options.profileDeletionGate?.promise;
+      if (state.deletionStatus !== 200) {
+        if (state.deletionStatus === 401) state.authenticated = false;
+        return json({ error: options.deletionError ?? 'User profile deletion could not finish. Retry to complete the cleanup.' }, state.deletionStatus);
+      }
       state.authenticated = false;
+      state.groqConfigured = false;
+      state.accounts = [];
+      res.setHeader('set-cookie', 'x_engine_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict');
+      return json({ success: true, message: PROFILE_DELETION_MESSAGE });
+    }
+    if (url.pathname === '/api/auth/logout') {
       state.logouts += 1;
+      await options.logoutGate?.promise;
+      state.authenticated = false;
       return json({ ok: true, authenticated: false });
     }
     if (url.pathname === '/api/auth' || url.pathname === '/api/auth/me') {
-      return json(state.authenticated ? {
+      const body = state.authenticated ? {
         userAuthenticated: true, authenticated: state.accounts.length > 0,
         user: { username: 'dashboard_user', email: 'dashboard@example.test' },
         username: activeHandle(), activeXAccount: activeHandle(),
         xAccounts: state.accounts.map((account) => account.xUsername),
-        accounts: state.accounts,
+        accounts: structuredClone(state.accounts),
         ...health(),
       } : {
         authenticated: false, userAuthenticated: false, user: null, username: null,
         activeXAccount: null, xAccounts: [], accounts: [],
         xSessionValid: null, xSessionStatus: 'none', xSessionCheckedAt: null,
-      });
+      };
+      await options.authGate?.promise;
+      state.authReplies += 1;
+      return json(body);
+    }
+    if (!state.authenticated && ['/api/config/groq', '/api/auth/x-accounts', '/api/history'].includes(url.pathname)) {
+      return json({ error: 'Authentication required' }, 401);
     }
     if (url.pathname === '/api/config/groq') {
       if (req.method === 'DELETE') {
@@ -98,6 +121,7 @@ async function fixture(t, options = {}) {
     if (url.pathname === '/api/auth/x-accounts') return json(state.accounts);
     if (url.pathname === '/api/run' && req.method === 'POST') {
       state.runs.push(JSON.parse(raw || '{}'));
+      await options.runGate?.promise;
       return json(options.runBody ?? {
         error: 'X connection expired for @alice. Re-authenticate the account before publishing.',
         code: 'X_SESSION_EXPIRED',
@@ -151,7 +175,7 @@ async function fixture(t, options = {}) {
   baseUrl = `http://127.0.0.1:${server.address().port}`;
   let browser;
   t.after(async () => {
-    for (const gate of [options.importGate, ...(options.importGates ?? []), options.groqGate]) gate?.resolve();
+    for (const gate of [options.importGate, ...(options.importGates ?? []), options.groqGate, options.profileDeletionGate, options.authGate, options.logoutGate, options.runGate]) gate?.resolve();
     await browser?.close();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -184,8 +208,276 @@ async function fixture(t, options = {}) {
     await page.locator('#session-import-submit').click();
     await until(() => state.imports.length === count + 1);
   };
-  return { page, context, state, errors, open, fill, submit };
+  const openDeletion = async () => {
+    await page.locator('#account-chip').click();
+    await page.locator('#delete-profile').click();
+    await page.locator('#delete-profile-dialog').waitFor({ state: 'visible' });
+  };
+  const deletionLanding = async () => {
+    await page.waitForFunction(() => document.getElementById('signup-tab').classList.contains('active')
+      && !document.getElementById('profile-toast').classList.contains('hidden'));
+    assert.equal(new URL(page.url()).pathname, '/');
+    assert.equal(new URL(page.url()).search, '');
+  };
+  return { page, context, state, errors, open, fill, submit, openDeletion, deletionLanding };
 }
+
+test('profile deletion has a red menu option, an explicit warning, and safe cancellation', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, openDeletion } = await fixture(t, {
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }], groqConfigured: true,
+  });
+  await page.evaluate(() => localStorage.setItem('cached-groq-key', 'synthetic-key-must-survive-cancel'));
+  await openDeletion();
+  assert.equal(await page.locator('#delete-profile').textContent(), 'Delete Profile');
+  assert.equal(await page.locator('#delete-profile').evaluate((button) => getComputedStyle(button).color), 'rgb(255, 116, 126)');
+  assert.equal(await page.locator('#delete-profile-warning').textContent(), PROFILE_DELETION_WARNING);
+  assert.match(await page.locator('#delete-profile-dialog').textContent(), /Your actual X accounts will not be deleted/);
+  assert.equal(await page.locator('#cancel-delete-profile').evaluate((button) => document.activeElement === button), true);
+  await page.locator('#cancel-delete-profile').click();
+  await page.locator('#delete-profile-dialog').waitFor({ state: 'hidden' });
+  await page.waitForFunction(() => document.activeElement.id === 'account-chip');
+  await openDeletion();
+  await page.keyboard.press('Escape');
+  await page.locator('#delete-profile-dialog').waitFor({ state: 'hidden' });
+  assert.deepEqual(state.deletions, []);
+  assert.equal(state.authenticated, true);
+  assert.equal(state.groqConfigured, true);
+  assert.equal(await page.locator('#who').textContent(), '@alice');
+  assert.equal(await page.evaluate(() => localStorage.getItem('cached-groq-key')), 'synthetic-key-must-survive-cancel');
+  assert.deepEqual(errors, []);
+});
+
+test('profile deletion confirmation fits mobile screens and keeps keyboard focus in the dialog', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, openDeletion } = await fixture(t, { viewport: { width: 390, height: 844 } });
+  await openDeletion();
+  const bounds = await page.locator('#delete-profile-dialog').boundingBox();
+  assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 390);
+  assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 844);
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#confirm-delete-profile').evaluate((button) => document.activeElement === button), true);
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#delete-profile-dialog').evaluate((dialog) => dialog.contains(document.activeElement)), true);
+  await page.keyboard.press('Escape');
+  await page.locator('#delete-profile-dialog').waitFor({ state: 'hidden' });
+  assert.deepEqual(state.deletions, []);
+  assert.deepEqual(errors, []);
+});
+
+test('profile deletion clears all cached keys and settings, expires the cookie, and redirects with a success toast', { timeout: 20_000 }, async (t) => {
+  const { page, context, state, errors, openDeletion, deletionLanding } = await fixture(t, {
+    accounts: [
+      { xUsername: 'alice', active: true, status: 'ready' },
+      { xUsername: 'bob', active: false, status: 'ready' },
+    ], groqConfigured: true,
+  });
+  await page.evaluate(() => {
+    localStorage.setItem('groq_api_key', 'gsk_synthetic_deleted_profile_key');
+    localStorage.setItem('x-engine-session-token', 'legacy-app-token');
+    localStorage.setItem('dashboard-settings', JSON.stringify({ tone: 'direct', theme: 'dark' }));
+    sessionStorage.setItem('groqApiKey', 'gsk_synthetic_deleted_profile_key');
+    sessionStorage.setItem('draft', 'private draft');
+  });
+  await page.locator('#groq-api-key').fill('gsk_synthetic_unsaved_key');
+  await page.locator('#run-url').fill('https://x.com/alice/status/1');
+  await openDeletion();
+  await page.locator('#confirm-delete-profile').click();
+  await deletionLanding();
+  assert.equal(state.deletions.length, 1);
+  assert.match(state.deletions[0].cookie, /x_engine_session=synthetic-app-session/);
+  assert.equal(state.deletions[0].body, '');
+  assert.equal(state.requests.filter((request) => request.method === 'DELETE' && request.path === '/api/auth/me').length, 1);
+  assert.equal(state.authenticated, false);
+  assert.equal(state.groqConfigured, false);
+  assert.deepEqual(state.accounts, []);
+  assert.equal((await context.cookies()).some((cookie) => cookie.name === 'x_engine_session'), false);
+  assert.deepEqual(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } })), { local: {}, session: {} });
+  assert.equal(await page.locator('#auth-modal').isVisible(), true);
+  assert.equal(await page.locator('#auth-title').textContent(), 'Create your account');
+  assert.equal(await page.locator('#profile-toast').textContent(), PROFILE_DELETION_MESSAGE);
+  assert.equal(await page.locator('#groq-api-key').inputValue(), '');
+  assert.equal(await page.locator('#run-url').inputValue(), '');
+  assert.equal(await page.locator('.linked-account-item').count(), 0);
+  assert.match(await page.locator('#history-list').textContent(), /Sign in/);
+  const rendered = await page.locator('body').innerText();
+  for (const secret of ['gsk_synthetic_deleted_profile_key', 'gsk_synthetic_unsaved_key', 'legacy-app-token', 'private draft']) {
+    assert.equal(rendered.includes(secret), false);
+  }
+  assert.deepEqual(errors, []);
+});
+
+test('pending profile deletion suppresses duplicate requests and prevents cancellation or conflicting actions', { timeout: 20_000 }, async (t) => {
+  const profileDeletionGate = deferred();
+  const { page, state, errors, openDeletion, deletionLanding } = await fixture(t, {
+    profileDeletionGate, groqConfigured: true,
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+  });
+  await openDeletion();
+  await page.locator('#confirm-delete-profile').click();
+  await until(() => state.deletions.length === 1);
+  assert.equal(await page.locator('#delete-profile-dialog').getAttribute('aria-busy'), 'true');
+  for (const id of ['confirm-delete-profile', 'cancel-delete-profile', 'delete-profile', 'signout', 'run', 'dry-run-btn', 'add-x-account', 'save-groq-key', 'clear-groq-key']) {
+    assert.equal(await page.locator(`#${id}`).isDisabled(), true, id);
+  }
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#delete-profile-dialog').isVisible(), true);
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#delete-profile-dialog').evaluate((dialog) => dialog.contains(document.activeElement)), true);
+  await page.evaluate(() => {
+    void deleteProfile();
+    void deleteProfile();
+    void startRun(false);
+    void saveGroqApiKey();
+    void switchXAccount('bob');
+    void unlinkXAccount('alice');
+  });
+  assert.equal(state.deletions.length, 1);
+  assert.deepEqual(state.runs, []);
+  assert.deepEqual(state.switches, []);
+  assert.equal(state.logouts, 0);
+  profileDeletionGate.resolve();
+  await deletionLanding();
+  assert.equal(state.deletions.length, 1);
+  assert.deepEqual(errors, []);
+});
+
+for (const status of [409, 503]) {
+  test(`a ${status} profile deletion failure preserves saved data and permits an explicit retry`, { timeout: 20_000 }, async (t) => {
+    const { page, state, errors, openDeletion, deletionLanding } = await fixture(t, {
+      deletionStatus: status, groqConfigured: true,
+      accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+    });
+    await page.evaluate(() => {
+      localStorage.setItem('cached-key', 'synthetic-saved-key');
+      sessionStorage.setItem('dashboard-settings', 'must-survive-failure');
+    });
+    await openDeletion();
+    await page.locator('#confirm-delete-profile').click();
+    await page.waitForFunction(() => document.getElementById('delete-profile-error').textContent.includes('Retry to complete the cleanup'));
+    assert.equal(await page.locator('#delete-profile-dialog').isVisible(), true);
+    assert.equal(await page.locator('#confirm-delete-profile').isEnabled(), true);
+    assert.equal(await page.locator('#cancel-delete-profile').isEnabled(), true);
+    assert.equal(await page.locator('#delete-profile-dialog').getAttribute('aria-busy'), 'false');
+    assert.equal(await page.locator('#who').textContent(), '@alice');
+    assert.equal(await page.locator('#profile-toast').isVisible(), false);
+    assert.equal(state.authenticated, true);
+    assert.equal(state.groqConfigured, true);
+    assert.equal(state.accounts.length, 1);
+    assert.equal(await page.evaluate(() => localStorage.getItem('cached-key')), 'synthetic-saved-key');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('dashboard-settings')), 'must-survive-failure');
+    state.deletionStatus = 200;
+    await page.locator('#confirm-delete-profile').click();
+    await deletionLanding();
+    assert.equal(state.deletions.length, 2);
+    assert.deepEqual(await page.evaluate(() => [localStorage.length, sessionStorage.length]), [0, 0]);
+    assert.deepEqual(errors, []);
+  });
+}
+
+test('an unauthenticated profile deletion returns to sign-in without claiming a successful deletion', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, openDeletion } = await fixture(t, {
+    deletionStatus: 401, groqConfigured: true, accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+  });
+  await page.evaluate(() => localStorage.setItem('saved-setting', 'not-confirmed-deleted'));
+  await openDeletion();
+  await page.locator('#confirm-delete-profile').click();
+  await page.locator('#auth-modal').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#auth-error').textContent(), /Your app session expired/);
+  assert.equal(await page.locator('#delete-profile-dialog').isVisible(), false);
+  assert.equal(await page.locator('#profile-toast').isVisible(), false);
+  assert.equal(await page.locator('#who').textContent(), 'Not connected');
+  assert.equal(await page.locator('#groq-api-key').inputValue(), '');
+  assert.equal(await page.locator('.linked-account-item').count(), 0);
+  assert.equal(await page.locator('#signin-tab').getAttribute('aria-selected'), 'true');
+  assert.equal(await page.evaluate(() => localStorage.getItem('saved-setting')), 'not-confirmed-deleted');
+  assert.equal(state.deletions.length, 1);
+  assert.deepEqual(errors, []);
+});
+
+test('profile deletion cannot race an app logout already in progress', { timeout: 20_000 }, async (t) => {
+  const logoutGate = deferred();
+  const { page, state, errors } = await fixture(t, { logoutGate });
+  await page.locator('#account-chip').click();
+  await page.locator('#signout').click();
+  await until(() => state.logouts === 1);
+  assert.equal(await page.locator('#delete-profile').isDisabled(), true);
+  await page.evaluate(() => {
+    openProfileDeletion();
+    void deleteProfile();
+  });
+  assert.equal(await page.locator('#delete-profile-dialog').isVisible(), false);
+  assert.deepEqual(state.deletions, []);
+  logoutGate.resolve();
+  await page.waitForFunction(() => document.getElementById('who').textContent === 'Not connected');
+  assert.equal(await page.locator('#delete-profile').isDisabled(), true);
+  assert.deepEqual(errors, []);
+});
+
+test('aborting a run for profile deletion cannot overwrite deletion status or re-enable its controls', { timeout: 20_000 }, async (t) => {
+  const runGate = deferred();
+  const profileDeletionGate = deferred();
+  const { page, state, errors, openDeletion, deletionLanding } = await fixture(t, {
+    runGate, profileDeletionGate, runStatus: 409, groqConfigured: true,
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+  });
+  await page.locator('#run-url').fill('https://x.com/alice/status/1');
+  await page.evaluate(() => { window.pendingRun = startRun(false); });
+  await until(() => state.runs.length === 1);
+  await openDeletion();
+  await page.locator('#confirm-delete-profile').click();
+  await until(() => state.deletions.length === 1);
+  await page.evaluate(() => window.pendingRun);
+  assert.equal(await page.locator('#status').textContent(), 'Deleting profile');
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  for (const id of ['run', 'dry-run-btn', 'save-groq-key', 'delete-profile']) {
+    assert.equal(await page.locator(`#${id}`).isDisabled(), true, id);
+  }
+  runGate.resolve();
+  profileDeletionGate.resolve();
+  await deletionLanding();
+  assert.equal(await page.locator('#who').textContent(), 'Not connected');
+  assert.deepEqual(errors, []);
+});
+
+test('profile deletion is unavailable after app logout', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors } = await fixture(t);
+  await page.locator('#account-chip').click();
+  await page.locator('#signout').click();
+  await page.waitForFunction(() => document.getElementById('who').textContent === 'Not connected');
+  await page.locator('#account-chip').click();
+  assert.equal(await page.locator('#delete-profile').isDisabled(), true);
+  await page.evaluate(() => openProfileDeletion());
+  assert.equal(await page.locator('#auth-modal').isVisible(), true);
+  assert.equal(await page.locator('#delete-profile-dialog').isVisible(), false);
+  assert.deepEqual(state.deletions, []);
+  assert.deepEqual(errors, []);
+});
+
+test('a stale bootstrap cannot unlock controls or restore a profile during deletion', { timeout: 20_000 }, async (t) => {
+  const options = {
+    profileDeletionGate: deferred(), groqConfigured: true,
+    accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
+  };
+  const { page, state, errors, openDeletion, deletionLanding } = await fixture(t, options);
+  options.authGate = deferred();
+  const repliesBefore = state.authReplies;
+  const requestsBefore = state.requests.filter((request) => request.path === '/api/auth/me').length;
+  await page.evaluate(() => { window.pendingBootstrap = loadAuth(); });
+  await until(() => state.requests.filter((request) => request.path === '/api/auth/me').length === requestsBefore + 1);
+  await openDeletion();
+  await page.locator('#confirm-delete-profile').click();
+  await until(() => state.deletions.length === 1);
+  options.authGate.resolve();
+  await until(() => state.authReplies === repliesBefore + 1);
+  await page.evaluate(() => window.pendingBootstrap);
+  for (const id of ['delete-profile', 'run', 'dry-run-btn', 'save-groq-key']) {
+    assert.equal(await page.locator(`#${id}`).isDisabled(), true, id);
+  }
+  options.profileDeletionGate.resolve();
+  await deletionLanding();
+  assert.equal(await page.locator('#who').textContent(), 'Not connected');
+  assert.equal(await page.locator('.linked-account-item').count(), 0);
+  assert.deepEqual(errors, []);
+});
 
 test('dashboard imports only masked cookie values and immediately activates the account without opening a viewer', { timeout: 20_000 }, async (t) => {
   const { page, context, state, errors, open, fill, submit } = await fixture(t);

@@ -153,7 +153,7 @@ Account summaries include each cookie pair's last checked health, so switching a
 
 **Cookies grant account access.** Use HTTPS in production and protect the PostgreSQL connection string and `auth.json`. `auth_token` and `ct0` are stored as plain text in `x_sessions` and in the staged `auth.json`; they are not encrypted at the application layer. Health checks confirm that X still accepts the cookies, not that the handle matches the account or that the cookies were obtained with permission. A mismatched handle or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
 
-Install local Chromium before either test suite. Run `npm test` for API, tenant-isolation, persistence, rollback, runner, and real local-browser health regressions. Run `npm run test:ui` for dashboard submission, secret cleanup, error handling, dropdown/re-authentication synchronization, and stale-response checks. API tests use a test-only browser preload; browser health tests route all requests to synthetic pages. Test servers default to isolated local storage or explicitly configured `pg-mem://`, never an inherited deployment database. No test logs into X with real cookies.
+Install local Chromium before either test suite. Run `npm test` for API, tenant-isolation, persistence, profile-deletion cascades, rollback, runner, and real local-browser health regressions. Run `npm run test:ui` for dashboard submission, secret cleanup, profile-deletion confirmation/redirect, error handling, dropdown/re-authentication synchronization, and stale-response checks. API tests use test-only preloads; browser health tests route all requests to synthetic pages. Test servers default to isolated local storage or explicitly configured `pg-mem://`, never an inherited deployment database. No test logs into X with real cookies.
 
 ### Browser execution and session flow
 
@@ -192,6 +192,7 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 | `GET /` | Dashboard UI from `public/index.html` |
 | `GET /api/auth` | Authentication status and active-account metadata; no raw cookie values |
 | `GET /api/auth/me` | App user profile plus active X account, saved `xSession.auth_token`/`ct0`, account summaries, and `xSessionStatus`/`xSessionValid`; restages `auth.json` when idle |
+| `DELETE /api/auth/me` | Permanently delete the authenticated app profile, its saved Groq key/settings, all X sessions, and its local session/history files; revoke the app session |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
 | `POST /api/auth/import-session` | Body `{"handle": "…", "auth_token": "…", "ct0": "…"}` — validate with X, then save, link, and activate an X session |
 | `GET /api/auth/x-accounts` | List linked accounts and their last checked X health, including expired inactive accounts |
@@ -214,6 +215,26 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 ```
 
 Consumers should render only a **status notification** (`Idle` / `Running…` / `Completed successfully` / `Run failed` / sign-in equivalents) — raw log lines stay off the dashboard.
+
+### Delete Local User Profile
+
+Open the profile/account dropdown → **Delete Profile** and confirm the permanent deletion warning. The dashboard calls authenticated **`DELETE /api/auth/me`**; a supplied user ID cannot target another profile.
+
+The server stops that user's running automation, blocks competing logins/mutations during deletion, and removes:
+
+- The entire `users` record, including `groq_api_key`, linked handles, and the default-account setting.
+- Every attached `x_sessions` row, including orphan rows absent from linked-account metadata. Cookie rows and the primary profile are deleted in one PostgreSQL transaction; this application's schema uses `x_sessions`, not a separate `x_accounts` table.
+- The user's whole `sessions/<userId>` directory, including trusted-device state and orphan cookie files, their entries in `history.json`, and their staged `auth.json`. Staged sessions carry `appUserId` ownership metadata; older untagged files are matched by cookies only while no other run is active. Matching pre-PostgreSQL profile copies are also removed from local JSON storage.
+
+Other users' records, saved sessions, and running jobs are preserved. An ambiguous legacy staged session in use by another run returns **409** until that run finishes, rather than erasing its cookies or leaving an orphan behind. Disk cleanup precedes deletion of the primary profile: a storage failure returns retryable **503**, does not claim success or clear the app cookie, and retains the primary profile so the user can retry to finish any partial cleanup. Conflicting legacy user IDs require checking storage ownership before retrying.
+
+Success expires the HttpOnly app session cookie and returns:
+
+```json
+{ "success": true, "message": "User profile, Groq API key, and associated X sessions completely deleted." }
+```
+
+The dashboard clears local/session storage and secret inputs, shows a success toast, and reloads the Register/Login screen. Old cookies and bearer tokens can no longer read Groq settings, accounts, or history; the bootstrap `GET /api/auth/me` keeps its existing signed-out response. The deleted username/email can be registered again with no restored keys or X sessions. This deletes application copies only; it does not delete actual X accounts or revoke the key at Groq.
 
 ### Run actions
 

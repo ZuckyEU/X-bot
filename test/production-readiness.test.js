@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -30,6 +30,7 @@ import {
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SESSION_SECRET = 'test-only-session-secret-with-more-than-32-characters';
+const PROFILE_DELETION_MESSAGE = 'User profile, Groq API key, and associated X sessions completely deleted.';
 
 async function availablePort() {
   const probe = createServer();
@@ -69,7 +70,7 @@ async function startServer(t, extraEnv = {}, options = {}) {
       X_SESSION_CHECK_DISABLED: '1',
       ...extraEnv,
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe', ...(options.ipc ? ['ipc'] : [])],
   });
 
   let output = '';
@@ -92,8 +93,6 @@ async function startServer(t, extraEnv = {}, options = {}) {
       }
     });
   });
-  await ready;
-
   let stopping;
   const stop = () => stopping ??= (async () => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -108,6 +107,7 @@ async function startServer(t, extraEnv = {}, options = {}) {
     if (cleanupData) await rm(dataDir, { recursive: true, force: true });
   })();
   t.after(stop);
+  await ready;
 
   return { baseUrl: `http://127.0.0.1:${port}`, dataDir, child, output: () => output, stop };
 }
@@ -167,6 +167,71 @@ function importSession(baseUrl, cookie, body) {
   return fetch(`${baseUrl}/api/auth/import-session`, {
     method: 'POST', headers: jsonHeaders(cookie), body: JSON.stringify(body),
   });
+}
+
+function deleteProfile(baseUrl, cookie) {
+  return fetch(`${baseUrl}/api/auth/me`, { method: 'DELETE', headers: { cookie } });
+}
+
+async function saveGroqKey(baseUrl, cookie, apiKey = 'test-only-groq-key-no-external-requests') {
+  const response = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(cookie), body: JSON.stringify({ apiKey }),
+  });
+  assert.equal(response.status, 200, await response.text());
+}
+
+function profileDatabaseCommand(child, action, userId) {
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off('message', receive);
+    };
+    const receive = (message) => {
+      if (message?.requestId !== requestId) return;
+      cleanup();
+      if (message.error) reject(new Error(message.error));
+      else resolve(message.result);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('Profile deletion database fixture timed out'));
+    }, 5_000);
+    child.on('message', receive);
+    child.send({ fixture: 'profile-deletion-database', requestId, action, userId }, (error) => {
+      if (!error) return;
+      cleanup();
+      reject(error);
+    });
+  });
+}
+
+async function assertDeletedProfileCannotAuthenticate(baseUrl, account) {
+  for (const path of ['/api/config/groq', '/api/auth/x-accounts', '/api/history', '/api/auth']) {
+    const response = await fetch(`${baseUrl}${path}`, { headers: { cookie: account.cookie } });
+    assert.equal(response.status, 401, path);
+  }
+  const token = account.cookie.slice(account.cookie.indexOf('=') + 1);
+  const bearer = await fetch(`${baseUrl}/api/config/groq`, { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(bearer.status, 401);
+  const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: account.cookie } });
+  assert.equal(me.status, 200); // Preserve the signed-out dashboard bootstrap contract.
+  const signedOut = await me.json();
+  assert.equal(signedOut.user, null);
+  assert.equal(signedOut.userAuthenticated, false);
+  assert.equal(signedOut.xSession, undefined);
+  assert.equal(signedOut.groq, undefined);
+  assert.equal((await deleteProfile(baseUrl, account.cookie)).status, 401);
+  const saved = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(account.cookie),
+    body: JSON.stringify({ apiKey: 'deleted-profile-cannot-save-this-key' }),
+  });
+  assert.equal(saved.status, 401);
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: account.body.user.username, password: account.password }),
+  });
+  assert.equal(login.status, 401);
 }
 
 /**
@@ -976,6 +1041,432 @@ test('Groq status is masked and explicit deletion purges persisted state', async
   assert.deepEqual(await status.json(), { configured: false, source: 'none', preview: null });
 });
 
+test('local profile deletion purges all settings, X sessions, orphan files and history without deleting another user', async (t) => {
+  const { baseUrl, dataDir } = await startServer(t);
+  const owner = await register(baseUrl, 'delete_local');
+  const other = await register(baseUrl, 'delete_local_other');
+  const apiKey = `gsk_${'d'.repeat(48)}`;
+  await saveGroqKey(baseUrl, owner.cookie, apiKey);
+  await saveGroqKey(baseUrl, other.cookie, 'other-user-groq-key-must-survive');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('beta'))).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('alpha', 'other_alpha'))).status, 201);
+  const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ xUsername: 'gamma', storageState: xStorageState('gamma') }),
+  });
+  assert.equal(linked.status, 201);
+  const ownerDirectory = join(dataDir, 'sessions', owner.body.user.id);
+  const otherFile = join(dataDir, 'sessions', other.body.user.id, 'alpha.json');
+  const otherSessionBefore = await readFile(otherFile, 'utf8');
+  await mkdir(join(ownerDirectory, 'old-browser'), { recursive: true });
+  await writeFile(join(ownerDirectory, 'orphan.json'), JSON.stringify(xStorageState('orphan')));
+  await writeFile(join(ownerDirectory, 'broken.json'), 'malformed orphan cookie state');
+  await writeFile(join(ownerDirectory, 'old-browser', 'auth.json'), JSON.stringify(xStorageState('orphan')));
+  const otherHistory = { userId: other.body.user.id, url: 'https://x.com/alpha/status/2' };
+  await writeFile(join(dataDir, 'history.json'), JSON.stringify([
+    { userId: owner.body.user.id, url: 'https://x.com/beta/status/1' }, otherHistory,
+  ]));
+  const usersBefore = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  const ownerRecord = usersBefore.find((user) => user.id === owner.body.user.id);
+  ownerRecord.settings = { groq_api_key: apiKey, theme: 'dark', tone: 'direct' };
+  await writeFile(join(dataDir, 'user-db.json'), JSON.stringify(usersBefore));
+  const otherRecordBefore = usersBefore.find((user) => user.id === other.body.user.id);
+  const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } });
+  assert.equal(me.status, 200);
+  const stagedBefore = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.equal(stagedBefore.appUserId, owner.body.user.id);
+
+  assert.equal((await fetch(`${baseUrl}/api/auth/me`, { method: 'DELETE' })).status, 401);
+  assert.equal((await deleteProfile(baseUrl, 'x_engine_session=expired-token')).status, 401);
+  assert.equal(await readFile(otherFile, 'utf8'), otherSessionBefore);
+  // IDs in a request body must never select somebody else's profile.
+  const deleted = await fetch(`${baseUrl}/api/auth/me`, {
+    method: 'DELETE', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ userId: other.body.user.id }),
+  });
+  assert.equal(deleted.status, 200, await deleted.clone().text());
+  assert.deepEqual(await deleted.json(), { success: true, message: PROFILE_DELETION_MESSAGE });
+  const clearedCookie = deleted.headers.get('set-cookie');
+  assert.match(clearedCookie, /^x_engine_session=;/);
+  assert.match(clearedCookie, /Expires=Thu, 01 Jan 1970/i);
+  assert.match(clearedCookie, /HttpOnly/i);
+  assert.match(clearedCookie, /SameSite=Strict/i);
+  await assert.rejects(stat(ownerDirectory), { code: 'ENOENT' });
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  const usersAfter = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+  assert.deepEqual(usersAfter, [otherRecordBefore]);
+  assert.equal(JSON.stringify(usersAfter).includes(apiKey), false);
+  assert.equal(await readFile(otherFile, 'utf8'), otherSessionBefore);
+  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf8')), [otherHistory]);
+  await assertDeletedProfileCannotAuthenticate(baseUrl, owner);
+
+  const surviving = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: other.cookie } });
+  assert.equal(surviving.status, 200);
+  const survivingBody = await surviving.json();
+  assert.equal(survivingBody.groq.configured, true);
+  assert.equal(survivingBody.xSession.auth_token, importPayload('alpha', 'other_alpha').auth_token);
+  const replacement = await register(baseUrl, 'delete_local');
+  assert.notEqual(replacement.body.user.id, owner.body.user.id);
+  assert.deepEqual(replacement.body.user.xAccounts, []);
+  assert.equal(replacement.body.user.groq.configured, false);
+});
+
+test('PostgreSQL profile deletion leaves no orphan rows or legacy disk copies and permits a clean registration', async (t) => {
+  const { baseUrl, dataDir, child } = await startServer(t, { DATABASE_URL: 'pg-mem://' }, {
+    ipc: true, nodeArgs: ['--import', new URL('./fixtures/profile-deletion-database.js', import.meta.url).href],
+  });
+  const owner = await register(baseUrl, 'delete_pg');
+  const other = await register(baseUrl, 'delete_pg_other');
+  const apiKey = `gsk_${'p'.repeat(48)}`;
+  await saveGroqKey(baseUrl, owner.cookie, apiKey);
+  await saveGroqKey(baseUrl, other.cookie, 'other-pg-groq-key-must-survive');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('beta'))).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('alpha', 'other_pg'))).status, 201);
+  assert.deepEqual(await profileDatabaseCommand(child, 'orphan', owner.body.user.id), { rowCount: 1 });
+  const before = await profileDatabaseCommand(child, 'snapshot');
+  assert.equal(before.users.find((user) => user.id === owner.body.user.id).groq_api_key, apiKey);
+  assert.equal(before.sessions.filter((session) => session.user_id === owner.body.user.id).length, 3);
+
+  const legacyOwnerId = crypto.randomUUID();
+  const legacyOtherId = crypto.randomUUID();
+  const legacyOther = {
+    id: legacyOtherId, username: 'unrelated_legacy_user', email: 'unrelated@example.test',
+    groqApiKey: 'unrelated-legacy-key-must-survive', xAccounts: ['alpha'],
+  };
+  await writeFile(join(dataDir, 'user-db.json'), JSON.stringify([
+    { id: legacyOwnerId, username: owner.body.user.username, email: owner.body.user.email, groqApiKey: apiKey },
+    legacyOther,
+  ]));
+  for (const id of [String(owner.body.user.id), legacyOwnerId, legacyOtherId]) {
+    await mkdir(join(dataDir, 'sessions', id, 'browser'), { recursive: true });
+    await writeFile(join(dataDir, 'sessions', id, '_trusted-login-profile.json'), JSON.stringify(xStorageState('alpha')));
+    await writeFile(join(dataDir, 'sessions', id, 'browser', 'auth.json'), JSON.stringify(xStorageState('alpha')));
+  }
+  const remainingHistory = [
+    { userId: other.body.user.id, url: 'https://x.com/alpha/status/2' },
+    { userId: legacyOtherId, url: 'https://x.com/alpha/status/3' },
+  ];
+  await writeFile(join(dataDir, 'history.json'), JSON.stringify([
+    { userId: owner.body.user.id, url: 'https://x.com/beta/status/1' },
+    { userId: legacyOwnerId, url: 'https://x.com/alpha/status/4' }, ...remainingHistory,
+  ]));
+  assert.equal((await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).status, 200);
+  // Exercise cleanup of auth.json files created before ownership metadata existed.
+  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  delete staged.appUserId;
+  await writeFile(join(dataDir, 'auth.json'), JSON.stringify(staged));
+
+  const deleted = await deleteProfile(baseUrl, owner.cookie);
+  assert.equal(deleted.status, 200, await deleted.clone().text());
+  assert.deepEqual(await deleted.json(), { success: true, message: PROFILE_DELETION_MESSAGE });
+  const after = await profileDatabaseCommand(child, 'snapshot');
+  assert.deepEqual(after.users, before.users.filter((user) => user.id === other.body.user.id));
+  assert.deepEqual(after.sessions, before.sessions.filter((session) => session.user_id === other.body.user.id));
+  assert.equal(JSON.stringify(after).includes(apiKey), false);
+  for (const id of [String(owner.body.user.id), legacyOwnerId]) {
+    await assert.rejects(stat(join(dataDir, 'sessions', id)), { code: 'ENOENT' });
+  }
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  assert.equal((await stat(join(dataDir, 'sessions', legacyOtherId, 'browser', 'auth.json'))).isFile(), true);
+  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8')), [legacyOther]);
+  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf8')), remainingHistory);
+  await assertDeletedProfileCannotAuthenticate(baseUrl, owner);
+  await assert.rejects(profileDatabaseCommand(child, 'orphan', owner.body.user.id), /foreign key constraint/i);
+
+  const replacement = await register(baseUrl, 'delete_pg');
+  assert.notEqual(replacement.body.user.id, owner.body.user.id);
+  assert.deepEqual(replacement.body.user.xAccounts, []);
+  assert.equal(replacement.body.user.groq.configured, false);
+  const settings = await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: replacement.cookie } });
+  assert.deepEqual(await settings.json(), { configured: false, source: 'none', preview: null });
+  const final = await profileDatabaseCommand(child, 'snapshot');
+  assert.equal(final.users.length, 2);
+  assert.deepEqual(final.sessions, after.sessions);
+  const cleanUser = final.users.find((user) => user.id === replacement.body.user.id);
+  assert.equal(cleanUser.groq_api_key, null);
+  assert.equal(cleanUser.default_handle, null);
+  assert.equal(cleanUser.linked_handles, '');
+});
+
+for (const tagged of [true, false]) {
+  test(`profile deletion removes ${tagged ? 'owned staged cookies with no linked accounts' : 'legacy staged cookies from nested orphan files'}`, async (t) => {
+    const { baseUrl, dataDir } = await startServer(t);
+    const owner = await register(baseUrl, 'delete_orphans');
+    const other = await register(baseUrl, 'delete_orphans_other');
+    await saveGroqKey(baseUrl, owner.cookie);
+    const directory = join(dataDir, 'sessions', owner.body.user.id);
+    await mkdir(join(directory, 'orphan-browser'), { recursive: true });
+    await writeFile(join(directory, 'broken.json'), 'malformed orphan session file');
+    const orphan = xStorageState('orphan');
+    if (!tagged) await writeFile(join(directory, 'orphan-browser', 'auth.json'), JSON.stringify(orphan));
+    await writeFile(join(dataDir, 'auth.json'), JSON.stringify(tagged ? { ...orphan, appUserId: owner.body.user.id } : orphan));
+    await writeFile(join(dataDir, 'history.json'), JSON.stringify([{ userId: owner.body.user.id, url: 'https://x.com/orphan/status/1' }]));
+    const deleted = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(deleted.status, 200, await deleted.text());
+    for (const path of [directory, join(dataDir, 'auth.json'), join(dataDir, 'history.json')]) {
+      await assert.rejects(stat(path), { code: 'ENOENT' });
+    }
+    const users = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
+    assert.deepEqual(users.map((user) => user.id), [other.body.user.id]);
+    assert.equal((await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } })).status, 401);
+  });
+}
+
+for (const conflictingStorage of ['local', 'PostgreSQL']) {
+  test(`PostgreSQL profile deletion refuses ambiguous legacy IDs instead of deleting another ${conflictingStorage} user`, async (t) => {
+    const { baseUrl, dataDir, child } = await startServer(t, { DATABASE_URL: 'pg-mem://' }, {
+      ipc: true, nodeArgs: ['--import', new URL('./fixtures/profile-deletion-database.js', import.meta.url).href],
+    });
+    const owner = await register(baseUrl, 'delete_conflict');
+    const other = conflictingStorage === 'PostgreSQL' ? await register(baseUrl, 'delete_conflict_other') : null;
+    await saveGroqKey(baseUrl, owner.cookie);
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+    if (other) assert.equal((await importSession(baseUrl, other.cookie, importPayload('alpha', 'other_conflict'))).status, 201);
+    const legacyUserFile = JSON.stringify([{
+      id: other?.body.user.id ?? owner.body.user.id,
+      username: other ? owner.body.user.username : 'different_legacy_user',
+      email: other ? owner.body.user.email : 'different@example.test',
+      groqApiKey: 'legacy-key-must-survive-ambiguous-ownership',
+    }]);
+    const directory = join(dataDir, 'sessions', String(other?.body.user.id ?? owner.body.user.id));
+    await mkdir(directory, { recursive: true });
+    const legacyCookies = JSON.stringify(xStorageState('legacy_other'));
+    await writeFile(join(directory, 'alpha.json'), legacyCookies);
+    await writeFile(join(dataDir, 'user-db.json'), legacyUserFile);
+    const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    const databaseBefore = await profileDatabaseCommand(child, 'snapshot');
+    const deleted = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(deleted.status, 503);
+    assert.match((await deleted.json()).error, /ownership conflicts/);
+    assert.equal(deleted.headers.get('set-cookie'), null);
+    assert.equal(await readFile(join(directory, 'alpha.json'), 'utf8'), legacyCookies);
+    assert.equal(await readFile(join(dataDir, 'user-db.json'), 'utf8'), legacyUserFile);
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+    assert.deepEqual(await profileDatabaseCommand(child, 'snapshot'), databaseBefore);
+    const settings = await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } });
+    assert.equal(settings.status, 200);
+    assert.equal((await settings.json()).configured, true);
+  });
+}
+
+for (const [storage, databaseUrl] of [['local', ''], ['PostgreSQL', 'pg-mem://']]) {
+  test(`${storage} profile deletion preserves another user's running bot and staged credentials`, { timeout: 20_000 }, async (t) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-delete-other-run-'));
+    const gate = join(dataDir, 'automation-gate');
+    const { baseUrl } = await startServer(t, { DATABASE_URL: databaseUrl, SESSION_TEST_RUN_GATE: gate }, {
+      dataDir, cleanupData: true,
+      nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+    });
+    const owner = await register(baseUrl, 'delete_other_run');
+    const other = await register(baseUrl, 'delete_running_user');
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'owner'))).status, 201);
+    assert.equal((await importSession(baseUrl, other.cookie, importPayload('alpha', 'other'))).status, 201);
+    await saveGroqKey(baseUrl, other.cookie);
+    const otherHistory = { userId: other.body.user.id, url: 'https://x.com/alpha/status/2' };
+    await writeFile(join(dataDir, 'history.json'), JSON.stringify([
+      { userId: owner.body.user.id, url: 'https://x.com/alpha/status/1' }, otherHistory,
+    ]));
+    await writeFile(gate, 'pause');
+    const running = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(other.cookie),
+      body: JSON.stringify({ url: 'https://x.com/alpha/status/3', dryRun: true }),
+    });
+    assert.equal(running.status, 200);
+    await until(() => stat(`${gate}.entered`).then(() => true, () => false), 'Other user bot never started');
+    const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    assert.equal(JSON.parse(stagedBefore).appUserId, other.body.user.id);
+    const deleted = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(deleted.status, 200, await deleted.text());
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+    assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf8')), [otherHistory]);
+    const otherSettings = await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: other.cookie } });
+    assert.equal(otherSettings.status, 200);
+    assert.equal((await otherSettings.json()).configured, true);
+    assert.equal((await importSession(baseUrl, other.cookie, importPayload('beta'))).status, 409);
+    await unlink(gate);
+    await running.text();
+    assert.equal((await importSession(baseUrl, other.cookie, importPayload('beta'))).status, 201);
+    assert.equal((await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } })).status, 401);
+  });
+
+  test(`${storage} profile deletion stops its own bot before clearing keys, files and final history`, { timeout: 20_000 }, async (t) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-delete-own-run-'));
+    const gate = join(dataDir, 'automation-gate');
+    const { baseUrl } = await startServer(t, { DATABASE_URL: databaseUrl, SESSION_TEST_RUN_GATE: gate }, {
+      dataDir, cleanupData: true,
+      nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+    });
+    const owner = await register(baseUrl, 'delete_own_run');
+    const other = await register(baseUrl, 'delete_own_run_other');
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+    assert.equal((await importSession(baseUrl, other.cookie, importPayload('beta'))).status, 201);
+    await saveGroqKey(baseUrl, owner.cookie);
+    const otherHistory = { userId: other.body.user.id, url: 'https://x.com/beta/status/2' };
+    await writeFile(join(dataDir, 'history.json'), JSON.stringify([otherHistory]));
+    await writeFile(gate, 'pause');
+    const running = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+    });
+    assert.equal(running.status, 200);
+    await until(() => stat(`${gate}.entered`).then(() => true, () => false), 'Profile owner bot never started');
+    const stream = running.text();
+    const deleted = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(deleted.status, 200, await deleted.text());
+    await stream;
+    assert.equal((await stat(gate)).isFile(), true, 'The paused runner must be stopped, not released');
+    await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+    await assert.rejects(stat(join(dataDir, 'sessions', String(owner.body.user.id))), { code: 'ENOENT' });
+    assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf8')), [otherHistory]);
+    assert.equal((await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } })).status, 401);
+    assert.equal((await importSession(baseUrl, other.cookie, importPayload('gamma'))).status, 201);
+  });
+
+  test(`${storage} profile deletion is retryable after partial disk cleanup and never falsely reports success`, async (t) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-delete-storage-failure-'));
+    const marker = join(dataDir, 'profile-write-failure');
+    const { baseUrl } = await startServer(t, { DATABASE_URL: databaseUrl, SESSION_TEST_USER_WRITE_GATE: marker }, {
+      dataDir, cleanupData: true,
+      nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+    });
+    const owner = await register(baseUrl, 'delete_retry');
+    await saveGroqKey(baseUrl, owner.cookie);
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+    if (databaseUrl) {
+      await writeFile(join(dataDir, 'user-db.json'), JSON.stringify([{
+        id: crypto.randomUUID(), username: owner.body.user.username, email: owner.body.user.email,
+        groqApiKey: 'test-only-groq-key-no-external-requests',
+      }]));
+    }
+    const originalUserFile = await readFile(join(dataDir, 'user-db.json'), 'utf8');
+    await writeFile(marker, 'fail');
+    const failed = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(failed.status, 503);
+    assert.equal(failed.headers.get('set-cookie'), null);
+    const failure = await failed.json();
+    assert.equal(failure.success, undefined);
+    assert.match(failure.error, /Retry to complete the cleanup/);
+    assert.equal(failure.error.includes('Simulated'), false);
+    assert.equal(await readFile(join(dataDir, 'user-db.json'), 'utf8'), originalUserFile);
+    const settings = await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } });
+    assert.equal(settings.status, 200);
+    assert.equal((await settings.json()).configured, true);
+    await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+    const retried = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(retried.status, 200, await retried.clone().text());
+    assert.deepEqual(await retried.json(), { success: true, message: PROFILE_DELETION_MESSAGE });
+    assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8')), []);
+    await assertDeletedProfileCannotAuthenticate(baseUrl, owner);
+  });
+}
+
+test('profile deletion defers ambiguous legacy staging cleanup until another user’s run finishes', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-delete-legacy-run-'));
+  const gate = join(dataDir, 'automation-gate');
+  const { baseUrl } = await startServer(t, { SESSION_TEST_RUN_GATE: gate }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'delete_legacy_run');
+  const other = await register(baseUrl, 'delete_legacy_other');
+  const sharedCookies = importPayload('alpha', 'shared');
+  assert.equal((await importSession(baseUrl, owner.cookie, sharedCookies)).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, sharedCookies)).status, 201);
+  await saveGroqKey(baseUrl, other.cookie);
+  await writeFile(gate, 'pause');
+  const running = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(other.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  assert.equal(running.status, 200);
+  await until(() => stat(`${gate}.entered`).then(() => true, () => false), 'Legacy runner did not start');
+  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  delete staged.appUserId;
+  const legacyStaging = JSON.stringify(staged);
+  await writeFile(join(dataDir, 'auth.json'), legacyStaging);
+  const deferred = await deleteProfile(baseUrl, owner.cookie);
+  assert.equal(deferred.status, 409);
+  assert.match((await deferred.json()).error, /Retry deleting this profile after it finishes/);
+  assert.equal(deferred.headers.get('set-cookie'), null);
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), legacyStaging);
+  assert.equal((await stat(join(dataDir, 'sessions', owner.body.user.id, 'alpha.json'))).isFile(), true);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } })).status, 200);
+  await unlink(gate);
+  await running.text();
+  const deleted = await deleteProfile(baseUrl, owner.cookie);
+  assert.equal(deleted.status, 200, await deleted.text());
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  const surviving = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: other.cookie } });
+  assert.equal(surviving.status, 200);
+  assert.equal((await surviving.json()).xSession.auth_token, sharedCookies.auth_token);
+});
+
+test('profile deletion prevents a pending cookie verification from recreating deleted user sessions', { timeout: 15_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-delete-pending-import-'));
+  const gate = join(dataDir, 'health-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, SESSION_TEST_HEALTH_BROWSER_GATE: gate,
+  }, { dataDir, cleanupData: true });
+  const owner = await register(baseUrl, 'delete_pending_import');
+  await writeFile(gate, 'pause');
+  const pendingImport = importSession(baseUrl, owner.cookie, importPayload('alpha', 'browservalid_pending'));
+  await until(() => stat(`${gate}.entered`).then(() => true, () => false), 'Import did not reach browser verification');
+  const deleted = await deleteProfile(baseUrl, owner.cookie);
+  assert.equal(deleted.status, 200, await deleted.text());
+  await unlink(gate);
+  const imported = await pendingImport;
+  assert.equal(imported.status, 401);
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  await assert.rejects(stat(join(dataDir, 'sessions', owner.body.user.id)), { code: 'ENOENT' });
+  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8')), []);
+});
+
+test('profile deletion blocks login and mutations while stopping an in-flight browser verification', { timeout: 20_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-delete-pending-run-'));
+  const gate = join(dataDir, 'health-gate');
+  const runMarker = join(dataDir, 'unused-run-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+    SESSION_TEST_HEALTH_BROWSER_GATE: gate, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'delete_pending_run');
+  await saveGroqKey(baseUrl, owner.cookie);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'browservalid_run'))).status, 201);
+  await writeFile(gate, 'pause');
+  const starting = fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  await until(() => stat(`${gate}.entered`).then(() => true, () => false), 'Run did not reach browser verification');
+  const deleting = deleteProfile(baseUrl, owner.cookie);
+  await until(async () => (await fetch(`${baseUrl}/api/config/groq`, { headers: { cookie: owner.cookie } })).status === 409,
+    'The profile must be reserved while its browser stops');
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
+  });
+  assert.equal(login.status, 409);
+  assert.equal((await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie: owner.cookie } })).status, 409);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('beta'))).status, 409);
+  const saved = await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'cannot-replace-key-during-deletion' }),
+  });
+  assert.equal(saved.status, 409);
+  await unlink(gate);
+  assert.equal((await starting).status, 409);
+  const deleted = await deleting;
+  assert.equal(deleted.status, 200, await deleted.text());
+  await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  await assertDeletedProfileCannotAuthenticate(baseUrl, owner);
+});
+
 test('production refuses an insecure session secret', async () => {
   const port = await availablePort();
   const child = spawn(process.execPath, ['server.js'], {
@@ -1013,6 +1504,13 @@ test('production accepts a strong secret and emits hardened session cookies', as
   assert.match(cookie, /Secure/i);
   const imported = await importSession(baseUrl, sessionCookie(response), importPayload('production_x'));
   assert.equal(imported.status, 201);
+  const deleted = await deleteProfile(baseUrl, sessionCookie(response));
+  assert.equal(deleted.status, 200);
+  const clearedCookie = deleted.headers.get('set-cookie');
+  assert.match(clearedCookie, /^x_engine_session=;/);
+  assert.match(clearedCookie, /HttpOnly/i);
+  assert.match(clearedCookie, /SameSite=Strict/i);
+  assert.match(clearedCookie, /Secure/i);
 });
 test('PostgreSQL stores users and X sessions and restores them after login', async (t) => {
   const { baseUrl, dataDir } = await startServer(t, { DATABASE_URL: 'pg-mem://' });
