@@ -1,8 +1,22 @@
 // Test-only preload. API tests never launch a browser or contact X; real
-// Chromium/DOM coverage lives in x-session-health.test.js with routed fixtures.
+// Chromium/DOM coverage lives in browser tests with routed fixtures.
 const { appendFileSync, existsSync } = require('node:fs');
 const { setTimeout: delay } = require('node:timers/promises');
 const { chromium } = require('playwright');
+
+// Production enforces live verification even with the old disable flag.
+// Route its default X endpoints to the local fixture, never to the internet.
+if (process.env.SESSION_TEST_HEALTH_HTTP_URL) {
+  const fetch = globalThis.fetch;
+  globalThis.fetch = (target, options) => {
+    const url = new URL(target);
+    if (/(^|\.)(x|twitter)\.com$/i.test(url.hostname)) {
+      return fetch(process.env.SESSION_TEST_HEALTH_HTTP_URL, options);
+    }
+    if (url.hostname !== '127.0.0.1') throw new Error('External HTTP request blocked by the X health fixture');
+    return fetch(target, options);
+  };
+}
 
 function record(event) {
   if (process.env.SESSION_TEST_HEALTH_BROWSER_LOG) {

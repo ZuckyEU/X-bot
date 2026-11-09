@@ -23,12 +23,14 @@ const SKIP_DIRS = new Set([
   '.tmp',
   'blob-report',
   'coverage',
+  'data',
   'node_modules',
   'playwright-report',
   'sessions',
   'test-results',
   'tmp',
   'user-data',
+  'user_data',
 ]);
 
 function fail(message) {
@@ -84,14 +86,11 @@ if (sessionSecret.length < 32 || INSECURE_SESSION_SECRETS.has(sessionSecret.toLo
 }
 
 const databaseUrl = String(process.env.DATABASE_URL ?? '').trim();
-if (!databaseUrl || databaseUrl.startsWith('pg-mem:')) {
-  fail(
-    'DATABASE_URL must be set to the Supabase PostgreSQL connection string.\n' +
-      'Use the pooler connection string from Supabase → Project Settings → Database.',
-  );
+if (databaseUrl.startsWith('pg-mem:')) {
+  fail('The in-memory test database cannot be used for a production deployment.');
 }
 
-console.log('[check:prod] Environment verified (NODE_ENV=production, PostgreSQL configured).');
+console.log(`[check:prod] Environment verified (NODE_ENV=production, ${databaseUrl ? 'PostgreSQL configured' : 'local JSON storage'}).`);
 
 const files = (await javascriptFiles(ROOT))
   .map((file) => relative(ROOT, file))

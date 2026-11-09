@@ -10,6 +10,8 @@ user-db.json
 history.json
 sessions
 user-data
+user_data
+data
 x-auth-state.json
 test-browserbase.cjs
 test-error-screenshot.png

@@ -13,6 +13,8 @@ user-db.json
 history.json
 sessions/
 user-data/
+user_data/
+data/
 
 # Playwright output
 test-results/

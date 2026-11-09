@@ -40,6 +40,7 @@ async function fixture(t, options = {}) {
     deletionStatus: options.deletionStatus ?? 200,
     runs: [],
     imports: [], switches: [], requests: [], deletions: [], replies: 0, logouts: 0, authReplies: 0,
+    interactiveImports: [],
   };
   const health = () => ({
     xSessionValid: state.xSessionStatus === 'valid' ? true
@@ -129,6 +130,26 @@ async function fixture(t, options = {}) {
         xSessionStatus: 'invalid',
       }, state.runStatus);
     }
+    if (url.pathname === '/api/auth/connect-interactive' && req.method === 'POST') {
+      const body = JSON.parse(raw);
+      state.interactiveImports.push({ body, cookie: req.headers.cookie });
+      await options.interactiveGate?.promise;
+      const status = options.interactiveStatus ?? 201;
+      if (status !== 201) {
+        if (status === 401) state.authenticated = false;
+        return json({ error: options.interactiveError ?? 'Interactive login failed' }, status);
+      }
+      const handle = body.handle.trim().replace(/^@/, '').toLowerCase();
+      if (!state.accounts.some((account) => account.xUsername === handle)) {
+        state.accounts.push({ xUsername: handle, active: false, status: 'ready' });
+      }
+      activate(handle);
+      state.xSessionStatus = 'valid';
+      return json({
+        ok: true, authenticated: true, interactive: true, username: handle,
+        activeXAccount: handle, accounts: state.accounts, cookieCount: 2, ...health(),
+      }, 201);
+    }
     if (url.pathname === '/api/auth/import-session' && req.method === 'POST') {
       const body = JSON.parse(raw);
       const index = state.imports.length;
@@ -175,7 +196,7 @@ async function fixture(t, options = {}) {
   baseUrl = `http://127.0.0.1:${server.address().port}`;
   let browser;
   t.after(async () => {
-    for (const gate of [options.importGate, ...(options.importGates ?? []), options.groqGate, options.profileDeletionGate, options.authGate, options.logoutGate, options.runGate]) gate?.resolve();
+    for (const gate of [options.importGate, ...(options.importGates ?? []), options.interactiveGate, options.groqGate, options.profileDeletionGate, options.authGate, options.logoutGate, options.runGate]) gate?.resolve();
     await browser?.close();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -479,6 +500,59 @@ test('a stale bootstrap cannot unlock controls or restore a profile during delet
   assert.deepEqual(errors, []);
 });
 
+test('dashboard connects X in a browser without requiring pasted cookies', { timeout: 20_000 }, async (t) => {
+  const interactiveGate = deferred();
+  const { page, state, errors, open } = await fixture(t, { interactiveGate });
+  await open();
+  assert.equal(await page.locator('#session-import-title').textContent(), 'Connect X account');
+  assert.equal(await page.locator('#connect-x-interactive').textContent(), 'Open X sign-in');
+  assert.equal(await page.locator('#manual-session-import').count(), 1);
+
+  await page.locator('#session-handle').fill('@Alice');
+  await page.locator('#connect-x-interactive').click();
+  await until(() => state.interactiveImports.length === 1);
+  assert.deepEqual(state.interactiveImports[0].body, { handle: '@Alice' });
+  assert.match(state.interactiveImports[0].cookie, /x_engine_session=synthetic-app-session/);
+  assert.equal(await page.locator('#connect-x-interactive').isDisabled(), true);
+  assert.equal(await page.locator('#session-handle').isDisabled(), true);
+  assert.match(await page.locator('#interactive-login-status').textContent(), /Waiting for you to finish/);
+
+  // The disabled button and the request guard must both suppress duplicates.
+  await page.evaluate(() => document.getElementById('connect-x-interactive').click());
+  await delay(50);
+  assert.equal(state.interactiveImports.length, 1);
+
+  interactiveGate.resolve();
+  await page.locator('#session-import-modal').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('#who').textContent(), '@alice');
+  assert.match(await page.locator('#auth-msg').textContent(), /Connected @alice/);
+  assert.match(await page.locator('#status-detail').textContent(), /local browser profile is saved/);
+  assert.equal(await page.locator('.linked-account-item.active').count(), 1);
+  assert.equal(await page.locator('#session-auth-token').inputValue(), '');
+  assert.equal(await page.locator('#session-ct0').inputValue(), '');
+  const storage = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }));
+  assert.equal(storage.includes('auth_token'), false);
+  assert.equal(storage.includes('ct0'), false);
+  assert.deepEqual(errors, []);
+});
+
+test('a failed interactive connection keeps the dialog open and shows the server message', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors, open } = await fixture(t, {
+    interactiveStatus: 409,
+    interactiveError: 'Signed in as @someone_else, but @alice was requested.',
+  });
+  await open();
+  await page.locator('#session-handle').fill('alice');
+  await page.locator('#connect-x-interactive').click();
+  await until(() => state.interactiveImports.length === 1);
+  await page.waitForFunction(() => document.getElementById('session-import-error').textContent.includes('someone_else'));
+  assert.equal(await page.locator('#session-import-modal').isVisible(), true);
+  assert.equal(await page.locator('#session-handle').inputValue(), 'alice');
+  assert.equal(await page.locator('#connect-x-interactive').isEnabled(), true);
+  assert.equal(await page.locator('.linked-account-item').count(), 0);
+  assert.deepEqual(errors, []);
+});
+
 test('dashboard imports only masked cookie values and immediately activates the account without opening a viewer', { timeout: 20_000 }, async (t) => {
   const { page, context, state, errors, open, fill, submit } = await fixture(t);
   const values = cookieValues('@Alice');
@@ -717,16 +791,17 @@ test('expired X session shows the reconnection badge, disables publishing, and r
 
   await page.locator('#x-session-reconnect').click();
   await page.locator('#session-import-modal').waitFor({ state: 'visible' });
-  assert.equal(await page.locator('#session-import-title').textContent(), 'Re-authenticate X account');
+  assert.equal(await page.locator('#session-import-title').textContent(), 'Reconnect X account');
   assert.equal(
     await page.locator('#session-import-subtitle').textContent(),
-    'Update the cookies for @alice to restore publishing.',
+    'Sign in to X in the browser window to restore publishing for @alice.',
   );
   assert.equal(await page.locator('#session-handle').inputValue(), 'alice');
   assert.equal(await page.locator('#session-handle').evaluate((input) => input.readOnly), true);
-  assert.equal(await page.locator('#session-import-submit').textContent(), 'Re-authenticate account');
+  assert.equal(await page.locator('#session-import-submit').textContent(), 'Save pasted cookies');
+  assert.equal(await page.locator('#connect-x-interactive').textContent(), 'Reconnect in browser');
   assert.equal(
-    await page.locator('#session-auth-token').evaluate((input) => document.activeElement === input),
+    await page.locator('#connect-x-interactive').evaluate((button) => document.activeElement === button),
     true,
   );
 
@@ -745,6 +820,35 @@ test('expired X session shows the reconnection badge, disables publishing, and r
   assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
   assert.equal(await account.locator('.update-x-session').count(), 0);
   assert.equal(await account.locator('.account-check').textContent(), '✓');
+  assert.deepEqual(errors, []);
+});
+
+test('interactive reconnect restores an expired X account without pasted cookies', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors } = await fixture(t, {
+    accounts: [{ xUsername: 'zuckyeu', active: true, status: 'ready' }],
+    xSessionStatus: 'invalid',
+  });
+  await page.locator('#account-chip').click();
+  const account = page.locator('.linked-account-item[data-x-username="zuckyeu"]');
+  await account.getByRole('button', { name: 'Update session for @zuckyeu', exact: true }).click();
+  await page.locator('#session-import-modal').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#session-import-title').textContent(), 'Reconnect X account');
+  assert.equal(await page.locator('#connect-x-interactive').textContent(), 'Reconnect in browser');
+  assert.equal(await page.locator('#session-handle').inputValue(), 'zuckyeu');
+
+  await page.locator('#connect-x-interactive').click();
+  await until(() => state.interactiveImports.length === 1);
+  assert.deepEqual(state.interactiveImports[0].body, { handle: 'zuckyeu' });
+  await page.locator('#session-import-modal').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  assert.equal(await page.locator('#run').isEnabled(), true);
+  assert.match(await page.locator('#auth-msg').textContent(), /Reconnected @zuckyeu/);
+  await page.locator('#account-chip').click();
+  assert.equal(await account.locator('.linked-account-copy span').textContent(), 'Active');
+  assert.equal(await account.locator('.session-expired').count(), 0);
+  assert.equal(await account.locator('.update-x-session').count(), 0);
+  assert.deepEqual(state.imports, []);
+  assert.deepEqual(state.switches, []);
   assert.deepEqual(errors, []);
 });
 
@@ -771,13 +875,13 @@ for (const [source, accountState] of [
     await update.click();
     await page.locator('#session-import-modal').waitFor({ state: 'visible' });
     assert.equal(await page.locator('#account-dropdown').isVisible(), false);
-    assert.equal(await page.locator('#session-import-title').textContent(), 'Re-authenticate X account');
+    assert.equal(await page.locator('#session-import-title').textContent(), 'Reconnect X account');
     assert.equal(await page.locator('#session-handle').inputValue(), 'zuckyeu');
     assert.equal(await page.locator('#session-handle').evaluate((input) => input.readOnly), true);
     assert.match(await page.locator('#session-import-subtitle').textContent(), /@zuckyeu/);
     assert.equal(await page.locator('#session-auth-token').inputValue(), '');
     assert.equal(await page.locator('#session-ct0').inputValue(), '');
-    assert.equal(await page.locator('#session-auth-token').evaluate((input) => document.activeElement === input), true);
+    assert.equal(await page.locator('#connect-x-interactive').evaluate((button) => document.activeElement === button), true);
     assert.deepEqual(state.switches, []);
     assert.equal(state.imports.length, 0);
 

@@ -47,7 +47,8 @@ async function startServer(t, extraEnv = {}, options = {}) {
   const dataDir = options.dataDir ?? (await mkdtemp(join(tmpdir(), 'x-engine-test-')));
   const cleanupData = options.cleanupData ?? !options.dataDir;
   const port = await availablePort();
-  const healthFixture = extraEnv.X_SESSION_CHECK_DISABLED === '0'
+  const productionHealth = extraEnv.NODE_ENV === 'production' ? await startXHealthFixture(t) : null;
+  const healthFixture = extraEnv.X_SESSION_CHECK_DISABLED === '0' || productionHealth
     ? ['--require', join(ROOT, 'test', 'fixtures', 'x-health-browser.cjs')]
     : [];
   const child = spawn(process.execPath, [...healthFixture, ...(options.nodeArgs ?? []), 'server.js'], {
@@ -65,9 +66,11 @@ async function startServer(t, extraEnv = {}, options = {}) {
       PORT: String(port),
       SESSION_SECRET,
       BCRYPT_ROUNDS: '10',
-      // Tests must never call X. Individual health-check tests opt back in
-      // with X_SESSION_CHECK_DISABLED=0 and a local fixture URL.
+      // Tests must never call X. Production/default endpoints and opt-in health
+      // checks are intercepted or directed to a local fixture.
       X_SESSION_CHECK_DISABLED: '1',
+      X_SESSION_CHECK_URL: '',
+      SESSION_TEST_HEALTH_HTTP_URL: productionHealth?.url ?? '',
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe', ...(options.ipc ? ['ipc'] : [])],
@@ -109,7 +112,7 @@ async function startServer(t, extraEnv = {}, options = {}) {
   t.after(stop);
   await ready;
 
-  return { baseUrl: `http://127.0.0.1:${port}`, dataDir, child, output: () => output, stop };
+  return { baseUrl: `http://127.0.0.1:${port}`, dataDir, child, output: () => output, stop, productionHealth };
 }
 
 function sessionCookie(response) {
@@ -483,6 +486,13 @@ test('X account deletion rejects traversal and restages the next active account'
   });
   assert.ok([400, 404].includes(traversal.status));
 
+  const alphaProfile = join(dataDir, 'user_data', body.user.id, 'alpha');
+  const betaProfile = join(dataDir, 'user_data', body.user.id, 'beta');
+  await mkdir(alphaProfile, { recursive: true });
+  await mkdir(betaProfile, { recursive: true });
+  await writeFile(join(alphaProfile, 'Cookies'), 'persistent alpha profile');
+  await writeFile(join(betaProfile, 'Cookies'), 'persistent beta profile');
+
   const deleted = await fetch(`${baseUrl}/api/auth/x-accounts/alpha`, {
     method: 'DELETE',
     headers: { cookie },
@@ -498,6 +508,8 @@ test('X account deletion rejects traversal and restages the next active account'
   assert.deepEqual(user.xAccounts, ['beta']);
   assert.equal(user.preferences.defaultXAccount, 'beta');
   await assert.rejects(stat(join(dataDir, 'sessions', user.id, 'alpha.json')), { code: 'ENOENT' });
+  await assert.rejects(stat(alphaProfile), { code: 'ENOENT' });
+  await stat(betaProfile);
   const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
   assert.equal(staged.username, 'beta');
   assert.deepEqual(staged.origins, xStorageState('beta').origins);
@@ -513,6 +525,7 @@ test('X account deletion rejects traversal and restages the next active account'
     headers: { cookie },
   });
   assert.equal(deletedLast.status, 200, await deletedLast.text());
+  await assert.rejects(stat(betaProfile), { code: 'ENOENT' });
   await assert.rejects(
     stat(join(dataDir, 'sessions', user.id, '_trusted-login-profile.json')),
     { code: 'ENOENT' },
@@ -774,6 +787,258 @@ test('disconnecting during import rolls back the prior session and staging block
     (await readFile(paths[2], 'utf8')) === previous[2], 'Cancelled import did not restore the prior session');
   assert.deepEqual(await Promise.all(paths.map((path) => readFile(path, 'utf8'))), previous);
 });
+
+test('interactive X connect saves a namespaced persistent profile and local account', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-interactive-profile-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const recordFile = join(dataDir, 'interactive-record.jsonl');
+  const { baseUrl } = await startServer(t, {
+    DISPLAY: ':99',
+    INTERACTIVE_LOGIN_TIMEOUT_MS: '30000',
+    SESSION_TEST_INTERACTIVE_RECORD: recordFile,
+  }, {
+    dataDir,
+    cleanupData: false,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-profile.cjs')],
+  });
+
+  const owner = await register(baseUrl, 'interactive_owner');
+  const response = await fetch(`${baseUrl}/api/auth/connect-interactive`, {
+    method: 'POST',
+    headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ handle: '@Alice' }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 201, JSON.stringify(body));
+  assert.equal(body.authenticated, true);
+  assert.equal(body.interactive, true);
+  assert.equal(body.activeXAccount, 'alice');
+  assert.equal(body.username, 'alice');
+  assert.deepEqual(body.accounts.map((account) => account.xUsername), ['alice']);
+  assert.equal(Object.hasOwn(body, 'auth_token'), false);
+  assert.equal(Object.hasOwn(body, 'ct0'), false);
+
+  const events = (await readFile(recordFile, 'utf8')).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const launch = events.find((event) => event.type === 'launch');
+  assert.equal(launch.headless, false);
+  assert.equal(launch.directory, join(dataDir, 'user_data', owner.body.user.id, 'alice'));
+  assert.ok(events.some((event) => event.type === 'goto' && event.url === X_LOGIN_URL));
+  assert.ok(events.some((event) => event.type === 'close'));
+
+  const database = JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8'));
+  assert.deepEqual(database.users.map((user) => user.id), [owner.body.user.id]);
+  assert.deepEqual(database.users[0].xAccounts, ['alice']);
+  assert.equal(database.users[0].preferences.defaultXAccount, 'alice');
+  assert.equal(database.users[0].groqApiKey ?? '', '');
+
+  const session = JSON.parse(await readFile(join(dataDir, 'sessions', owner.body.user.id, 'alice.json'), 'utf8'));
+  const cookies = new Map(session.cookies.map((cookie) => [cookie.name, cookie]));
+  assert.equal(cookies.get('auth_token').value, 'interactive_auth_token_value');
+  assert.equal(cookies.get('ct0').value, 'interactive_ct0_value');
+  assert.equal(cookies.get('auth_token').domain, '.x.com');
+  assert.equal(cookies.get('auth_token').secure, true);
+  assert.equal(cookies.get('ct0').sameSite, 'Lax');
+  assert.equal(session.source, 'interactive-login');
+
+  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.ok(staged.cookies.some((cookie) => cookie.name === 'auth_token'));
+});
+
+test('interactive X connect rejects a different signed-in handle', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-interactive-mismatch-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const recordFile = join(dataDir, 'interactive-record.jsonl');
+  const { baseUrl } = await startServer(t, {
+    DISPLAY: ':99',
+    INTERACTIVE_LOGIN_TIMEOUT_MS: '30000',
+    SESSION_TEST_INTERACTIVE_HANDLE: 'someone_else',
+    SESSION_TEST_INTERACTIVE_RECORD: recordFile,
+  }, {
+    dataDir,
+    cleanupData: false,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-profile.cjs')],
+  });
+
+  const owner = await register(baseUrl, 'interactive_mismatch');
+  const response = await fetch(`${baseUrl}/api/auth/connect-interactive`, {
+    method: 'POST',
+    headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ handle: 'alice' }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 409, JSON.stringify(body));
+  assert.match(body.error, /someone_else/);
+  await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  const database = JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8'));
+  assert.deepEqual(database.users[0].xAccounts, []);
+});
+
+for (const [prefix, status, code] of [
+  ['expired_interactive', 409, 'X_SESSION_EXPIRED'],
+  ['browsererror_interactive', 503, 'X_SESSION_CHECK_UNAVAILABLE'],
+]) {
+  test(`interactive X connect preserves the previous session on ${code}`, { timeout: 20_000 }, async (t) => {
+    const x = await startXHealthFixture(t);
+    const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-interactive-health-'));
+    const { baseUrl, output } = await startServer(t, {
+      DISPLAY: ':99',
+      X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+      SESSION_TEST_INTERACTIVE_PREFIX: prefix,
+      SESSION_TEST_INTERACTIVE_RECORD: join(dataDir, 'interactive-record.jsonl'),
+    }, {
+      dataDir, cleanupData: true,
+      nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'interactive-profile.cjs')],
+    });
+    const owner = await register(baseUrl, `interactive_${status}`);
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+    const paths = [join(dataDir, 'sessions', owner.body.user.id, 'alice.json'), join(dataDir, 'auth.json')];
+    const previous = await Promise.all(paths.map((path) => readFile(path, 'utf8')));
+    const response = await fetch(`${baseUrl}/api/auth/connect-interactive`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ handle: 'alice' }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, status, JSON.stringify(body));
+    assert.equal(body.code, code);
+    assert.deepEqual(await Promise.all(paths.map((path) => readFile(path, 'utf8'))), previous);
+    assert.equal(output().includes(`${prefix}_auth_token_value`), false);
+    assert.equal(output().includes(`${prefix}_ct0_value`), false);
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('bob'))).status, 201, 'The login lock must be released');
+  });
+}
+
+test('interactive X connect rolls back account and session writes when staging fails', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-interactive-rollback-'));
+  const marker = join(dataDir, 'stage-gate');
+  const { baseUrl, output } = await startServer(t, {
+    DISPLAY: ':99', SESSION_TEST_WRITE_GATE: marker,
+    SESSION_TEST_INTERACTIVE_RECORD: join(dataDir, 'interactive-record.jsonl'),
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: [
+      '--require', join(ROOT, 'test', 'fixtures', 'interactive-profile.cjs'),
+      '--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs'),
+    ],
+  });
+  const owner = await register(baseUrl, 'interactive_rollback');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+  const paths = [join(dataDir, 'sessions', owner.body.user.id, 'alice.json'), join(dataDir, 'auth.json')];
+  const previous = await Promise.all(paths.map((path) => readFile(path, 'utf8')));
+  const previousUsers = JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8')).users;
+  await writeFile(marker, 'fail');
+  const response = await fetch(`${baseUrl}/api/auth/connect-interactive`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ handle: 'alice' }),
+  });
+  assert.equal(response.status, 503, await response.text());
+  assert.deepEqual(await Promise.all(paths.map((path) => readFile(path, 'utf8'))), previous);
+  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8')).users, previousUsers);
+  assert.equal(output().includes('interactive_auth_token_value'), false);
+  assert.equal(output().includes('interactive_ct0_value'), false);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('bob'))).status, 201);
+});
+
+test('interactive X connect is unavailable on a headless Linux display', { timeout: 20_000 }, async (t) => {
+  if (process.platform !== 'linux') {
+    t.skip('The display guard only applies to headless Linux hosts');
+    return;
+  }
+  const { baseUrl } = await startServer(t, { DISPLAY: '', WAYLAND_DISPLAY: '' });
+  const owner = await register(baseUrl, 'interactive_headless');
+  const response = await fetch(`${baseUrl}/api/auth/connect-interactive`, {
+    method: 'POST',
+    headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ handle: 'alice' }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.match(body.error, /desktop display/);
+});
+
+test('a profile-mode run persists the exported session and removes the temporary export', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-profile-sync-'));
+  const gate = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, { SESSION_TEST_RUN_GATE: gate }, {
+    dataDir,
+    cleanupData: false,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+
+  const owner = await register(baseUrl, 'profile_sync');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+  await saveGroqKey(baseUrl, owner.cookie, 'synthetic-groq-key-profile-sync');
+  const profileDirectory = join(dataDir, 'user_data', owner.body.user.id, 'alpha');
+  await mkdir(profileDirectory, { recursive: true });
+  await writeFile(join(profileDirectory, 'Cookies'), 'synthetic persistent profile');
+
+  const response = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST',
+    headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  const stream = await response.text();
+  assert.match(stream, /"type":"batch-complete"/);
+
+  const runner = JSON.parse(await readFile(`${gate}.entered`, 'utf8'));
+  assert.equal(runner.profileDirectory, profileDirectory);
+  assert.equal(runner.profileHeadless, '1');
+  assert.equal(runner.profileExportPath, join(dataDir, 'sessions', owner.body.user.id, '_profile-export-alpha.json'));
+
+  const sessionPath = join(dataDir, 'sessions', owner.body.user.id, 'alpha.json');
+  await until(async () => {
+    const session = JSON.parse(await readFile(sessionPath, 'utf8').catch(() => '{}'));
+    return session.cookies?.some((cookie) => cookie.name === 'ct0' && cookie.value === 'profile_rotated_ct0_value');
+  });
+  const session = JSON.parse(await readFile(sessionPath, 'utf8'));
+  assert.equal(session.source, 'persistent-profile');
+  assert.equal(session.username, 'alpha');
+  const staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
+  assert.equal(staged.cookies.find((cookie) => cookie.name === 'ct0').value, 'profile_rotated_ct0_value');
+  await assert.rejects(
+    stat(join(dataDir, 'sessions', owner.body.user.id, '_profile-export-alpha.json')),
+    { code: 'ENOENT' },
+  );
+  await stat(profileDirectory);
+});
+
+for (const profiles of ['1', '0']) {
+  test(`storage-state runs clear inherited profile settings when profiles are ${profiles === '1' ? 'absent' : 'disabled'}`, { timeout: 20_000 }, async (t) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-profile-environment-'));
+    const gate = join(dataDir, 'run-gate');
+    const foreignProfile = join(dataDir, 'foreign-profile');
+    const foreignExport = join(dataDir, 'foreign-export.json');
+    await mkdir(foreignProfile, { recursive: true });
+    await writeFile(foreignExport, 'synthetic export must remain untouched');
+    const { baseUrl } = await startServer(t, {
+      SESSION_TEST_RUN_GATE: gate,
+      PERSISTENT_PROFILES: profiles,
+      X_PROFILE_DIR: foreignProfile,
+      X_PROFILE_HEADLESS: '0',
+      X_SESSION_EXPORT_PATH: foreignExport,
+    }, {
+      dataDir, cleanupData: true,
+      nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+    });
+    const owner = await register(baseUrl, `profile_env_${profiles}`);
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+    await saveGroqKey(baseUrl, owner.cookie, 'synthetic-groq-profile-environment');
+    if (profiles === '0') {
+      await mkdir(join(dataDir, 'user_data', owner.body.user.id, 'alice'), { recursive: true });
+    }
+
+    const response = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ url: 'https://x.com/alice/status/1', dryRun: true }),
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.match(await response.text(), /"type":"batch-complete"/);
+    const runner = JSON.parse(await readFile(`${gate}.entered`, 'utf8'));
+    assert.equal(runner.profileDirectory, null);
+    assert.equal(runner.profileHeadless, '1');
+    assert.equal(runner.profileExportPath, null);
+    assert.equal(await readFile(foreignExport, 'utf8'), 'synthetic export must remain untouched');
+  });
+}
 
 test('imported sessions and active-account selection survive a server restart', { timeout: 20_000 }, async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-import-restart-'));
@@ -1068,6 +1333,12 @@ test('local profile deletion purges all settings, X sessions, orphan files and h
   await writeFile(join(ownerDirectory, 'orphan.json'), JSON.stringify(xStorageState('orphan')));
   await writeFile(join(ownerDirectory, 'broken.json'), 'malformed orphan cookie state');
   await writeFile(join(ownerDirectory, 'old-browser', 'auth.json'), JSON.stringify(xStorageState('orphan')));
+  const ownerProfile = join(dataDir, 'user_data', owner.body.user.id, 'alpha');
+  const otherProfile = join(dataDir, 'user_data', other.body.user.id, 'alpha');
+  await mkdir(ownerProfile, { recursive: true });
+  await mkdir(otherProfile, { recursive: true });
+  await writeFile(join(ownerProfile, 'Cookies'), 'owner persistent profile');
+  await writeFile(join(otherProfile, 'Cookies'), 'other persistent profile');
   const otherHistory = { userId: other.body.user.id, url: 'https://x.com/alpha/status/2' };
   await writeFile(join(dataDir, 'history.json'), JSON.stringify([
     { userId: owner.body.user.id, url: 'https://x.com/beta/status/1' }, otherHistory,
@@ -1097,6 +1368,8 @@ test('local profile deletion purges all settings, X sessions, orphan files and h
   assert.match(clearedCookie, /HttpOnly/i);
   assert.match(clearedCookie, /SameSite=Strict/i);
   await assert.rejects(stat(ownerDirectory), { code: 'ENOENT' });
+  await assert.rejects(stat(ownerProfile), { code: 'ENOENT' });
+  await stat(otherProfile);
   await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
   const usersAfter = JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8'));
   assert.deepEqual(usersAfter, [otherRecordBefore]);
@@ -1176,6 +1449,9 @@ test('PostgreSQL profile deletion leaves no orphan rows or legacy disk copies an
   assert.equal((await stat(join(dataDir, 'sessions', legacyOtherId, 'browser', 'auth.json'))).isFile(), true);
   assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8')), [legacyOther]);
   assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf8')), remainingHistory);
+  const localDatabase = JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8'));
+  assert.deepEqual(localDatabase.users, [legacyOther]);
+  assert.equal(JSON.stringify(localDatabase).includes(apiKey), false);
   await assertDeletedProfileCannotAuthenticate(baseUrl, owner);
   await assert.rejects(profileDatabaseCommand(child, 'orphan', owner.body.user.id), /foreign key constraint/i);
 
@@ -1193,6 +1469,84 @@ test('PostgreSQL profile deletion leaves no orphan rows or legacy disk copies an
   assert.equal(cleanUser.default_handle, null);
   assert.equal(cleanUser.linked_handles, '');
 });
+
+for (const [storage, databaseUrl] of [['local', ''], ['PostgreSQL', 'pg-mem://']]) {
+  test(`production ${storage} profile deletion purges current and retained legacy copies without deleting other users`, { timeout: 20_000 }, async (t) => {
+    const { baseUrl, dataDir } = await startServer(t, { NODE_ENV: 'production', DATABASE_URL: databaseUrl });
+    const owner = await register(baseUrl, 'delete_copies');
+    const other = await register(baseUrl, 'delete_copies_other');
+    const ownedKey = 'synthetic-owned-groq-key-in-all-storage-copies';
+    await saveGroqKey(baseUrl, owner.cookie, ownedKey);
+    await saveGroqKey(baseUrl, other.cookie, 'synthetic-other-groq-key-must-survive');
+    assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
+
+    const databaseOwnerId = databaseUrl ? crypto.randomUUID() : owner.body.user.id;
+    const databaseOtherId = databaseUrl ? crypto.randomUUID() : other.body.user.id;
+    const legacyOwnerId = crypto.randomUUID();
+    const legacyOtherId = crypto.randomUUID();
+    const legacyOther = {
+      id: legacyOtherId, username: 'unrelated_legacy_copy', email: 'legacy-copy@example.test',
+      groqApiKey: 'synthetic-unrelated-legacy-key',
+    };
+    const database = databaseUrl ? {
+      version: 1,
+      users: [
+        { id: databaseOwnerId, username: owner.body.user.username, email: owner.body.user.email, groqApiKey: ownedKey },
+        { id: databaseOtherId, username: 'unrelated_database_copy', email: 'database-copy@example.test', groqApiKey: 'synthetic-unrelated-database-key' },
+      ],
+      history: [],
+    } : JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8'));
+    const remainingUsers = database.users.filter((user) => user.id !== databaseOwnerId);
+    const remainingHistory = [
+      { userId: databaseOtherId, url: 'https://x.com/alice/status/99' },
+      { userId: legacyOtherId, url: 'https://x.com/alice/status/100' },
+    ];
+    const history = [
+      { userId: owner.body.user.id, url: 'https://x.com/alice/status/1' },
+      { userId: databaseOwnerId, url: 'https://x.com/alice/status/2' },
+      { userId: legacyOwnerId, url: 'https://x.com/alice/status/3' },
+      ...remainingHistory,
+    ];
+    database.history = history;
+    await mkdir(join(dataDir, 'data'), { recursive: true });
+    await writeFile(join(dataDir, 'data', 'db.json'), JSON.stringify(database));
+    await writeFile(join(dataDir, 'user-db.json'), '\uFEFF' + JSON.stringify([
+      { id: legacyOwnerId, username: owner.body.user.username, email: owner.body.user.email, groqApiKey: ownedKey },
+      legacyOther,
+    ]));
+    await writeFile(join(dataDir, 'history.json'), JSON.stringify(history));
+
+    const ownedIds = new Set([String(owner.body.user.id), String(databaseOwnerId), legacyOwnerId]);
+    const otherIds = new Set([String(other.body.user.id), String(databaseOtherId), legacyOtherId]);
+    for (const id of new Set([...ownedIds, ...otherIds])) {
+      await mkdir(join(dataDir, 'sessions', id), { recursive: true });
+      await writeFile(join(dataDir, 'sessions', id, 'alice.json'), JSON.stringify(xStorageState('alice')));
+      await mkdir(join(dataDir, 'user_data', id, 'alice'), { recursive: true });
+      await writeFile(join(dataDir, 'user_data', id, 'alice', 'Cookies'), 'synthetic profile storage');
+    }
+
+    const deleted = await deleteProfile(baseUrl, owner.cookie);
+    assert.equal(deleted.status, 200, await deleted.clone().text());
+    assert.deepEqual(await deleted.json(), { success: true, message: PROFILE_DELETION_MESSAGE });
+    const remainingDatabase = JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8'));
+    assert.deepEqual(remainingDatabase.users, remainingUsers);
+    assert.deepEqual(remainingDatabase.history, remainingHistory);
+    assert.equal(JSON.stringify(remainingDatabase).includes(ownedKey), false);
+    assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'user-db.json'), 'utf8')), [legacyOther]);
+    assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf8')), remainingHistory);
+    for (const id of ownedIds) {
+      await assert.rejects(stat(join(dataDir, 'sessions', id)), { code: 'ENOENT' });
+      await assert.rejects(stat(join(dataDir, 'user_data', id)), { code: 'ENOENT' });
+    }
+    for (const id of otherIds) {
+      await stat(join(dataDir, 'sessions', id, 'alice.json'));
+      await stat(join(dataDir, 'user_data', id, 'alice', 'Cookies'));
+    }
+    await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+    assert.equal((await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: other.cookie } })).status, 200);
+    await assertDeletedProfileCannotAuthenticate(baseUrl, owner);
+  });
+}
 
 for (const tagged of [true, false]) {
   test(`profile deletion removes ${tagged ? 'owned staged cookies with no linked accounts' : 'legacy staged cookies from nested orphan files'}`, async (t) => {
@@ -1517,6 +1871,164 @@ test('production accepts a strong secret and emits hardened session cookies', as
   assert.match(clearedCookie, /SameSite=Strict/i);
   assert.match(clearedCookie, /Secure/i);
 });
+test('production without Supabase persists locally across restarts and still verifies X', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-production-local-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const env = { NODE_ENV: 'production', DATABASE_URL: '', ALLOW_LOCAL_STORAGE: '', X_SESSION_CHECK_DISABLED: '1' };
+  const first = await startServer(t, env, { dataDir, cleanupData: false });
+  const owner = await register(first.baseUrl, 'prod_local');
+  await saveGroqKey(first.baseUrl, owner.cookie, 'synthetic-production-local-groq');
+  const imported = await importSession(first.baseUrl, owner.cookie, importPayload('alice'));
+  assert.equal(imported.status, 201, await imported.text());
+  assert.equal(first.productionHealth.requests.length, 1);
+  assert.match(first.output(), /Local JSON database:/);
+  await assert.rejects(stat(join(dataDir, 'user-db.json')), { code: 'ENOENT' });
+  const database = JSON.parse(await readFile(join(dataDir, 'data', 'db.json'), 'utf8'));
+  assert.equal(database.users[0].groqApiKey, 'synthetic-production-local-groq');
+  assert.deepEqual(database.users[0].xAccounts, ['alice']);
+  await first.stop();
+
+  const second = await startServer(t, env, { dataDir, cleanupData: false });
+  const login = await fetch(`${second.baseUrl}/api/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
+  });
+  assert.equal(login.status, 200);
+  assert.match(login.headers.get('set-cookie'), /HttpOnly.*SameSite=Strict.*Secure|HttpOnly.*Secure.*SameSite=Strict/i);
+  const body = await login.json();
+  assert.equal(body.activeXAccount, 'alice');
+  assert.equal(body.xSessionValid, true);
+  assert.equal(body.user.groq.configured, true);
+  assert.ok(second.productionHealth.requests.length > 0);
+  await second.stop();
+});
+
+test('production requires live verification despite the old disable flag and never stages rejected or unavailable sessions', { timeout: 30_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-production-live-health-'));
+  const stageMarker = join(dataDir, 'stage-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl, output, productionHealth } = await startServer(t, {
+    NODE_ENV: 'production', DATABASE_URL: 'pg-mem://', X_SESSION_CHECK_DISABLED: '1',
+    SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'prod_live');
+  await saveGroqKey(baseUrl, owner.cookie);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('zuckyeu', 'prod_valid'))).status, 201);
+  assert.equal(productionHealth.requests.length, 1, 'Production imports must perform live verification');
+  assert.match(output(), /Ignoring X_SESSION_CHECK_DISABLED=1 in production; live verification is required/);
+  for (const [prefix, status, code, valid] of [
+    ['expired_prod', 409, 'X_SESSION_EXPIRED', false],
+    ['browsererror_prod', 503, 'X_SESSION_CHECK_UNAVAILABLE', null],
+  ]) {
+    const changed = importPayload('zuckyeu', prefix);
+    const edited = await fetch(`${baseUrl}/api/auth`, {
+      method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify(changed),
+    });
+    assert.equal(edited.status, 200, await edited.text());
+    const beforeRun = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    await writeFile(stageMarker, 'fail');
+    const requestCount = productionHealth.requests.length;
+    const response = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie),
+      body: JSON.stringify({ url: 'https://x.com/zuckyeu/status/1', dryRun: true }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, status, JSON.stringify(body));
+    assert.equal(body.code, code);
+    assert.equal(body.xSessionValid, valid);
+    assert.ok(productionHealth.requests.length > requestCount, 'Every production run must verify the saved cookies');
+    assert.equal(productionHealth.requests.at(-1).csrf, changed.ct0);
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), beforeRun);
+    assert.equal(await readFile(stageMarker, 'utf8'), 'fail', 'Rejected/unavailable sessions must not reach staging');
+    await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+    assert.equal(output().includes(changed.auth_token), false);
+    assert.equal(output().includes(changed.ct0), false);
+    await unlink(stageMarker);
+  }
+});
+
+for (const backend of ['file', 'postgres']) {
+  test(`${backend} session writes canonicalize cookie attributes without encoding opaque values`, async (t) => {
+    const { baseUrl, dataDir, output } = await startServer(t, backend === 'postgres' ? { DATABASE_URL: 'pg-mem://' } : {});
+    const owner = await register(baseUrl, `format_${backend}`);
+    const state = xStorageState('zuckyeu');
+    const auth = 'opaque_auth%2B+/_value==';
+    const csrf = 'opaque_ct0%2F+/_value==';
+    state.cookies[0] = { ...state.cookies[0], value: auth, domain: '.twitter.com', path: '/legacy', secure: false, httpOnly: false, sameSite: 'None', expires: 1 };
+    state.cookies[1] = { ...state.cookies[1], value: csrf, domain: 'x.com', path: '/legacy', secure: false, httpOnly: true, sameSite: 'Strict', expires: 1 };
+    const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ xUsername: 'zuckyeu', storageState: state }),
+    });
+    assert.equal(linked.status, 201, await linked.text());
+    const switched = await fetch(`${baseUrl}/api/auth/switch-account`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ xUsername: 'zuckyeu' }),
+    });
+    assert.equal(switched.status, 200, await switched.text());
+    const assertCookies = (staged, expectedCsrf) => {
+      for (const [name, value] of [['auth_token', auth], ['ct0', expectedCsrf]]) {
+        assert.deepEqual(staged.cookies.find((cookie) => cookie.name === name), {
+          name, value, domain: '.x.com', path: '/', expires: -1, secure: true, httpOnly: name === 'auth_token', sameSite: 'Lax',
+        });
+        assert.equal(staged.cookies.filter((cookie) => cookie.name === name).length, 1);
+      }
+    };
+    assertCookies(JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8')), csrf);
+    const sessionPath = join(dataDir, 'sessions', String(owner.body.user.id), 'zuckyeu.json');
+    if (backend === 'file') {
+      assertCookies(JSON.parse(await readFile(sessionPath, 'utf8')), csrf);
+      // A legacy file may predate canonicalization; a partial cookie edit must
+      // update that first verified pair, not append an ignored duplicate.
+      await writeFile(sessionPath, JSON.stringify({ ...state, appUserId: owner.body.user.id }), 'utf8');
+    }
+    const updatedCsrf = 'updated_ct0%2F+/_value==';
+    const edited = await fetch(`${baseUrl}/api/auth`, {
+      method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ ct0: updatedCsrf }),
+    });
+    assert.equal(edited.status, 200, await edited.text());
+    assertCookies(JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8')), updatedCsrf);
+    if (backend === 'file') assertCookies(JSON.parse(await readFile(sessionPath, 'utf8')), updatedCsrf);
+    const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+    assert.equal(me.xSession.auth_token, auth);
+    assert.equal(me.xSession.ct0, updatedCsrf);
+    for (const secret of [auth, csrf, updatedCsrf]) assert.equal(output().includes(secret), false);
+  });
+}
+
+test('runner diagnostics reach server and dashboard logs without driving retries, topics or reply confirmation', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-runner-diagnostic-forwarding-'));
+  const attempts = join(dataDir, 'diagnostic-attempts');
+  const { baseUrl, output } = await startServer(t, {
+    SESSION_TEST_RUN_GATE: join(dataDir, 'run-gate'), SESSION_TEST_RUNNER_DIAGNOSTIC_STATE: attempts,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'runner_logs');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('zuckyeu'))).status, 201);
+  await saveGroqKey(baseUrl, owner.cookie);
+  const response = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/zuckyeu/status/1', dryRun: true }),
+  });
+  assert.equal(response.status, 200);
+  const events = (await response.text()).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const presence = '[RUNNER] Loaded cookies for @zuckyeu: auth_token=present, ct0=present';
+  assert.ok(events.some((event) => event.type === 'stdout' && event.data === presence));
+  assert.ok(events.some((event) => event.type === 'stderr' && event.data.startsWith('[RUNNER] Visible error element; page title:')));
+  await until(() => output().includes(presence), 'Runner cookie-presence diagnostics were not forwarded to the server console');
+  assert.equal(await readFile(attempts, 'utf8'), '1', 'Page-title text must not trigger a network or unconfirmed-reply retry');
+  assert.equal(events.find((event) => event.type === 'batch-complete').failed, 1);
+  const history = await (await fetch(`${baseUrl}/api/history`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(history.history.length, 1);
+  assert.equal(history.history[0].ok, false);
+  assert.equal(history.history[0].topic, 'other');
+  assert.equal(history.history[0].error, 'Failed: X displayed an error page.');
+  assert.deepEqual(history.history[0].actions, []);
+});
+
 test('PostgreSQL stores users and X sessions and restores them after login', async (t) => {
   const { baseUrl, dataDir } = await startServer(t, { DATABASE_URL: 'pg-mem://' });
   const { cookie, password } = await register(baseUrl, 'pg');
@@ -2785,7 +3297,7 @@ test('retired interactive sign-in does not block cookie imports or interfere wit
     method: 'POST', headers: jsonHeaders(owner.cookie), body: '{}',
   });
   assert.equal(retired.status, 410);
-  assert.match((await retired.json()).error, /local headless Chromium.*\/api\/auth\/import-session/);
+  assert.match((await retired.json()).error, /connect-interactive.*import-session/);
   assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alice'))).status, 201);
   assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
     method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-for-local-fixture' }),
@@ -2841,9 +3353,14 @@ test('native service uses the platform port and delegates browser execution to m
 
   assert.match(server, /const args = \['main\.js', targetUrl, '--yes'\]/);
   assert.match(server, /AUTH_FILE_PATH: AUTH_FILE/);
+  assert.match(server, /X_PROFILE_DIR: profileDirectory/);
+  assert.match(server, /X_SESSION_EXPORT_PATH: profileExportFile/);
+  assert.match(server, /existingPersistentProfile/);
+  assert.match(server, /syncProfileSession/);
   assert.doesNotMatch(server, /connectBrowser|createLiveInspection|runBrowserLogin|Browserbase/);
   assert.equal(server.includes('/auth/x/credentials'), false);
-  assert.doesNotMatch(server, /HARVEST_|INTERACTIVE_LOGIN_|remote-desktop-http|desktop-browser/);
+  assert.match(server, /\/api\/auth\/connect-interactive/);
+  assert.doesNotMatch(server, /HARVEST_|remote-desktop-http|desktop-browser/);
 });
 
 test('production preflight and Render image require local Playwright instead of a browser-service key', async () => {
@@ -2864,17 +3381,29 @@ test('production preflight and Render image require local Playwright instead of 
   assert.match(healthSource, /connectBrowser\(/);
   assert.match(checkProd, /SESSION_SECRET/);
   assert.match(checkProd, /DATABASE_URL/);
+  assert.doesNotMatch(checkProd, /!databaseUrl \|\||DATABASE_URL must be set/);
+  assert.match(checkProd, /local JSON storage/);
+  assert.match(checkProd, /'user_data'/);
+  assert.match(checkProd, /'data'/);
   assert.match(envExample, /DATABASE_URL/);
   assert.match(readme, /Supabase PostgreSQL/);
   assert.match(readme, /POST \/api\/auth\/import-session/);
   assert.match(readme, /local headless Chromium/);
+  assert.match(readme, /npm run setup/);
+  assert.match(readme, /git clone https:\/\/github\.com\/ZuckyEU\/X-bot\.git\r?\ncd X-bot\r?\n/);
+  assert.match(readme, /npm start/);
+  assert.match(readme, /http:\/\/localhost:3000/);
+  assert.match(readme, /connect-interactive/);
+  assert.match(readme, /data\/db\.json/);
   const manifest = JSON.parse(packageJson);
+  assert.equal(manifest.scripts.start, 'node server.js');
+  assert.equal(manifest.scripts.setup, 'npm install && npx playwright install chromium');
   const imageVersion = dockerfile.match(/^FROM mcr\.microsoft\.com\/playwright:v([\d.]+)-jammy$/m)?.[1];
   assert.equal(manifest.dependencies.playwright, imageVersion, 'Pin Playwright to the container browser version');
   assert.equal(Object.hasOwn(manifest.dependencies, '@browserbasehq/sdk'), false);
   assert.match(dockerfile, /RUN node --input-type=module -e.*await connectBrowser\(\).*await closeBrowser\(browser\)/);
   for (const contents of [checkProd, envExample, readme]) {
-    assert.doesNotMatch(contents, /HARVEST_|INTERACTIVE_LOGIN_|fly\.dev|noVNC|Xvfb/);
+    assert.doesNotMatch(contents, /HARVEST_|fly\.dev|noVNC|Xvfb/);
   }
 });
 
@@ -2883,6 +3412,8 @@ test('dashboard imports X sessions with masked inputs instead of asking for X cr
   assert.equal(html.includes('id="x-credentials-form"'), false);
   assert.equal(html.includes('id="x-password"'), false);
   assert.match(html, /\/api\/auth\/import-session/);
+  assert.match(html, /\/api\/auth\/connect-interactive/);
+  assert.match(html, /id="connect-x-interactive"/);
   assert.match(html, /id="session-auth-token"[^>]*type="password"/);
   assert.match(html, /id="session-ct0"[^>]*type="password"/);
   assert.doesNotMatch(html, /remote-login|\/x-accounts\/interactive|window\.open|(?:local|session)Storage\.setItem/);

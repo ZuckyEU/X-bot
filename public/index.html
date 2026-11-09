@@ -502,39 +502,42 @@
       <div class="session-import" role="dialog" aria-modal="true" aria-labelledby="session-import-title" aria-describedby="session-import-hint">
         <div class="session-import-head">
           <div>
-            <h2 id="session-import-title">Import X session</h2>
-            <p id="session-import-subtitle">Connect an account using cookies from your signed-in browser.</p>
+            <h2 id="session-import-title">Connect X account</h2>
+            <p id="session-import-subtitle">Sign in to X in a browser window opened by this app.</p>
           </div>
           <button id="session-import-close" class="ghost" type="button" aria-label="Close session import">Close</button>
         </div>
         <p id="session-import-hint" class="session-import-hint">
-          These cookies grant access to your X account. Only import accounts you own or are authorized to manage. Values are stored privately on the server, not in browser storage.
+          Click “Open X sign-in”, enter the handle below, and finish signing in to X in the browser window. The session is saved to a private local browser profile for this app account.
         </p>
-        <details class="session-import-help">
-          <summary>Where do I find these cookies?</summary>
-          <ol>
-            <li>Sign in to the matching account on <strong>x.com</strong> in your own browser.</li>
-            <li>Open Developer Tools → Application (or Storage) → Cookies → <strong>https://x.com</strong>.</li>
-            <li>Copy the <strong>Value</strong> of <code>auth_token</code> and <code>ct0</code>. Paste only the values below, not a full cookie header.</li>
-          </ol>
-          <p>Both cookies must come from the same account. The cookies are checked with X before they are saved, so expired or revoked values are rejected.</p>
-        </details>
+        <div class="session-import-actions">
+          <button id="connect-x-interactive" class="primary" type="button">Open X sign-in</button>
+        </div>
+        <p id="interactive-login-status" class="session-import-hint" role="status" aria-live="polite"></p>
         <form id="session-import-form" autocomplete="off">
           <div class="auth-field">
             <label class="control-label" for="session-handle">X handle</label>
             <input id="session-handle" name="handle" type="text" placeholder="@your_handle" required maxlength="16" pattern="@?[A-Za-z0-9_]{1,15}" autocapitalize="none" spellcheck="false" />
           </div>
-          <div class="auth-field">
-            <label class="control-label" for="session-auth-token">auth_token</label>
-            <input id="session-auth-token" name="auth_token" type="password" placeholder="Paste auth_token value" required minlength="8" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" />
-          </div>
-          <div class="auth-field">
-            <label class="control-label" for="session-ct0">ct0</label>
-            <input id="session-ct0" name="ct0" type="password" placeholder="Paste ct0 value" required minlength="8" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" />
+          <div class="manual-fallback" id="manual-session-import">
+            <p class="session-import-help"><strong>Advanced fallback:</strong> paste auth_token and ct0 manually only when this machine cannot open a browser window, or on a remote deployment.</p>
+            <ol class="session-import-help">
+              <li>Sign in to the matching account on <strong>x.com</strong> in your own browser.</li>
+              <li>Open Developer Tools → Application (or Storage) → Cookies → <strong>https://x.com</strong>.</li>
+              <li>Copy the <strong>Value</strong> of <code>auth_token</code> and <code>ct0</code>. Paste only the values below, not a full cookie header.</li>
+            </ol>
+            <div class="auth-field">
+              <label class="control-label" for="session-auth-token">auth_token</label>
+              <input id="session-auth-token" name="auth_token" type="password" placeholder="Paste auth_token value" required minlength="8" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" />
+            </div>
+            <div class="auth-field">
+              <label class="control-label" for="session-ct0">ct0</label>
+              <input id="session-ct0" name="ct0" type="password" placeholder="Paste ct0 value" required minlength="8" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" />
+            </div>
           </div>
           <div id="session-import-error" class="auth-error" role="alert" aria-live="polite"></div>
           <div class="session-import-actions">
-            <button id="session-import-submit" class="primary" type="submit">Import &amp; activate account</button>
+            <button id="session-import-submit" class="primary" type="submit">Save pasted cookies</button>
           </div>
         </form>
       </div>
@@ -959,12 +962,21 @@
 
       function setSessionImportBusy(busy) {
         $('session-import-form').setAttribute('aria-busy', String(busy));
-        for (const id of ['session-handle', 'session-auth-token', 'session-ct0', 'session-import-submit']) {
+        for (const id of [
+          'session-handle',
+          'session-auth-token',
+          'session-ct0',
+          'session-import-submit',
+          'connect-x-interactive',
+        ]) {
           $(id).disabled = busy;
         }
         $('session-import-submit').textContent = busy
-          ? 'Importing…'
-          : sessionImportReauthenticate ? 'Re-authenticate account' : 'Import & activate account';
+          ? 'Saving…'
+          : 'Save pasted cookies';
+        $('connect-x-interactive').textContent = busy
+          ? 'Waiting for X sign-in…'
+          : sessionImportReauthenticate ? 'Reconnect in browser' : 'Open X sign-in';
         const blocked = busy || Boolean(controller) || Boolean(profileDeletionRequest);
         $('add-x-account').disabled = blocked;
         $('run').disabled = blocked || sessionBlocksPublishing();
@@ -1039,19 +1051,20 @@
         $('session-import-form').reset();
         sessionImportReauthenticate = Boolean(reauthenticate && xUsername);
         $('session-import-title').textContent = sessionImportReauthenticate
-          ? 'Re-authenticate X account'
-          : 'Import X session';
+          ? 'Reconnect X account'
+          : 'Connect X account';
         $('session-import-subtitle').textContent = sessionImportReauthenticate
-          ? `Update the cookies for @${xUsername} to restore publishing.`
-          : 'Connect an account using cookies from your signed-in browser.';
+          ? `Sign in to X in the browser window to restore publishing for @${xUsername}.`
+          : 'Sign in to X in a browser window opened by this app.';
         $('session-handle').readOnly = sessionImportReauthenticate;
         if (sessionImportReauthenticate) $('session-handle').value = xUsername;
+        $('interactive-login-status').textContent = '';
         $('session-import-error').textContent = '';
         setSessionImportBusy(false);
         $('session-import-modal').classList.remove('hidden');
         $('session-import-modal').setAttribute('aria-hidden', 'false');
         document.body.classList.add('import-open');
-        (sessionImportReauthenticate ? $('session-auth-token') : $('session-handle')).focus();
+        (sessionImportReauthenticate ? $('connect-x-interactive') : $('session-handle')).focus();
       }
 
       function closeSessionImport({ restoreFocus = true } = {}) {
@@ -1063,8 +1076,9 @@
         $('session-import-form').reset();
         sessionImportReauthenticate = false;
         $('session-handle').readOnly = false;
-        $('session-import-title').textContent = 'Import X session';
-        $('session-import-subtitle').textContent = 'Connect an account using cookies from your signed-in browser.';
+        $('session-import-title').textContent = 'Connect X account';
+        $('session-import-subtitle').textContent = 'Sign in to X in a browser window opened by this app.';
+        $('interactive-login-status').textContent = '';
         $('session-import-error').textContent = '';
         setSessionImportBusy(false);
         if (restoreFocus) sessionImportReturnFocus?.focus();
@@ -1354,6 +1368,73 @@
         openSessionImport();
       }
 
+      async function connectInteractive() {
+        if (controller || sessionImportRequest || profileDeletionRequest) return;
+        const generation = authStateGeneration;
+        const handle = $('session-handle').value.trim();
+        if (!/^@?[A-Za-z0-9_]{1,15}$/.test(handle)) {
+          $('session-import-error').textContent = 'Enter the X handle you will sign in with.';
+          $('session-handle').focus();
+          return;
+        }
+
+        const request = new AbortController();
+        sessionImportRequest = request;
+        $('session-import-error').textContent = '';
+        $('interactive-login-status').textContent =
+          'Waiting for you to finish signing in to X in the browser window…';
+        setSessionImportBusy(true);
+        try {
+          const response = await fetch('/api/auth/connect-interactive', {
+            method: 'POST',
+            headers: appSessionHeaders({ 'content-type': 'application/json' }),
+            credentials: 'same-origin',
+            body: JSON.stringify({ handle }),
+            // The server waits up to INTERACTIVE_LOGIN_TIMEOUT_MS; give it a
+            // little headroom so the server's clear timeout message wins.
+            signal: AbortSignal.any([request.signal, AbortSignal.timeout(16 * 60_000)]),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (generation !== authStateGeneration || sessionImportRequest !== request) return;
+          request.signal.throwIfAborted();
+          if (response.status === 401) {
+            resetSignedOutState();
+            showAuthOverlay();
+            setText('auth-msg', 'Your app session expired. Sign in before connecting X.', 'warn');
+            return;
+          }
+          if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+          const reconnected = sessionImportReauthenticate;
+          applyLinkedAccounts(data.accounts, data.activeXAccount);
+          applyXSessionHealth(data);
+          closeSessionImport();
+          setText('auth-msg', reconnected
+            ? `Reconnected @${data.username}.`
+            : `Connected @${data.username}.`, 'ok');
+          setStatus(
+            'X connection verified',
+            'ok',
+            `Signed in as @${data.username}; the local browser profile is saved.`,
+          );
+        } catch (error) {
+          if (generation !== authStateGeneration || sessionImportRequest !== request) return;
+          if (error.name !== 'AbortError') {
+            const message = error.name === 'TimeoutError'
+              ? 'Sign-in timed out. Close and retry when you are ready to finish in the browser window.'
+              : error.message;
+            $('session-import-error').textContent = message;
+            $('interactive-login-status').textContent = '';
+            setStatus('X connection failed', 'err', message);
+          }
+        } finally {
+          if (generation === authStateGeneration && sessionImportRequest === request) {
+            sessionImportRequest = null;
+            setSessionImportBusy(false);
+            $('interactive-login-status').textContent = '';
+          }
+        }
+      }
+
       async function importSession(event) {
         event.preventDefault();
         if (controller || sessionImportRequest || profileDeletionRequest) return;
@@ -1563,6 +1644,7 @@
         addXAccountBtn.addEventListener('click', addXAccount);
         $('x-session-reconnect').addEventListener('click', () => openReauthentication());
         $('session-import-form').addEventListener('submit', importSession);
+        $('connect-x-interactive').addEventListener('click', connectInteractive);
         $('session-import-close').addEventListener('click', () => closeSessionImport());
         window.addEventListener('pagehide', () => closeSessionImport({ restoreFocus: false }));
         sessionImportModal.addEventListener('click', (event) => {

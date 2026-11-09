@@ -5,10 +5,12 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
+    "setup": "npm install && npx playwright install chromium",
+    "start": "node server.js",
+    "serve": "node server.js",
     "auth": "node auth.js",
     "automate": "node main.js",
-    "serve": "node server.js",
+    "demo": "node index.js",
     "check:prod": "node scripts/check-prod.js",
     "test": "node --test \"test/*.test.js\"",
     "test:ui": "node --test test/session-import-dashboard.browser.js"

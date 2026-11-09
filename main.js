@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { access, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -9,11 +9,14 @@ import {
   connectBrowser,
   getDefaultContext,
   getOrCreatePage,
+  hasXSessionCookies,
   restoreStorageState,
   safeContextCall,
   safeGoto,
 } from './lib/browser.js';
+import { closePersistentProfile, launchPersistentProfile } from './lib/persistent-profile.js';
 import { generateReply, MAX_REPLY_LENGTH, DEFAULT_TONE } from './lib/reply.js';
+import { loadRunnerSession, redactRunnerDiagnostic, reportRunnerPageFailure, waitForRunnerContent } from './lib/runner-session.js';
 
 /**
  * X reply automation.
@@ -27,6 +30,9 @@ import { generateReply, MAX_REPLY_LENGTH, DEFAULT_TONE } from './lib/reply.js';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = resolve(process.env.DATA_DIR || ROOT);
 const AUTH_FILE = process.env.AUTH_FILE_PATH || join(DATA_DIR, 'auth.json');
+const PROFILE_DIR = String(process.env.X_PROFILE_DIR ?? '').trim() || null;
+const PROFILE_EXPORT = String(process.env.X_SESSION_EXPORT_PATH ?? '').trim() || null;
+const PROFILE_HEADLESS = String(process.env.X_PROFILE_HEADLESS ?? '1') !== '0';
 const TWEET_URL_PATTERN = /^https?:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
 
 const USAGE = `
@@ -125,58 +131,32 @@ async function waitUntilEnabled(locator, timeoutMs) {
   throw new Error('The post button never became enabled.');
 }
 
-/** Reads the session saved by auth.js (also accepts a bare cookie array). */
-async function loadAuthState() {
-  try {
-    await access(AUTH_FILE);
-  } catch {
-    throw new Error('auth.json not found. Run `npm run auth` first to save your X session.');
-  }
-
-  const raw = (await readFile(AUTH_FILE, 'utf8')).replace(/^\uFEFF/, ''); // tolerate a BOM from Windows editors
-  const parsed = JSON.parse(raw);
-  const cookies = Array.isArray(parsed) ? parsed : parsed.cookies;
-
-  if (!Array.isArray(cookies) || cookies.length === 0) {
-    throw new Error('auth.json contains no cookies. Re-run `npm run auth`.');
-  }
-
-  const savedUsername = Array.isArray(parsed) ? null : parsed.username;
-  const usernameMatch = String(savedUsername ?? '').trim().match(/^@?([A-Za-z0-9_]{1,15})$/);
-
-  return {
-    cookies,
-    origins: Array.isArray(parsed) || !Array.isArray(parsed.origins) ? [] : parsed.origins,
-    username: usernameMatch?.[1] ?? null,
-  };
-}
-
 /* ------------------------------- X actions ------------------------------ */
 
-async function ensureLoggedIn(page) {
+async function ensureLoggedIn(page, cookies) {
   const navigation = await safeGoto(page, 'https://x.com/home', {
     waitUntil: 'domcontentloaded',
     timeout: 30_000,
   });
   if (navigation.error) {
-    console.warn(`[AUTH] Navigation warning: ${navigation.error.message}. Checking the session anyway…`);
+    console.warn(`[AUTH] Navigation warning: ${redactRunnerDiagnostic(navigation.error.message, cookies)}. Checking the session anyway…`);
   } else if (navigation.response && navigation.response.status() >= 400) {
     console.warn(`[AUTH] X returned HTTP ${navigation.response.status()} while opening the timeline.`);
   }
 
   try {
-    await page
-      .locator('[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"]')
-      .first()
-      .waitFor({ state: 'visible', timeout: 20_000 });
-  } catch {
-    throw new Error('Not logged in — the session in auth.json is missing or expired. Run `npm run auth` again.');
+    await waitForRunnerContent(page, '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"]', {
+      cookies, timeoutMs: 20_000,
+    });
+  } catch (error) {
+    if (error.name !== 'TimeoutError') throw error;
+    throw new Error('The authenticated X timeline did not load. Review the runner page-title diagnostic and retry.');
   }
 }
 
-async function extractTweet(page) {
+async function extractTweet(page, cookies) {
   const tweet = page.locator(SEL.tweet).first();
-  await tweet.waitFor({ state: 'visible', timeout: 30_000 });
+  await waitForRunnerContent(page, SEL.tweet, { cookies });
 
   const showMore = tweet.locator(SEL.showMore);
   if ((await showMore.count()) > 0) await showMore.first().click().catch(() => {});
@@ -409,25 +389,51 @@ async function main() {
   const groqKeySource = process.env.GROQ_API_KEY_SOURCE === 'account' ? 'saved account' : 'environment';
   console.log(`[GROQ] Using API key from ${groqKeySource}.`);
 
-  const authState = await loadAuthState();
+  const authState = await loadRunnerSession(AUTH_FILE, { username: process.env.X_ACCOUNT_USERNAME });
 
   let browser = null;
+  let context = null;
+  let page = null;
   try {
-    browser = await connectBrowser();
-    const context = await getDefaultContext(browser);
-    const restored = await safeContextCall(
-      context,
-      () => restoreStorageState(context, authState, { clearCookies: true }),
-      'Restoring X session cookies and localStorage',
-    );
-    if (!restored.ok) {
-      console.warn(`[AUTH] ${restored.error.message}. Nothing was posted.`);
-      process.exitCode = 1;
-      return;
+    if (PROFILE_DIR) {
+      // Local standalone mode: reuse the persistent profile created by the
+      // dashboard's "Connect X" flow. Re-applying the verified auth/ct0 pair
+      // keeps a stale or partially signed-in profile usable; all other profile
+      // cookies and localStorage (device reputation, CSRF helpers) are retained.
+      context = await launchPersistentProfile(PROFILE_DIR, { headless: PROFILE_HEADLESS });
+      const restored = await safeContextCall(
+        context,
+        () => restoreStorageState(context, authState, { clearCookies: false }),
+        'Restoring the verified X session into the persistent profile',
+      );
+      if (!restored.ok) {
+        console.warn(`[AUTH] ${redactRunnerDiagnostic(restored.error.message, authState.cookies)}. Nothing was posted.`);
+        process.exitCode = 1;
+        return;
+      }
+      page = await getOrCreatePage(context);
+      const profileCookies = await context.cookies(['https://x.com']).catch(() => []);
+      if (!hasXSessionCookies(profileCookies)) {
+        console.warn('[RUNNER] Redirected to login page - cookies rejected by X');
+        throw new Error('The persistent X profile is not signed in. Reconnect the X account from the dashboard.');
+      }
+    } else {
+      browser = await connectBrowser();
+      context = await getDefaultContext(browser);
+      const restored = await safeContextCall(
+        context,
+        () => restoreStorageState(context, authState, { clearCookies: true }),
+        'Restoring X session cookies and localStorage',
+      );
+      if (!restored.ok) {
+        console.warn(`[AUTH] ${redactRunnerDiagnostic(restored.error.message, authState.cookies)}. Nothing was posted.`);
+        process.exitCode = 1;
+        return;
+      }
+      page = await getOrCreatePage(context);
     }
-    const page = await getOrCreatePage(context);
 
-    await ensureLoggedIn(page);
+    await ensureLoggedIn(page, authState.cookies);
 
     console.log(`Opening ${tweetUrl} …`);
     const navigation = await safeGoto(page, tweetUrl, {
@@ -435,12 +441,12 @@ async function main() {
       timeout: 60_000,
     });
     if (navigation.error) {
-      console.warn(`[NAV] Navigation warning: ${navigation.error.message}. Continuing…`);
+      console.warn(`[NAV] Navigation warning: ${redactRunnerDiagnostic(navigation.error.message, authState.cookies)}. Continuing…`);
     } else if (navigation.response && navigation.response.status() >= 400) {
       console.warn(`[NAV] X returned HTTP ${navigation.response.status()} for ${tweetUrl}.`);
     }
 
-    const tweet = await extractTweet(page);
+    const tweet = await extractTweet(page, authState.cookies);
     console.log(`\nTweet by @${tweet.author}:\n  ${truncate(tweet.text, 300)}\n`);
 
     if (options.audit) {
@@ -505,7 +511,22 @@ async function main() {
     }
 
     console.log(`\nDone: ${tweetUrl}`);
+  } catch (error) {
+    if (page) await reportRunnerPageFailure(page, authState.cookies);
+    if (error instanceof Error) error.message = redactRunnerDiagnostic(error.message, authState.cookies);
+    throw error;
   } finally {
+    if (PROFILE_DIR && PROFILE_EXPORT && context) {
+      try {
+        const state = await context.storageState();
+        await mkdir(dirname(PROFILE_EXPORT), { recursive: true });
+        await writeFile(PROFILE_EXPORT, `${JSON.stringify(state, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      } catch {
+        // The server will keep the previously verified session if this fails.
+        console.warn('[RUNNER] Could not export the persistent profile state.');
+      }
+    }
+    if (PROFILE_DIR) await closePersistentProfile(context);
     await closeBrowser(browser);
   }
 }

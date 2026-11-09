@@ -17,7 +17,24 @@ import {
   query,
   withTransaction,
 } from './lib/database.js';
-import { CHROME_USER_AGENT, createTrustedLoginProfile, X_LOGIN_URL } from './lib/browser.js';
+import {
+  CHROME_USER_AGENT,
+  createTrustedLoginProfile,
+  normalizeXSessionCookies,
+  X_LOGIN_URL,
+} from './lib/browser.js';
+import { createLocalStore } from './lib/local-store.js';
+import {
+  captureProfileState,
+  closePersistentProfile,
+  DEFAULT_LOGIN_TIMEOUT_MS,
+  interactiveLoginUnavailableReason,
+  launchPersistentProfile,
+  persistentProfileDirectory,
+  persistentProfilesEnabled,
+  signedInHandle,
+  waitForProfileLogin,
+} from './lib/persistent-profile.js';
 import { verifyXSessionInBrowser } from './lib/x-session-health.js';
 
 /**
@@ -26,10 +43,11 @@ import { verifyXSessionInBrowser } from './lib/x-session-health.js';
  *   POST /api/auth/register, /api/auth/login -> persisted local user authentication
  *   DELETE /api/auth/me -> delete the profile, configuration, and all saved X sessions
  *   GET  /api/auth/x-accounts -> list the logged-in user's saved X sessions
- *   POST /api/auth/import-session -> import X cookies -> active per-user session
+ *   POST /api/auth/connect-interactive -> open local Chromium and connect X
+ *   POST /api/auth/import-session -> advanced: import X cookies -> active per-user session
  *   POST /api/auth/switch-account -> select the X session used by automation
  *   GET/PUT/DELETE /api/config/groq -> manage the user's persisted Groq API key
- *   POST /auth/x     -> retired interactive sign-in; directs clients to cookie import
+ *   POST /auth/x     -> retired interactive sign-in; directs clients to connect-interactive
  *   POST /auth/x/cancel -> authenticated compatibility no-op
  *   POST /api/run    -> run the reply pipeline with the active X session
  *
@@ -42,9 +60,11 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(ROOT, 'public');
 const INDEX_FILE = join(PUBLIC_DIR, 'index.html');
 const DATA_DIR = resolve(process.env.DATA_DIR || ROOT);
+const LOCAL_STORE = createLocalStore(DATA_DIR);
 const AUTH_FILE = join(DATA_DIR, 'auth.json');
 const USER_DB_FILE = join(DATA_DIR, 'user-db.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
+const PROFILE_ROOT = join(DATA_DIR, 'user_data');
 const DEFAULT_ADMIN_USERNAME = String(process.env.DEFAULT_ADMIN_USERNAME || '').trim();
 const DEFAULT_ADMIN_EMAIL = String(process.env.DEFAULT_ADMIN_EMAIL || '')
   .trim()
@@ -121,16 +141,24 @@ const X_SESSION_CHECK_URLS = X_SESSION_CHECK_CONFIGURED_URLS.length
 const X_SESSION_CHECK_TIMEOUT_MS = envInteger('X_SESSION_CHECK_TIMEOUT_MS', 3_500, 500, 15_000);
 const X_SESSION_CHECK_BROWSER_TIMEOUT_MS = envInteger('X_SESSION_CHECK_BROWSER_TIMEOUT_MS', 10_000, 500, 30_000);
 const X_SESSION_CHECK_CACHE_MS = envInteger('X_SESSION_CHECK_CACHE_MS', 60_000, 0, 15 * 60_000);
-const X_SESSION_CHECK_DISABLED = process.env.X_SESSION_CHECK_DISABLED === '1'
-  || (IS_TEST && X_SESSION_CHECK_CONFIGURED_URLS.length === 0);
+const X_SESSION_CHECK_DISABLED = !IS_PRODUCTION && (process.env.X_SESSION_CHECK_DISABLED === '1'
+  || (IS_TEST && X_SESSION_CHECK_CONFIGURED_URLS.length === 0));
+if (IS_PRODUCTION && process.env.X_SESSION_CHECK_DISABLED === '1') {
+  console.warn('[x-session] Ignoring X_SESSION_CHECK_DISABLED=1 in production; live verification is required.');
+}
 // Public web-app bearer used by x.com itself; overridable in case X rotates it.
 const X_WEB_BEARER = String(
   process.env.X_SESSION_CHECK_BEARER
     || 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
 ).trim();
 
-const HISTORY_FILE = join(DATA_DIR, 'history.json');
 const REPLY_OUT_FILE = join(tmpdir(), 'playwright-gemini-reply.txt');
+const INTERACTIVE_LOGIN_TIMEOUT_MS = envInteger(
+  'INTERACTIVE_LOGIN_TIMEOUT_MS',
+  DEFAULT_LOGIN_TIMEOUT_MS,
+  30_000,
+  15 * 60_000,
+);
 
 /** Only one automation / session import at a time; drives the 409 + the Stop button. */
 let activeRun = null;
@@ -328,7 +356,7 @@ function userFromDatabaseRow(row) {
   };
 }
 
-/** Load user records from PostgreSQL when configured, otherwise the local test/dev file. */
+/** Load user records from PostgreSQL when configured, otherwise local data/db.json. */
 async function loadUserDb() {
   if (isPostgresEnabled()) {
     const { rows } = await query(`
@@ -344,9 +372,14 @@ async function loadUserDb() {
 }
 
 async function loadLocalUserDb() {
+  return LOCAL_STORE.readUsers();
+}
+
+/** Pre-PostgreSQL file, read only while cleaning up or migrating old installs. */
+async function readLegacyUserDb() {
   try {
     const raw = await readFile(USER_DB_FILE, 'utf8');
-    const data = JSON.parse(raw);
+    const data = JSON.parse(raw.replace(/^\uFEFF/, ''));
     return Array.isArray(data) ? data : [];
   } catch (error) {
     if (error.code === 'ENOENT') return [];
@@ -378,10 +411,10 @@ async function atomicWritePrivateFile(path, contents) {
   }
 }
 
-/** Save user records to PostgreSQL, or atomically replace the local fallback file. */
+/** Save user records to PostgreSQL, or the local data/db.json fallback. */
 async function saveUserDb(users) {
   if (!isPostgresEnabled()) {
-    await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(users, null, 2)}\n`);
+    await LOCAL_STORE.writeUsers(users);
     return;
   }
 
@@ -669,6 +702,22 @@ function loginProfileFileFor(userId) {
   return join(sessionDirectoryFor(userId), '_trusted-login-profile.json');
 }
 
+function persistentProfileDirectoryFor(userId, xUsername) {
+  return persistentProfileDirectory(DATA_DIR, userId, xUsername);
+}
+
+/** The saved profile directory for this user/handle, or null when it is not in use. */
+async function existingPersistentProfile(userId, xUsername) {
+  if (!persistentProfilesEnabled()) return null;
+  const directory = persistentProfileDirectoryFor(userId, xUsername);
+  try {
+    await access(directory);
+    return directory;
+  } catch {
+    return null;
+  }
+}
+
 async function sessionFileExists(path) {
   try {
     await access(path);
@@ -697,7 +746,10 @@ async function writeAuthFile(payload, path = AUTH_FILE) {
   if (!payload || !Array.isArray(payload.cookies)) {
     throw new ValidationError('Playwright storage state must contain a cookies array');
   }
-  await atomicWritePrivateFile(path, `${JSON.stringify(payload, null, 2)}\n`);
+  const state = { ...payload, cookies: normalizeXSessionCookies(payload.cookies) };
+  if (payload.cookieCount !== undefined) state.cookieCount = state.cookies.length;
+  await atomicWritePrivateFile(path, `${JSON.stringify(state, null, 2)}\n`);
+  return state;
 }
 
 async function deleteAuthFile(path = AUTH_FILE) {
@@ -768,9 +820,7 @@ async function readXSession(userId, xUsername) {
 
 async function writeXSession(userId, xUsername, storageState) {
   if (!isPostgresEnabled()) {
-    const state = { ...storageState, appUserId: userId };
-    await writeAuthFile(state, sessionFileFor(userId, xUsername));
-    return state;
+    return writeAuthFile({ ...storageState, appUserId: userId }, sessionFileFor(userId, xUsername));
   }
 
   const cookies = Array.isArray(storageState?.cookies) ? storageState.cookies : [];
@@ -799,6 +849,42 @@ async function deleteXSession(userId, xUsername) {
     return;
   }
   await query('DELETE FROM x_sessions WHERE user_id = $1 AND handle = $2', [userId, xUsername]);
+}
+
+/**
+ * Runs write cookies back into the persistent profile. After the runner exits,
+ * the profile may contain a rotated csrf/session cookie; copy it to the saved
+ * session so the next verification and remote fallback stay current.
+ * Returns without writing when the export is missing or incomplete.
+ */
+async function syncProfileSession(userId, xUsername, exportPath) {
+  const state = await readAuthFile(exportPath).catch(() => null);
+  try {
+    if (!state) return false;
+    const credentials = xSessionCredentials(state);
+    if (!credentials.auth_token || !credentials.ct0) return false;
+
+    await withWriteLock(async () => {
+      const users = await loadUserDb();
+      const current = users.find((candidate) => candidate.id === userId);
+      if (!current || deletingUserProfiles.has(current.id)) return;
+      normalizeUserAccounts(current);
+      if (!current.xAccounts.includes(xUsername)) return;
+      const saved = await writeXSession(current.id, xUsername, {
+        ...state,
+        username: xUsername,
+        source: 'persistent-profile',
+        savedAt: new Date().toISOString(),
+      });
+      if (current.preferences.defaultXAccount === xUsername) {
+        await writeAuthFile(saved ?? state, AUTH_FILE);
+      }
+    });
+    return true;
+  } finally {
+    // The export contains live cookies; remove it whether or not it was usable.
+    await deleteAuthFile(exportPath);
+  }
 }
 
 /** Most recent saved account for one user, used when their default handle is empty. */
@@ -1428,6 +1514,223 @@ app.post('/api/auth/import-session', async (req, res, next) => {
   }
 });
 
+/* --------------------- interactive X sign-in (persistent) ---------------- */
+
+/**
+ * Opens a real, headful Chromium profile and waits for the user to sign in to
+ * X. X writes auth_token/ct0 (and the rest of its session) into the profile on
+ * disk; the cookies are then verified and saved to the normal session store.
+ *
+ * The browser must run on the same machine as the user (local deployment).
+ * Headless/datacenter servers get a clear 503 instead of a browser nobody can see.
+ */
+app.post('/api/auth/connect-interactive', async (req, res, next) => {
+  let context = null;
+  let handle = null;
+  let completion = null;
+  let pendingProfileDirectory = null;
+
+  try {
+    const auth = await authenticatedUser(req);
+    if (activeRun) throw new HttpError(409, 'A run is already in progress');
+
+    const unavailable = interactiveLoginUnavailableReason();
+    if (unavailable) throw new HttpError(503, unavailable);
+
+    const requestedHandle = req.body?.handle == null || String(req.body.handle).trim() === ''
+      ? null
+      : normalizeXUsername(req.body.handle);
+
+    completion = createCompletionSignal();
+    const request = new AbortController();
+    const assertOpen = () => {
+      if (request.signal.aborted || res.destroyed || req.aborted || req.socket?.destroyed) {
+        throw new HttpError(410, 'Interactive X sign-in was cancelled');
+      }
+    };
+    const profileDirectory = requestedHandle
+      ? persistentProfileDirectoryFor(auth.user.id, requestedHandle)
+      : join(PROFILE_ROOT, String(auth.user.id), `pending-${crypto.randomUUID()}`);
+    if (!requestedHandle) pendingProfileDirectory = profileDirectory;
+
+    handle = {
+      type: 'interactive-login',
+      userId: auth.user.id,
+      xUsername: requestedHandle,
+      done: completion.promise,
+      abort() {
+        request.abort();
+        void closePersistentProfile(context);
+      },
+    };
+    activeRun = handle;
+    attachRunCleanup(res, handle);
+
+    context = await launchPersistentProfile(profileDirectory, { headless: false });
+    assertOpen();
+    const page = context.pages()[0] ?? await context.newPage();
+    try {
+      await page.goto(X_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } catch {
+      assertOpen();
+      throw new HttpError(503, 'Could not open X in the sign-in browser. Check the network connection and retry.');
+    }
+
+    await waitForProfileLogin(context, {
+      timeoutMs: INTERACTIVE_LOGIN_TIMEOUT_MS,
+      signal: request.signal,
+      page,
+    });
+    assertOpen();
+
+    const detectedHandle = await signedInHandle(page);
+    if (detectedHandle && requestedHandle && detectedHandle !== requestedHandle) {
+      // Never leave another account's cookies in a profile directory named for
+      // the requested handle. A later attempt must be able to start cleanly.
+      await closePersistentProfile(context);
+      context = null;
+      await rm(profileDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+        .catch(() => {});
+      throw new HttpError(
+        409,
+        `Signed in as @${detectedHandle}, but @${requestedHandle} was requested. Retry and use the account you entered.`,
+      );
+    }
+    const username = detectedHandle ?? requestedHandle;
+    if (!username) {
+      throw new HttpError(422, 'Could not determine the signed-in X handle. Enter the handle first and retry.');
+    }
+
+    const state = await captureProfileState(context, { username });
+    await closePersistentProfile(context);
+    context = null;
+    assertOpen();
+
+    // A real login is still verified like every other session source. X can
+    // redirect a profile that is already signed out, so never stage unverified
+    // cookies for a run.
+    const health = await checkXSessionHealth(state, { handle: username, force: true });
+    assertOpen();
+    if (health.xSessionValid === false) {
+      const error = new HttpError(409, `X rejected the signed-in session for @${username}. Sign in again.`);
+      error.code = 'X_SESSION_EXPIRED';
+      error.health = health;
+      throw error;
+    }
+    if (!X_SESSION_CHECK_DISABLED && health.xSessionValid !== true) {
+      const error = new HttpError(
+        503,
+        `X could not confirm the session for @${username} after sign-in. Retry shortly; your saved account session has not been changed.`,
+      );
+      error.code = 'X_SESSION_CHECK_UNAVAILABLE';
+      error.health = health;
+      throw error;
+    }
+
+    const result = await withWriteLock(async () => {
+      const users = await loadUserDb();
+      const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
+      assertUserProfileAvailable(current.id);
+      if (activeRun !== handle || request.signal.aborted) {
+        throw new HttpError(409, 'The sign-in was interrupted. Retry.');
+      }
+      normalizeUserAccounts(current);
+      if (!current.xAccounts.includes(username) && current.xAccounts.length >= MAX_X_ACCOUNTS) {
+        throw new HttpError(409, `A maximum of ${MAX_X_ACCOUNTS} X accounts can be linked`);
+      }
+
+      // Promote handle-less profiles only after verification and ownership /
+      // account-limit checks, never over an existing profile on a failed check.
+      assertOpen();
+      const finalDirectory = persistentProfileDirectoryFor(auth.user.id, username);
+      if (profileDirectory !== finalDirectory) {
+        await rm(finalDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        await mkdir(dirname(finalDirectory), { recursive: true });
+        await rename(profileDirectory, finalDirectory);
+        pendingProfileDirectory = null;
+      }
+
+      const previousUsers = structuredClone(users);
+      const previousSession = await readXSession(current.id, username);
+      const previousActive = await readAuthFile(AUTH_FILE);
+      let sessionWritten = false;
+      let usersWritten = false;
+      let activeWritten = false;
+      try {
+        assertOpen();
+        const savedSession = await writeXSession(current.id, username, state);
+        sessionWritten = true;
+        assertOpen();
+        if (!current.xAccounts.includes(username)) current.xAccounts.push(username);
+        current.preferences.defaultXAccount = username;
+        await saveUserDb(users);
+        usersWritten = true;
+        assertOpen();
+        await writeAuthFile(savedSession ?? state, AUTH_FILE);
+        activeWritten = true;
+        const accounts = await accountSummaries(current);
+        assertOpen();
+        return { username, activeXAccount: username, accounts };
+      } catch (error) {
+        try {
+          if (activeWritten) {
+            if (previousActive) await writeAuthFile(previousActive, AUTH_FILE);
+            else await deleteAuthFile(AUTH_FILE);
+          }
+          if (usersWritten) await saveUserDb(previousUsers);
+          if (sessionWritten) {
+            if (previousSession) await writeXSession(current.id, username, previousSession);
+            else await deleteXSession(current.id, username);
+          }
+        } catch {
+          throw new HttpError(503, 'Could not restore an interrupted X sign-in. Check persistent storage before retrying.');
+        }
+        throw error;
+      }
+    });
+
+    return res.status(201).json({
+      ok: true,
+      authenticated: true,
+      interactive: true,
+      cookieCount: state.cookieCount,
+      ...result,
+      ...health,
+    });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      const payload = {
+        error: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.health ?? {}),
+      };
+      return res.status(error.status).json(payload);
+    }
+
+    const loginFailure = {
+      X_LOGIN_CANCELLED: [410, 'Interactive X sign-in was cancelled.'],
+      X_LOGIN_BROWSER_CLOSED: [400, 'The sign-in browser window closed before login completed.'],
+      X_LOGIN_TIMEOUT: [408, 'Timed out waiting for X sign-in. Retry and finish the login in the browser window.'],
+      X_LOGIN_NO_COOKIES: [502, 'X did not provide a complete session. Sign in again.'],
+    }[error?.code];
+    if (loginFailure) return res.status(loginFailure[0]).json({ error: loginFailure[1], code: error.code });
+
+    // Do not return the underlying browser/storage error: a path or parser
+    // message can contain part of an existing session file.
+    console.error('[interactive-login] Could not complete X sign-in.');
+    return next(new HttpError(503, 'Could not complete the interactive X sign-in. Check the browser and retry.'));
+  } finally {
+    await closePersistentProfile(context);
+    if (pendingProfileDirectory) {
+      await rm(pendingProfileDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+        .catch(() => {});
+    }
+    if (handle && activeRun === handle) activeRun = null;
+    completion?.resolve();
+  }
+});
+
 /* --------------------------------- auth ---------------------------------- */
 
 app.get('/api/auth', async (req, res, next) => {
@@ -1481,7 +1784,7 @@ app.put('/api/auth', async (req, res, next) => {
       payload.savedAt = now;
       payload.loginUrl ??= X_LOGIN_URL;
       payload.origins ??= [];
-      payload.cookies ??= [];
+      payload.cookies = normalizeXSessionCookies(payload.cookies);
 
       for (const [name, value] of Object.entries(values)) {
         const spec = COOKIE_SPEC[name];
@@ -1491,8 +1794,10 @@ app.put('/api/auth', async (req, res, next) => {
           value,
           domain: '.x.com',
           path: '/',
+          expires: -1,
           secure: true,
           httpOnly: spec.httpOnly,
+          sameSite: 'Lax',
         };
 
         if (index >= 0) payload.cookies[index] = { ...payload.cookies[index], ...cookie };
@@ -1507,8 +1812,7 @@ app.put('/api/auth', async (req, res, next) => {
         return savedState;
       }
 
-      await writeAuthFile(payload, AUTH_FILE);
-      return payload;
+      return writeAuthFile(payload, AUTH_FILE);
     });
 
     res.json({ ...describe(saved), activeXAccount: selectedSession?.xUsername ?? null });
@@ -1683,19 +1987,26 @@ app.get('/api/auth/me', async (req, res, next) => {
 /** Called under the write lock, after this user's automation/import has stopped. */
 async function deleteUserProfileData(user, users, token) {
   const postgres = isPostgresEnabled();
-  const localUsers = postgres ? await loadLocalUserDb() : users;
-  // A pre-PostgreSQL copy can have a different ID. Only an exact username/email
-  // identity match authorizes removing that legacy profile and its session files.
-  const ownedLocalUsers = localUsers.filter((candidate) => postgres
-    ? String(candidate.username ?? '').toLowerCase() === user.username.toLowerCase()
-      && Boolean(user.email) && String(candidate.email ?? '').toLowerCase() === user.email.toLowerCase()
-    : candidate.id === user.id);
+  const databaseLocalUsers = postgres ? await loadLocalUserDb() : users;
+  const legacyLocalUsers = await readLegacyUserDb();
+  const localUsers = [...databaseLocalUsers, ...legacyLocalUsers];
+  // A copy from an older storage backend can have a different ID. Only an exact
+  // username/email match authorizes removing those copies and their profile files.
+  const matchesIdentity = (candidate) => String(candidate.username ?? '').toLowerCase() === user.username.toLowerCase()
+    && Boolean(user.email) && String(candidate.email ?? '').toLowerCase() === user.email.toLowerCase();
+  const ownedLocalUsers = [
+    ...databaseLocalUsers.filter((candidate) => postgres ? matchesIdentity(candidate) : candidate.id === user.id),
+    ...legacyLocalUsers.filter(matchesIdentity),
+  ];
   const profileIds = new Set([String(user.id), ...ownedLocalUsers.map((candidate) => String(candidate.id))]);
-  if (postgres && (users.some((candidate) => candidate.id !== user.id && profileIds.has(String(candidate.id)))
-    || localUsers.some((candidate) => !ownedLocalUsers.includes(candidate) && profileIds.has(String(candidate.id))))) {
+  if (users.some((candidate) => candidate.id !== user.id && profileIds.has(String(candidate.id)))
+    || localUsers.some((candidate) => !ownedLocalUsers.includes(candidate) && profileIds.has(String(candidate.id)))) {
     throw new HttpError(503, 'Local storage ownership conflicts with this profile. Check persistent storage before retrying.');
   }
   const sessionDirectories = [...profileIds].map(sessionDirectoryFor);
+  const profileDirectories = [...profileIds]
+    .filter((id) => /^(?:\d+|[a-f0-9-]{16,64})$/i.test(String(id)))
+    .map((id) => join(PROFILE_ROOT, String(id)));
   const sessionKeys = new Set();
   const rememberCredentials = (credentials) => {
     if (credentials.auth_token && credentials.ct0) sessionKeys.add(xSessionCredentialKey(credentials));
@@ -1727,7 +2038,8 @@ async function deleteUserProfileData(user, users, token) {
   for (const directory of sessionDirectories) await rememberDirectoryCredentials(directory);
 
   const staged = await readAuthFile(AUTH_FILE);
-  const remainingLocalUsers = localUsers.filter((candidate) => !ownedLocalUsers.includes(candidate));
+  const remainingLocalUsers = databaseLocalUsers.filter((candidate) => !ownedLocalUsers.includes(candidate));
+  const remainingLegacyUsers = legacyLocalUsers.filter((candidate) => !ownedLocalUsers.includes(candidate));
   const ownsLegacyStaging = staged && staged.appUserId == null
     && sessionKeys.has(xSessionCredentialKey(xSessionCredentials(staged)));
   if (ownsLegacyStaging && activeRun) {
@@ -1738,6 +2050,8 @@ async function deleteUserProfileData(user, users, token) {
     : ownsLegacyStaging);
   const history = await readHistoryFile();
   const remainingHistory = history.filter((entry) => !profileIds.has(String(entry.userId)));
+  const legacyHistory = await readLegacyHistoryFile();
+  const remainingLegacyHistory = legacyHistory.filter((entry) => !profileIds.has(String(entry.userId)));
 
   // Remove disk copies first, including unlinked sessions and trusted-device data.
   // Keep the primary profile until cleanup finishes so a storage failure is retryable.
@@ -1746,14 +2060,28 @@ async function deleteUserProfileData(user, users, token) {
   for (const directory of sessionDirectories) {
     await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   }
+  // Persistent Chromium profiles contain the same account access as the
+  // storage-state files. Remove them for this app user only.
+  for (const directory of profileDirectories) {
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
   if (remainingHistory.length !== history.length) {
-    if (remainingHistory.length) await atomicWritePrivateFile(HISTORY_FILE, `${JSON.stringify(remainingHistory, null, 2)}\n`);
-    else await deleteAuthFile(HISTORY_FILE);
+    await LOCAL_STORE.writeHistory(remainingHistory);
+  }
+  if (remainingLegacyHistory.length !== legacyHistory.length) {
+    if (remainingLegacyHistory.length) {
+      await atomicWritePrivateFile(LOCAL_STORE.legacyHistoryFile, `${JSON.stringify(remainingLegacyHistory, null, 2)}\n`);
+    } else {
+      await deleteAuthFile(LOCAL_STORE.legacyHistoryFile);
+    }
   }
 
   if (postgres) {
-    if (ownedLocalUsers.length) {
-      await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(remainingLocalUsers, null, 2)}\n`);
+    if (remainingLocalUsers.length !== databaseLocalUsers.length) {
+      await LOCAL_STORE.writeUsers(remainingLocalUsers);
+    }
+    if (remainingLegacyUsers.length !== legacyLocalUsers.length) {
+      await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(remainingLegacyUsers, null, 2)}\n`);
     }
     await withTransaction(async (tx) => {
       // Explicitly remove every cookie row, not only handles in linked_handles.
@@ -1763,6 +2091,9 @@ async function deleteUserProfileData(user, users, token) {
       if (rowCount !== 1) throw new HttpError(401, 'The app session is no longer active');
     });
   } else {
+    if (remainingLegacyUsers.length !== legacyLocalUsers.length) {
+      await atomicWritePrivateFile(USER_DB_FILE, `${JSON.stringify(remainingLegacyUsers, null, 2)}\n`);
+    }
     await saveUserDb(remainingLocalUsers);
   }
   for (const key of sessionKeys) xSessionHealthCache.delete(key);
@@ -1916,6 +2247,12 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
       // session row, never a user record that points at a deleted session.
       await saveUserDb(users);
       await deleteXSession(current.id, xUsername);
+      await rm(persistentProfileDirectoryFor(current.id, xUsername), {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 100,
+      });
 
       let activeSessionStaged = false;
       if (wasActive && !activeRun) {
@@ -2048,9 +2385,14 @@ async function readReplyForHistory(reply, dryRun) {
 }
 
 async function readHistoryFile() {
+  return LOCAL_STORE.readHistory();
+}
+
+/** Retained migration files also need owned-history cleanup after profile deletion. */
+async function readLegacyHistoryFile() {
   try {
-    const raw = await readFile(HISTORY_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
+    const raw = await readFile(LOCAL_STORE.legacyHistoryFile, 'utf8');
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
     return Array.isArray(parsed) ? parsed : [];
   } catch (error) {
     if (error.code === 'ENOENT') return [];
@@ -2063,7 +2405,7 @@ async function appendHistory(entry) {
     const history = await readHistoryFile();
     history.push(entry);
     const trimmed = history.length > 50 ? history.slice(history.length - 50) : history;
-    await atomicWritePrivateFile(HISTORY_FILE, `${JSON.stringify(trimmed, null, 2)}\n`);
+    await LOCAL_STORE.writeHistory(trimmed);
   });
 }
 
@@ -2080,7 +2422,7 @@ async function clearHistoryForUser(userId) {
   return withWriteLock(async () => {
     const history = await readHistoryFile();
     const remaining = history.filter((entry) => entry.userId !== userId);
-    await atomicWritePrivateFile(HISTORY_FILE, `${JSON.stringify(remaining, null, 2)}\n`);
+    await LOCAL_STORE.writeHistory(remaining);
   });
 }
 
@@ -2111,7 +2453,7 @@ app.post('/auth/x', async (req, res, next) => {
     await authenticatedUser(req);
     if (activeRun) throw new HttpError(409, 'A run is already in progress');
     return res.status(410).json({
-      error: 'Interactive X sign-in is unavailable with local headless Chromium. Import auth_token and ct0 through /api/auth/import-session.',
+      error: 'Interactive X sign-in now uses POST /api/auth/connect-interactive on a machine with a desktop display. Use /api/auth/import-session only as the advanced fallback.',
     });
   } catch (error) {
     next(error);
@@ -2167,6 +2509,8 @@ app.post('/api/run', async (req, res) => {
   let cooldownTimer = null;
   let finishCooldown = null;
   let aborted = false;
+  let profileDirectory = null;
+  let profileExportFile = null;
   const completion = createCompletionSignal();
 
   const batchHandle = {
@@ -2220,6 +2564,15 @@ app.post('/api/run', async (req, res) => {
       });
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
+
+      profileDirectory = await existingPersistentProfile(appAuth.user.id, selectedSession.xUsername);
+      if (profileDirectory) {
+        await mkdir(sessionDirectoryFor(appAuth.user.id), { recursive: true });
+        profileExportFile = join(
+          sessionDirectoryFor(appAuth.user.id),
+          `_profile-export-${selectedSession.xUsername}.json`,
+        );
+      }
     } catch (error) {
       return res.status(error.status ?? 500).json({ error: error.status ? error.message : 'Could not load the active X session' });
     }
@@ -2270,6 +2623,9 @@ app.post('/api/run', async (req, res) => {
           if (error.code !== 'ENOENT') throw error;
         });
       }
+      if (profileExportFile) {
+        await deleteAuthFile(profileExportFile);
+      }
 
       const child = spawn(process.execPath, args, {
         cwd: ROOT,
@@ -2279,6 +2635,11 @@ app.post('/api/run', async (req, res) => {
           GROQ_API_KEY_SOURCE: groqConfiguration.source,
           X_ACCOUNT_USERNAME: selectedSession.xUsername,
           AUTH_FILE_PATH: AUTH_FILE,
+          // Never inherit a different user's CLI profile or export destination
+          // from the server environment, including storage-state-only runs.
+          X_PROFILE_DIR: profileDirectory ?? '',
+          X_PROFILE_HEADLESS: '1',
+          X_SESSION_EXPORT_PATH: profileExportFile ?? '',
         },
         windowsHide: true,
         detached: process.platform !== 'win32',
@@ -2298,11 +2659,31 @@ app.post('/api/run', async (req, res) => {
       const stderrLines = [];
 
       const recordStderr = (line) => {
+        console.log(line);
+        // Page titles are diagnostic data, not retry/confirmation evidence.
+        if (line.startsWith('[RUNNER] ')) return;
         if (REPLY_VERIFICATION_ERROR.test(line)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
         lastError = line;
         stderrLines.push(line);
         if (stderrLines.length > 50) stderrLines.shift();
-        console.log(line);
+      };
+
+      const recordStdout = (line) => {
+        if (line.startsWith('[RUNNER] ')) {
+          console.log(line);
+          return;
+        }
+        const topicMatch = line.match(/Detected topic: (\w+)/);
+        if (topicMatch) lastTopic = topicMatch[1];
+        if (REPLY_VERIFICATION_ERROR.test(line)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
+        if (line.startsWith('[AUDIT_EVENT] ')) {
+          try {
+            auditResult = JSON.parse(line.slice('[AUDIT_EVENT] '.length));
+            send({ type: 'audit', ...auditResult });
+          } catch {
+            /* malformed child audit events remain ordinary stdout */
+          }
+        }
       };
 
       const forward = (stream, type) => {
@@ -2316,17 +2697,7 @@ app.post('/api/run', async (req, res) => {
             if (type === 'stderr') {
               recordStderr(line);
             } else if (type === 'stdout') {
-              const topicMatch = line.match(/Detected topic: (\w+)/);
-              if (topicMatch) lastTopic = topicMatch[1];
-              if (REPLY_VERIFICATION_ERROR.test(line)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
-              if (line.startsWith('[AUDIT_EVENT] ')) {
-                try {
-                  auditResult = JSON.parse(line.slice('[AUDIT_EVENT] '.length));
-                  send({ type: 'audit', ...auditResult });
-                } catch {
-                  /* malformed child audit events remain ordinary stdout */
-                }
-              }
+              recordStdout(line);
             }
             send({ type, data: line });
           }
@@ -2336,17 +2707,7 @@ app.post('/api/run', async (req, res) => {
             if (type === 'stderr') {
               recordStderr(pending);
             } else if (type === 'stdout') {
-              const topicMatch = pending.match(/Detected topic: (\w+)/);
-              if (topicMatch) lastTopic = topicMatch[1];
-              if (REPLY_VERIFICATION_ERROR.test(pending)) replyVerificationError = REPLY_VERIFICATION_ERROR_MESSAGE;
-              if (pending.startsWith('[AUDIT_EVENT] ')) {
-                try {
-                  auditResult = JSON.parse(pending.slice('[AUDIT_EVENT] '.length));
-                  send({ type: 'audit', ...auditResult });
-                } catch {
-                  /* malformed child audit events remain ordinary stdout */
-                }
-              }
+              recordStdout(pending);
             }
             send({ type, data: pending });
           }
@@ -2369,6 +2730,11 @@ app.post('/api/run', async (req, res) => {
           resolve({ code, signal });
         });
       });
+
+      if (profileExportFile) {
+        await syncProfileSession(appAuth.user.id, selectedSession.xUsername, profileExportFile)
+          .catch(() => console.warn('[RUN] Could not refresh the persistent profile session.'));
+      }
 
       // Older runners may emit a confirmation warning and still exit zero.
       // Treat that as a failed attempt, regardless of the child exit status.
@@ -2565,6 +2931,10 @@ if (
 }
 
 await initializeDatabase();
+if (!isPostgresEnabled()) {
+  await LOCAL_STORE.ensure();
+  console.log(`[storage] Local JSON database: ${LOCAL_STORE.file}`);
+}
 await hydrateActiveSessionFromDatabase();
 await seedDefaultAdmin();
 
@@ -2576,12 +2946,13 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);
   console.log(`  DELETE ${HOST}:${PORT}/api/auth/me       (delete profile, Groq configuration, and X sessions)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/x-accounts (list saved X sessions)`);
-  console.log(`  POST ${HOST}:${PORT}/api/auth/import-session (import and activate X session cookies)`);
+  console.log(`  POST ${HOST}:${PORT}/api/auth/connect-interactive (open a browser and connect X)`);
+  console.log(`  POST ${HOST}:${PORT}/api/auth/import-session (advanced: import X session cookies)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/switch-account (select active X session)`);
   console.log(`  GET/PUT/DELETE ${HOST}:${PORT}/api/config/groq   (persisted per-user key configuration)`);
   console.log(`  GET ${HOST}:${PORT}/api/history`);
   console.log(`  DELETE ${HOST}:${PORT}/api/history`);
-  console.log(`  POST ${HOST}:${PORT}/auth/x      (retired; use /api/auth/import-session)`);
+  console.log(`  POST ${HOST}:${PORT}/auth/x      (retired; use /api/auth/connect-interactive)`);
   console.log(`  POST ${HOST}:${PORT}/api/run   {"url": "…", "dryRun": false, "reply": true, "like": true, "audit": false}  -> NDJSON log stream`);
 });
 
