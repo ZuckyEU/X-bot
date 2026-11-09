@@ -46,11 +46,19 @@ async function startServer(t, extraEnv = {}, options = {}) {
   const dataDir = options.dataDir ?? (await mkdtemp(join(tmpdir(), 'x-engine-test-')));
   const cleanupData = options.cleanupData ?? !options.dataDir;
   const port = await availablePort();
-  const child = spawn(process.execPath, [...(options.nodeArgs ?? []), 'server.js'], {
+  const healthFixture = extraEnv.X_SESSION_CHECK_DISABLED === '0'
+    ? ['--require', join(ROOT, 'test', 'fixtures', 'x-health-browser.cjs')]
+    : [];
+  const child = spawn(process.execPath, [...healthFixture, ...(options.nodeArgs ?? []), 'server.js'], {
     cwd: ROOT,
     env: {
       ...process.env,
       NODE_ENV: 'test',
+      // Never inherit a real deployment database or admin seed into API fixtures.
+      DATABASE_URL: '',
+      DEFAULT_ADMIN_USERNAME: '',
+      DEFAULT_ADMIN_EMAIL: '',
+      DEFAULT_ADMIN_PASSWORD: '',
       DATA_DIR: dataDir,
       HOST: '127.0.0.1',
       PORT: String(port),
@@ -131,6 +139,10 @@ function jsonHeaders(cookie) {
   return { cookie, 'content-type': 'application/json' };
 }
 
+function accountIdentity(accounts) {
+  return accounts.map(({ xUsername, active, status }) => ({ xUsername, active, status }));
+}
+
 function xStorageState(username) {
   return {
     cookies: [
@@ -164,12 +176,17 @@ function importSession(baseUrl, cookie, body) {
  */
 async function startXHealthFixture(t) {
   const requests = [];
+  let override = null;
   const server = createHttpServer((req, res) => {
     const cookie = String(req.headers.cookie ?? '');
     requests.push({
       url: req.url, cookie, csrf: req.headers['x-csrf-token'], authorization: req.headers.authorization,
       authType: req.headers['x-twitter-auth-type'], activeUser: req.headers['x-twitter-active-user'],
     });
+    if (override) {
+      res.writeHead(override.status, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify(override.body));
+    }
     if (req.url?.startsWith('/missing')) {
       res.writeHead(404, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ errors: [{ message: 'Not found' }] }));
@@ -220,6 +237,10 @@ async function startXHealthFixture(t) {
       res.writeHead(503, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ errors: [{ code: 130, message: 'Over capacity' }] }));
     }
+    if (cookie.includes('browservalid') || cookie.includes('browsererror')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ errors: [{ message: 'API unavailable for this fixture' }] }));
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ screen_name: 'fixture' }));
   });
@@ -236,6 +257,7 @@ async function startXHealthFixture(t) {
     url: `${base}/i/api/1.1/account/settings.json`,
     missingUrl: `${base}/missing/1.1/account/settings.json`,
     requests,
+    setResponse: (response) => { override = response; },
   };
 }
 
@@ -428,7 +450,7 @@ test('X account deletion rejects traversal and restages the next active account'
 });
 
 test('manual session import saves standard X cookies, activates the account, and never exposes values', async (t) => {
-  const { baseUrl, dataDir, output } = await startServer(t, { BROWSERBASE_API_KEY: '' });
+  const { baseUrl, dataDir, output } = await startServer(t);
   const { cookie, body } = await register(baseUrl, 'import');
   const values = importPayload('carol');
   const unauthenticated = await fetch(`${baseUrl}/api/auth/import-session`, {
@@ -450,7 +472,7 @@ test('manual session import saves standard X cookies, activates the account, and
   assert.equal(result.cookieCount, 2);
   assert.equal(result.username, 'carol');
   assert.equal(result.activeXAccount, 'carol');
-  assert.deepEqual(result.accounts, [{ xUsername: 'carol', active: true, status: 'ready' }]);
+  assert.deepEqual(accountIdentity(result.accounts), [{ xUsername: 'carol', active: true, status: 'ready' }]);
   assert.equal(response.headers.get('cache-control'), 'no-store');
   const destination = join(dataDir, 'sessions', body.user.id, 'carol.json');
   const saved = JSON.parse(await readFile(destination, 'utf8'));
@@ -885,6 +907,20 @@ test('runner startup reserves its session before staging and blocks conflicting 
     method: 'POST', headers: jsonHeaders(other.cookie), body: '{}',
   });
   assert.equal(signIn.status, 409);
+  const linked = await fetch(`${baseUrl}/api/auth/x-accounts`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: JSON.stringify({ xUsername: 'bob', storageState: xStorageState('bob') }),
+  });
+  assert.equal(linked.status, 409);
+  const rotated = await fetch(`${baseUrl}/api/auth`, {
+    method: 'PUT', headers: jsonHeaders(other.cookie), body: JSON.stringify({ auth_token: 'replacement_auth_token' }),
+  });
+  assert.equal(rotated.status, 409);
+  const switching = await fetch(`${baseUrl}/api/auth/switch-account`, {
+    method: 'POST', headers: jsonHeaders(other.cookie), body: JSON.stringify({ xUsername: 'bob' }),
+  });
+  assert.equal(switching.status, 409);
+  const anonymousLogout = await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST' });
+  assert.equal(anonymousLogout.status, 409);
   assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), unchanged);
   await unlink(writeMarker);
   const running = await starting;
@@ -1002,10 +1038,10 @@ test('PostgreSQL stores users and X sessions and restores them after login', asy
   const loginCookie = sessionCookie(login);
   const loginBody = await login.json();
   assert.equal(loginBody.activeXAccount, 'alpha');
-  assert.deepEqual(loginBody.accounts, [{ xUsername: 'alpha', active: true, status: 'ready' }]);
+  assert.deepEqual(accountIdentity(loginBody.accounts), [{ xUsername: 'alpha', active: true, status: 'ready' }]);
 
   const accounts = await fetch(`${baseUrl}/api/auth/x-accounts`, { headers: { cookie: loginCookie } });
-  assert.deepEqual(await accounts.json(), [{ xUsername: 'alpha', active: true, status: 'ready' }]);
+  assert.deepEqual(accountIdentity(await accounts.json()), [{ xUsername: 'alpha', active: true, status: 'ready' }]);
 
   // Login restores the database session on this device.
   let staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
@@ -1025,7 +1061,7 @@ test('PostgreSQL stores users and X sessions and restores them after login', asy
   assert.equal(meBody.xSession.auth_token, 'alpha_auth_token_value');
   assert.equal(meBody.xSession.ct0, 'alpha_csrf_token_value');
   assert.equal(meBody.xSession.staged, true);
-  assert.deepEqual(meBody.accounts, [{ xUsername: 'alpha', active: true, status: 'ready' }]);
+  assert.deepEqual(accountIdentity(meBody.accounts), [{ xUsername: 'alpha', active: true, status: 'ready' }]);
 
   staged = JSON.parse(await readFile(join(dataDir, 'auth.json'), 'utf8'));
   assert.equal(staged.username, 'alpha');
@@ -1139,7 +1175,7 @@ test('X session health rejects expired cookies, blocks live runs, and re-authent
   assert.equal(preserved.xSessionValid, true);
 });
 
-test('X health check never masks an HTTP 401 with a successful fallback', { timeout: 30_000 }, async (t) => {
+test('X health check confirms HTTP 401 with the browser rather than another HTTP endpoint', { timeout: 30_000 }, async (t) => {
   const x = await startXHealthFixture(t);
   const { baseUrl } = await startServer(t, {
     X_SESSION_CHECK_DISABLED: '0',
@@ -1151,7 +1187,7 @@ test('X health check never masks an HTTP 401 with a successful fallback', { time
     const requestCount = x.requests.length;
     const rejected = await importSession(baseUrl, owner.cookie, importPayload('alpha', prefix));
     assert.equal(rejected.status, 422, await rejected.text());
-    assert.equal(x.requests.length, requestCount + 1, 'Authentication rejection must not trigger a fallback');
+    assert.equal(x.requests.length, requestCount + 1, 'HTTP 401 must go to the browser rather than another HTTP endpoint');
     assert.equal(x.requests.at(-1).url, '/i/api/1.1/account/settings.json');
   }
 });
@@ -1174,6 +1210,28 @@ test('X health check retries non-401 error responses on the authenticated fallba
     assert.equal(x.requests.length, requestCount + 2, 'A non-401 error must allow endpoint fallback');
     assert.equal(x.requests.at(-1).url, '/i/api/1.1/account/settings.json?fallback=1');
   }
+});
+
+test('settings JSON with an unexpected errors field must still fall back instead of confirming cookies', async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl, dataDir } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+  });
+  const owner = await register(baseUrl, 'health_error_shape');
+  const values = importPayload('alpha', 'good');
+  for (const errors of [{ message: 'Unexpected authentication error' }, 'Unexpected authentication error']) {
+    x.setResponse({ status: 200, body: { screen_name: 'alpha', errors } });
+    const response = await importSession(baseUrl, owner.cookie, values);
+    const body = await response.json();
+    assert.equal(response.status, 503, JSON.stringify(body));
+    assert.equal(body.code, 'X_SESSION_CHECK_UNAVAILABLE');
+    assert.equal(body.xSessionValid, null);
+    await assert.rejects(stat(join(dataDir, 'auth.json')), { code: 'ENOENT' });
+  }
+  x.setResponse({ status: 200, body: { screen_name: 'alpha', errors: [] } });
+  const confirmed = await importSession(baseUrl, owner.cookie, values);
+  assert.equal(confirmed.status, 201);
+  assert.equal((await confirmed.json()).xSessionValid, true);
 });
 
 test('X health check falls back after 404 and reports unknown failures without staging or spawn', { timeout: 30_000 }, async (t) => {
@@ -1273,6 +1331,435 @@ test('X health check falls back after 404 and reports unknown failures without s
     const restored = await importSession(baseUrl, owner.cookie, good);
     assert.equal(restored.status, 201, await restored.text());
   }
+});
+
+test('X browser fallback validates cookies after HTTP failures and permits a verified run', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-browser-fallback-'));
+  const log = join(dataDir, 'health-browser.log');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+    X_SESSION_CHECK_TIMEOUT_MS: '500', X_SESSION_CHECK_CACHE_MS: '0',
+    SESSION_TEST_HEALTH_BROWSER_LOG: log, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'browser_fallback');
+  const failures = ['notfound', 'gone', 'unauthorized', 'autherror', 'forbidden', 'ratelimited', 'html', 'malformed', 'flaky', 'timeout', 'network'];
+  for (const prefix of failures) {
+    const values = importPayload('alpha', `${prefix}_browservalid`);
+    const imported = await importSession(baseUrl, owner.cookie, values);
+    const text = await imported.text();
+    assert.equal(imported.status, 201, `${prefix}: ${text}`);
+    assert.equal(JSON.parse(text).xSessionValid, true, prefix);
+    assert.equal(JSON.parse(text).xSessionStatus, 'valid', prefix);
+    assert.equal(text.includes(values.auth_token), false, prefix);
+  }
+  let events = (await readFile(log, 'utf8')).trim().split(/\r?\n/);
+  assert.equal(events.filter((event) => event === 'launch').length, failures.length);
+  assert.equal(events.filter((event) => event === 'close').length, failures.length);
+
+  const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(me.xSessionValid, true);
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
+  });
+  assert.equal(login.status, 200);
+  assert.equal((await login.json()).xSessionValid, true);
+  owner.cookie = sessionCookie(login);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-browser-fallback' }),
+  })).status, 200);
+  const running = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  assert.equal(running.status, 200);
+  assert.match(await running.text(), /"type":"batch-complete"/);
+  const staged = JSON.parse(await readFile(`${runMarker}.entered`, 'utf8'));
+  assert.equal(staged.username, 'alpha');
+  assert.equal(staged.state.cookies.find((cookie) => cookie.name === 'auth_token').value, 'network_browservalid_auth_token_value');
+  events = (await readFile(log, 'utf8')).trim().split(/\r?\n/);
+  assert.equal(events.filter((event) => event === 'launch').length, failures.length + 3);
+  assert.equal(events.filter((event) => event === 'close').length, failures.length + 3);
+});
+
+test('X browser errors after HTTP 401 or 404 return unavailable without changing saved sessions', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-browser-errors-'));
+  const log = join(dataDir, 'health-browser.log');
+  const stageMarker = join(dataDir, 'stage-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl, output } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+    SESSION_TEST_HEALTH_BROWSER_LOG: log, SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'browser_errors');
+  const good = importPayload('alpha', 'good');
+  assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201);
+  await assert.rejects(stat(log), { code: 'ENOENT' }, 'Authenticated settings JSON should not launch Chromium');
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-browser-errors' }),
+  })).status, 200);
+  for (const prefix of ['browsererror', 'unauthorized_browsererror']) {
+    const failed = importPayload('alpha', prefix);
+    const sessionPath = join(dataDir, 'sessions', owner.body.user.id, 'alpha.json');
+    const savedBefore = await readFile(sessionPath, 'utf8');
+    const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    const rejected = await importSession(baseUrl, owner.cookie, failed);
+    const text = await rejected.text();
+    assert.equal(rejected.status, 503, text);
+    assert.equal(JSON.parse(text).code, 'X_SESSION_CHECK_UNAVAILABLE');
+    assert.equal(JSON.parse(text).xSessionValid, null);
+    assert.equal(JSON.parse(text).xSessionStatus, 'unknown');
+    assert.equal(text.includes(failed.auth_token), false);
+    assert.equal(await readFile(sessionPath, 'utf8'), savedBefore);
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+
+    assert.equal((await fetch(`${baseUrl}/api/auth`, {
+      method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ auth_token: failed.auth_token, ct0: failed.ct0 }),
+    })).status, 200);
+    const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+    assert.equal(me.xSessionStatus, 'unknown');
+    assert.equal(me.xSessionValid, null);
+    const beforeRun = await readFile(join(dataDir, 'auth.json'), 'utf8');
+    await writeFile(stageMarker, 'fail');
+    const blocked = await fetch(`${baseUrl}/api/run`, {
+      method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1' }),
+    });
+    const blockedBody = await blocked.json();
+    assert.equal(blocked.status, 503, JSON.stringify(blockedBody));
+    assert.equal(blockedBody.code, 'X_SESSION_CHECK_UNAVAILABLE');
+    assert.equal(blockedBody.xSessionValid, null);
+    assert.equal(await readFile(stageMarker, 'utf8'), 'fail');
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), beforeRun);
+    await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+    assert.equal(output().includes(failed.auth_token), false, 'Browser error logs must not expose cookies');
+    await unlink(stageMarker);
+    assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201);
+  }
+  const events = (await readFile(log, 'utf8')).trim().split(/\r?\n/);
+  assert.equal(events.filter((event) => event === 'launch').length, 6);
+  assert.equal(events.filter((event) => event === 'close').length, 6);
+});
+
+test('PostgreSQL keeps the saved cookie row intact when browser verification is unavailable', async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl, dataDir } = await startServer(t, {
+    DATABASE_URL: 'pg-mem://',
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+  });
+  const owner = await register(baseUrl, 'pg_browser_error');
+  const good = importPayload('alpha', 'good');
+  assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201);
+  const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+  for (const handle of ['alpha', 'beta']) {
+    const unavailable = await importSession(baseUrl, owner.cookie, importPayload(handle, 'unauthorized_browsererror'));
+    const body = await unavailable.json();
+    assert.equal(unavailable.status, 503, JSON.stringify(body));
+    assert.equal(body.code, 'X_SESSION_CHECK_UNAVAILABLE');
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+  }
+  const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(me.activeXAccount, 'alpha');
+  assert.deepEqual(me.xAccounts, ['alpha']);
+  assert.equal(me.xSession.auth_token, good.auth_token);
+  assert.equal(me.xSession.ct0, good.ct0);
+  assert.equal(me.xSessionValid, true);
+});
+
+test('explicit imports retry verification instead of reusing a cached availability error', async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '60000',
+  });
+  const owner = await register(baseUrl, 'health_import_retry');
+  const values = importPayload('alpha', 'browsererror');
+  const failed = await importSession(baseUrl, owner.cookie, values);
+  assert.equal(failed.status, 503);
+  assert.equal((await failed.json()).code, 'X_SESSION_CHECK_UNAVAILABLE');
+  const count = x.requests.length;
+  x.setResponse({ status: 200, body: { screen_name: 'alpha' } });
+  const retried = await importSession(baseUrl, owner.cookie, values);
+  const body = await retried.json();
+  assert.equal(retried.status, 201, JSON.stringify(body));
+  assert.equal(body.xSessionValid, true);
+  assert.equal(x.requests.length, count + 1);
+});
+
+test('X account summaries retain the verified expired state of inactive accounts and clear it after re-authentication', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+  });
+  const owner = await register(baseUrl, 'health_accounts');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'good_alpha'))).status, 201);
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('beta', 'good_beta'))).status, 201);
+  assert.equal((await fetch(`${baseUrl}/api/auth`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ auth_token: 'expired_beta_auth_token', ct0: 'expired_beta_ct0' }),
+  })).status, 200);
+  const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(me.xSessionValid, false);
+  assert.equal(me.accounts.find((account) => account.xUsername === 'beta').status, 'expired');
+
+  const switched = await fetch(`${baseUrl}/api/auth/switch-account`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ xUsername: 'alpha' }),
+  });
+  assert.equal(switched.status, 200);
+  const switchedBody = await switched.json();
+  assert.equal(switchedBody.xSessionValid, true);
+  const expired = switchedBody.accounts.find((account) => account.xUsername === 'beta');
+  assert.equal(expired.active, false);
+  assert.equal(expired.status, 'expired');
+  assert.equal(expired.xSessionValid, false);
+  assert.equal(expired.xSessionStatus, 'invalid');
+  assert.ok(expired.xSessionCheckedAt);
+  const accounts = await (await fetch(`${baseUrl}/api/auth/x-accounts`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(accounts.find((account) => account.xUsername === 'beta').xSessionValid, false);
+
+  const restored = await importSession(baseUrl, owner.cookie, importPayload('beta', 'fresh_beta'));
+  assert.equal(restored.status, 201);
+  const restoredBody = await restored.json();
+  const active = restoredBody.accounts.find((account) => account.xUsername === 'beta');
+  assert.equal(restoredBody.activeXAccount, 'beta');
+  assert.equal(active.active, true);
+  assert.equal(active.status, 'ready');
+  assert.equal(active.xSessionValid, true);
+  assert.equal(active.xSessionStatus, 'valid');
+});
+
+test('run staging refuses cookies changed by a previously queued edit after verification', { timeout: 20_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-staging-recheck-'));
+  const writeMarker = join(dataDir, 'session-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+    SESSION_TEST_SESSION_WRITE_GATE: writeMarker, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'staging_recheck');
+  const good = importPayload('alpha', 'good');
+  assert.equal((await importSession(baseUrl, owner.cookie, good)).status, 201);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-staging-recheck' }),
+  })).status, 200);
+  t.after(() => unlink(writeMarker).catch(() => {}));
+  await writeFile(writeMarker, 'pause');
+  const rotating = fetch(`${baseUrl}/api/auth`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ auth_token: 'expired_auth_token_value', ct0: 'expired_ct0_value' }),
+  });
+  await until(() => stat(`${writeMarker}.entered`).then(() => true, () => false));
+  const count = x.requests.length;
+  const starting = fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  await until(() => x.requests.length === count + 1, 'The run did not verify the original cookies');
+  await unlink(writeMarker);
+  assert.equal((await rotating).status, 200);
+  const blocked = await starting;
+  const text = await blocked.text();
+  assert.equal(blocked.status, 409, text);
+  const body = JSON.parse(text);
+  assert.match(body.error, /session changed during verification/i);
+  await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+  const retried = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1' }),
+  });
+  assert.equal(retried.status, 409);
+  assert.equal((await retried.json()).code, 'X_SESSION_EXPIRED');
+});
+
+test('queued cookie edits and logout recheck the app token after a concurrent login rotates it', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-cookie-edit-token-'));
+  const marker = join(dataDir, 'user-gate');
+  const { baseUrl } = await startServer(t, { SESSION_TEST_USER_WRITE_GATE: marker }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'cookie_edit_token');
+  const values = importPayload('alpha');
+  assert.equal((await importSession(baseUrl, owner.cookie, values)).status, 201);
+  const sessionPath = join(dataDir, 'sessions', owner.body.user.id, 'alpha.json');
+  const savedBefore = await readFile(sessionPath, 'utf8');
+  t.after(() => unlink(marker).catch(() => {}));
+  await writeFile(marker, 'pause');
+  const loggingIn = fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: owner.body.user.username, password: owner.password }),
+  });
+  await until(() => stat(`${marker}.entered`).then(() => true, () => false));
+  let editReturned = false;
+  const staleEdit = fetch(`${baseUrl}/api/auth`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ auth_token: 'replacement_auth_token_value' }),
+  }).then((response) => { editReturned = true; return response; });
+  const staleLogout = fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie: owner.cookie } });
+  await delay(100);
+  assert.equal(editReturned, false, 'The edit must wait for the login write to settle');
+  await unlink(marker);
+  const login = await loggingIn;
+  assert.equal(login.status, 200);
+  const rejected = await staleEdit;
+  assert.equal(rejected.status, 401);
+  assert.equal((await staleLogout).status, 401);
+  assert.equal(await readFile(sessionPath, 'utf8'), savedBefore);
+  const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: sessionCookie(login) } })).json();
+  assert.equal(me.xSession.auth_token, values.auth_token);
+});
+
+test('X run verification bypasses cached health and confirms expiration before staging or automation', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  x.setResponse({ status: 200, body: { screen_name: 'alpha' } });
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-health-cache-'));
+  const stageMarker = join(dataDir, 'stage-gate');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '60000',
+    SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'health_cache');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'expired'))).status, 201);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-health-cache' }),
+  })).status, 200);
+  const count = x.requests.length;
+  x.setResponse({ status: 401, body: { errors: [{ code: 32 }] } });
+  const me = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(me.xSessionValid, true, 'Ordinary bootstrap may reuse the short-lived cache');
+  assert.equal(x.requests.length, count);
+  const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+  await writeFile(stageMarker, 'fail');
+  const blocked = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1' }),
+  });
+  const body = await blocked.json();
+  assert.equal(blocked.status, 409, JSON.stringify(body));
+  assert.equal(body.code, 'X_SESSION_EXPIRED');
+  assert.equal(body.xSessionValid, false);
+  assert.equal(x.requests.length, count + 1);
+  assert.equal(await readFile(stageMarker, 'utf8'), 'fail');
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+  await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
+
+  await unlink(stageMarker);
+  x.setResponse({ status: 200, body: { screen_name: 'alpha' } });
+  const retry = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  assert.equal(retry.status, 200);
+  assert.match(await retry.text(), /"type":"batch-complete"/);
+  assert.equal(x.requests.length, count + 2, 'A forced retry must not reuse a cached rejection either');
+});
+
+test('X forced run checks share an in-flight browser probe for the same cookies', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-health-singleflight-'));
+  const gate = join(dataDir, 'health-gate');
+  const log = join(dataDir, 'health-browser.log');
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+    SESSION_TEST_HEALTH_BROWSER_GATE: gate, SESSION_TEST_HEALTH_BROWSER_LOG: log, SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'health_singleflight');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'browservalid'))).status, 201);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-health-singleflight' }),
+  })).status, 200);
+  t.after(() => unlink(gate).catch(() => {}));
+  await writeFile(gate, 'pause');
+  const probes = Array.from({ length: 3 }, () => fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } }));
+  await until(() => stat(`${gate}.entered`).then(() => true, () => false));
+  let runReturned = false;
+  const running = fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  }).then((response) => { runReturned = true; return response; });
+  await delay(100);
+  assert.equal(runReturned, false, 'A forced check must await the shared verification rather than return browser-busy');
+  await unlink(gate);
+  for (const response of await Promise.all(probes)) assert.equal((await response.json()).xSessionValid, true);
+  const response = await running;
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /"type":"batch-complete"/);
+  const events = (await readFile(log, 'utf8')).trim().split(/\r?\n/);
+  assert.equal(events.filter((event) => event === 'launch').length, 2, 'Only import and one shared refresh should launch');
+  assert.equal(events.filter((event) => event === 'close').length, 2);
+  assert.equal(x.requests.length, 2);
+});
+
+test('bootstrap storage failures remain unknown and cannot falsely expire saved cookies', async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-hydration-failure-'));
+  const marker = join(dataDir, 'stage-gate');
+  const { baseUrl } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+    SESSION_TEST_WRITE_GATE: marker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'hydration_failure');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+  const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+  await writeFile(marker, 'fail');
+  const response = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.authenticated, true);
+  assert.equal(body.activeXAccount, 'alpha');
+  assert.equal(body.xSessionValid, null);
+  assert.equal(body.xSessionStatus, 'unknown');
+  assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+  const recovered = await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: owner.cookie } })).json();
+  assert.equal(recovered.xSessionValid, true);
+});
+
+test('unlinking another user’s active accounts cannot replace or delete the running job’s staged cookies', { timeout: 20_000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-unlink-isolation-'));
+  const gate = join(dataDir, 'run-gate');
+  const { baseUrl } = await startServer(t, { SESSION_TEST_RUN_GATE: gate }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'unlink_owner');
+  const other = await register(baseUrl, 'unlink_other');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha'))).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('beta'))).status, 201);
+  assert.equal((await importSession(baseUrl, other.cookie, importPayload('gamma'))).status, 201);
+  assert.equal((await fetch(`${baseUrl}/api/config/groq`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ apiKey: 'synthetic-groq-key-unlink-isolation' }),
+  })).status, 200);
+  await writeFile(gate, 'pause');
+  const running = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie), body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  assert.equal(running.status, 200);
+  await until(() => stat(`${gate}.entered`).then(() => true, () => false));
+  const stagedBefore = await readFile(join(dataDir, 'auth.json'), 'utf8');
+  for (const handle of ['gamma', 'beta']) {
+    const unlinked = await fetch(`${baseUrl}/api/auth/x-accounts/${handle}`, { method: 'DELETE', headers: { cookie: other.cookie } });
+    const body = await unlinked.json();
+    assert.equal(unlinked.status, 200, JSON.stringify(body));
+    assert.equal(body.wasActive, true);
+    assert.equal(body.activeSessionStaged, false);
+    assert.equal(await readFile(join(dataDir, 'auth.json'), 'utf8'), stagedBefore);
+  }
+  await unlink(gate);
+  assert.match(await running.text(), /"type":"batch-complete"/);
 });
 
 test('production allows Render origins and rejects unknown origins', async (t) => {
@@ -1683,18 +2170,21 @@ test('native service uses the platform port and delegates browser execution to m
 });
 
 test('production preflight and Render image require local Playwright instead of a browser-service key', async () => {
-  const [checkProd, envExample, readme, dockerfile, packageJson, browserSource] = await Promise.all([
+  const [checkProd, envExample, readme, dockerfile, packageJson, browserSource, healthSource] = await Promise.all([
     readFile(join(ROOT, 'scripts', 'check-prod.js'), 'utf8'),
     readFile(join(ROOT, '.env.example'), 'utf8'),
     readFile(join(ROOT, 'README.md'), 'utf8'),
     readFile(join(ROOT, 'Dockerfile'), 'utf8'),
     readFile(join(ROOT, 'package.json'), 'utf8'),
     readFile(join(ROOT, 'lib', 'browser.js'), 'utf8'),
+    readFile(join(ROOT, 'lib', 'x-session-health.js'), 'utf8'),
   ]);
 
   assert.doesNotMatch(checkProd, /BROWSERBASE_|BROWSERLESS_/);
   assert.doesNotMatch(envExample, /BROWSERBASE_|BROWSERLESS_/);
   assert.doesNotMatch(browserSource, /Browserbase|browserbase|connectOverCDP/);
+  assert.doesNotMatch(healthSource, /Browserbase|browserbase|connectOverCDP|writeFile|storageState\(/);
+  assert.match(healthSource, /connectBrowser\(/);
   assert.match(checkProd, /SESSION_SECRET/);
   assert.match(checkProd, /DATABASE_URL/);
   assert.match(envExample, /DATABASE_URL/);
@@ -1752,12 +2242,19 @@ test('root serves the dashboard and retired desktop and harvest routes are unava
 
 test('retired deployment and desktop worker files have been removed', async () => {
   for (const path of [
-    'fly.toml', '.dockerignore', 'docker/openbox.xml',
+    'fly.toml', 'docker/openbox.xml',
     'scripts/desktop-browser-server.cjs', 'scripts/start-desktop.sh',
     'lib/desktop-browser.js', 'lib/harvest-client.js', 'lib/interactive-login.js',
     'lib/interactive-login-client.js', 'lib/remote-desktop-http.js',
     'public/remote-login/viewer.html', 'public/remote-login/viewer.js', 'public/remote-login/viewer.css',
   ]) {
     await assert.rejects(stat(join(ROOT, path)), { code: 'ENOENT' });
+  }
+});
+
+test('Docker excludes ignored credentials, local browser data, and the obsolete debug script', async () => {
+  const ignores = (await readFile(join(ROOT, '.dockerignore'), 'utf8')).split(/\r?\n/);
+  for (const path of ['.env', '.env.*', 'auth.json', 'tokens.json', 'user-db.json', 'history.json', 'sessions', 'user-data', 'node_modules', 'test-browserbase.cjs']) {
+    assert.ok(ignores.includes(path), `${path} must not enter the Docker build context`);
   }
 });

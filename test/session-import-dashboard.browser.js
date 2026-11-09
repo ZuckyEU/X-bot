@@ -129,7 +129,11 @@ async function fixture(t, options = {}) {
       const { xUsername } = JSON.parse(raw);
       state.switches.push(xUsername);
       activate(xUsername);
-      return json({ ok: true, activeXAccount: xUsername, accounts: state.accounts });
+      if (options.switchSessionStatus) state.xSessionStatus = options.switchSessionStatus;
+      return json({
+        ok: true, activeXAccount: xUsername, accounts: state.accounts,
+        ...(options.switchSessionStatus ? health() : {}),
+      });
     }
     if (url.pathname.startsWith('/api/auth/x-accounts/') && req.method === 'DELETE') {
       const handle = decodeURIComponent(url.pathname.split('/').pop());
@@ -585,6 +589,36 @@ test('a rejected re-authentication keeps the expired badge and the dialog open',
   assert.deepEqual(errors, []);
 });
 
+test('switching away from an expired account preserves its Update Session action without expiring the selected account', { timeout: 20_000 }, async (t) => {
+  const { page, state, errors } = await fixture(t, {
+    accounts: [
+      { xUsername: 'alice', active: true, status: 'expired', xSessionValid: false, xSessionStatus: 'invalid' },
+      { xUsername: 'bob', active: false, status: 'ready', xSessionValid: true, xSessionStatus: 'valid' },
+    ],
+    xSessionStatus: 'invalid', switchSessionStatus: 'valid',
+  });
+  assert.equal(await page.locator('#run').isDisabled(), true);
+  await page.locator('#account-chip').click();
+  await page.getByRole('menuitem', { name: 'Switch to @bob', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('who').textContent === '@bob');
+  assert.equal(await page.locator('#x-session-warning').isVisible(), false);
+  assert.equal(await page.locator('#run').isEnabled(), true);
+  assert.equal(await page.locator('#active-account-label').textContent(), 'X connection verified');
+  await page.locator('#account-chip').click();
+  const expired = page.locator('.linked-account-item[data-x-username="alice"]');
+  const active = page.locator('.linked-account-item[data-x-username="bob"]');
+  assert.equal(await expired.locator('.session-expired').textContent(), 'Session Expired');
+  assert.equal(await expired.locator('.update-x-session').count(), 1);
+  assert.equal(await active.locator('.session-expired').count(), 0);
+  assert.equal(await active.locator('.account-check').textContent(), '✓');
+  await expired.locator('.update-x-session').click();
+  await page.locator('#session-import-modal').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#session-handle').inputValue(), 'alice');
+  assert.equal(await page.locator('#who').textContent(), '@bob');
+  assert.deepEqual(state.switches, ['bob']);
+  assert.deepEqual(errors, []);
+});
+
 test('an unknown X health result does not mark the session expired', { timeout: 20_000 }, async (t) => {
   const { page, errors } = await fixture(t, {
     accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
@@ -629,7 +663,7 @@ test('an unavailable X check keeps the importer open without marking the saved a
 test('an unavailable X check is retryable and does not trigger session-expired UI', { timeout: 20_000 }, async (t) => {
   const { page, state, errors } = await fixture(t, {
     accounts: [{ xUsername: 'alice', active: true, status: 'ready' }],
-    xSessionStatus: 'unknown',
+    xSessionStatus: 'valid',
     groqConfigured: true,
     runStatus: 503,
     runBody: {

@@ -18,6 +18,7 @@ import {
   withTransaction,
 } from './lib/database.js';
 import { CHROME_USER_AGENT, createTrustedLoginProfile, X_LOGIN_URL } from './lib/browser.js';
+import { verifyXSessionInBrowser } from './lib/x-session-health.js';
 
 /**
  * Local service for the X reply automation.
@@ -98,8 +99,8 @@ function envInteger(name, fallback, min, max) {
 
 /**
  * The dashboard health check uses X's authenticated settings endpoint. It is a
- * cheap HTTP request (no browser), separating authentication rejection from
- * inconclusive probes. Try the API host first, then the web-app host on failure.
+ * cheap HTTP fast path, followed by an isolated local Chromium home-page check
+ * when the API cannot confirm the cookies (including datacenter-IP rejection).
  * Configured URLs run first; tests only call explicitly configured fixtures.
  */
 const X_SESSION_CHECK_DEFAULT_URLS = [
@@ -116,6 +117,7 @@ const X_SESSION_CHECK_URLS = X_SESSION_CHECK_CONFIGURED_URLS.length
     : [...new Set([...X_SESSION_CHECK_CONFIGURED_URLS, ...X_SESSION_CHECK_DEFAULT_URLS])]
   : X_SESSION_CHECK_DEFAULT_URLS;
 const X_SESSION_CHECK_TIMEOUT_MS = envInteger('X_SESSION_CHECK_TIMEOUT_MS', 3_500, 500, 15_000);
+const X_SESSION_CHECK_BROWSER_TIMEOUT_MS = envInteger('X_SESSION_CHECK_BROWSER_TIMEOUT_MS', 10_000, 500, 30_000);
 const X_SESSION_CHECK_CACHE_MS = envInteger('X_SESSION_CHECK_CACHE_MS', 60_000, 0, 15 * 60_000);
 const X_SESSION_CHECK_DISABLED = process.env.X_SESSION_CHECK_DISABLED === '1'
   || (IS_TEST && X_SESSION_CHECK_CONFIGURED_URLS.length === 0);
@@ -831,25 +833,8 @@ async function hydrateActiveSessionFromDatabase() {
 
 function describe(payload) {
   const cookies = payload?.cookies ?? [];
-  const view = {};
-
-  for (const [name, spec] of Object.entries(COOKIE_SPEC)) {
-    const cookie = cookies.find((item) => item.name === name && item.domain === '.x.com');
-    view[name] = cookie
-      ? {
-          present: true,
-          preview: mask(String(cookie.value ?? '')),
-          domain: cookie.domain,
-          path: cookie.path,
-          secure: cookie.secure,
-          httpOnly: cookie.httpOnly,
-          ...spec,
-        }
-      : { present: false, ...spec };
-  }
-
   return {
-    authenticated: Boolean(payload) && Boolean(view.auth_token?.present),
+    authenticated: cookies.some((cookie) => cookie?.name === 'auth_token' && cookie.domain === '.x.com'),
     username: payload?.username ?? null,
   };
 }
@@ -1015,15 +1000,24 @@ async function activeSessionFor(user, { required = false } = {}) {
 async function accountSummaries(user) {
   normalizeUserAccounts(user);
   return Promise.all(
-    user.xAccounts.map(async (xUsername) => ({
-      xUsername,
-      active: xUsername === user.preferences.defaultXAccount,
-      status: (await xSessionExists(user.id, xUsername)) ? 'ready' : 'missing',
-    })),
+    user.xAccounts.map(async (xUsername) => {
+      const account = { xUsername, active: xUsername === user.preferences.defaultXAccount };
+      try {
+        const state = await readXSession(user.id, xUsername);
+        const credentials = xSessionCredentials(state);
+        const health = !credentials.auth_token || !credentials.ct0
+          ? xSessionHealth('invalid', null)
+          : xSessionHealthCache.get(xSessionCredentialKey(credentials))?.result ?? xSessionHealth('unknown', null);
+        return { ...account, status: !state ? 'missing' : health.xSessionValid === false ? 'expired' : 'ready', ...health };
+      } catch {
+        // A storage outage for one linked account is not an expired cookie.
+        return { ...account, status: 'unavailable', ...xSessionHealth('unknown', null) };
+      }
+    }),
   );
 }
 
-async function stageActiveSession(user, { sessionToken = null, onlyWhenIdle = false } = {}) {
+async function stageActiveSession(user, { sessionToken = null, onlyWhenIdle = false, expectedSession = null } = {}) {
   return withWriteLock(async () => {
     // A bootstrap request must never replace the cookie file while an
     // automation or sign-in run is using it.
@@ -1034,6 +1028,12 @@ async function stageActiveSession(user, { sessionToken = null, onlyWhenIdle = fa
       if (!user) throw new HttpError(401, 'The app session is no longer active');
     }
     const session = await activeSessionFor(user, { required: true });
+    // A mutation that already held the write lock may finish during verification.
+    // Never stage a different account or cookie pair than the one just checked.
+    if (expectedSession && (session.xUsername !== expectedSession.xUsername
+      || xSessionCredentialKey(xSessionCredentials(session.state)) !== xSessionCredentialKey(xSessionCredentials(expectedSession.state)))) {
+      throw new HttpError(409, 'X session changed during verification. Retry before publishing.');
+    }
     await writeAuthFile(session.state, AUTH_FILE);
     return session;
   });
@@ -1096,7 +1096,8 @@ async function probeXSession(url, credentials, timeoutMs) {
       },
     });
 
-    // A 401 is definitive even when the response body is empty, HTML, or slow.
+    // A 401 ends HTTP probing even when its body is empty, HTML, or slow;
+    // verifyXSession still confirms rejection with the browser login redirect.
     if (response.status === 401) {
       await response.body?.cancel().catch(() => {});
       return { status: 'invalid', reason: 'unauthorized', httpStatus: 401, url };
@@ -1111,10 +1112,9 @@ async function probeXSession(url, credentials, timeoutMs) {
     }
     const errorCode = xSessionErrorCode(payload);
 
-    // Only HTTP 401 explicitly rejects the session. Error payloads on other
-    // statuses (including a missing route) remain inconclusive and allow fallback.
+    // Other error payloads, including missing routes, remain inconclusive.
     const hasError = errorCode !== null || Boolean(payload?.error)
-      || (Array.isArray(payload?.errors) && payload.errors.length > 0);
+      || (Array.isArray(payload?.errors) ? payload.errors.length > 0 : Boolean(payload?.errors));
     if (response.status === 200 && !hasError && typeof payload?.screen_name === 'string' && payload.screen_name.trim()) {
       return { status: 'valid', httpStatus: response.status, url };
     }
@@ -1136,52 +1136,55 @@ async function probeXSession(url, credentials, timeoutMs) {
   }
 }
 
-/** Confirm settings JSON, stop on HTTP 401, or report an inconclusive check as unknown. */
+/** Confirm settings JSON or fall back to the authenticated home page in local Chromium. */
 async function verifyXSession(
   storageState,
-  { timeoutMs = X_SESSION_CHECK_TIMEOUT_MS, urls = X_SESSION_CHECK_URLS } = {},
+  {
+    timeoutMs = X_SESSION_CHECK_TIMEOUT_MS,
+    browserTimeoutMs = X_SESSION_CHECK_BROWSER_TIMEOUT_MS,
+    urls = X_SESSION_CHECK_URLS,
+  } = {},
 ) {
   const credentials = xSessionCredentials(storageState);
   if (!credentials.auth_token || !credentials.ct0) return { status: 'invalid', reason: 'missing-cookies' };
   if (X_SESSION_CHECK_DISABLED) return { status: 'unknown', reason: 'disabled' };
 
-  const outcomes = [];
   for (const url of urls) {
     const outcome = await probeXSession(url, credentials, timeoutMs);
-    // Never hide an explicit authentication rejection behind a fallback.
-    if (outcome.status === 'valid' || outcome.status === 'invalid') return outcome;
-    outcomes.push(outcome);
+    if (outcome.status === 'valid') return outcome;
+    // A 401 may reject the public bearer or cloud IP, not the browser cookies.
+    // Do not try to mask it with another HTTP endpoint; inspect X's login/home UI.
+    if (outcome.status === 'invalid') break;
   }
 
-  // A missing endpoint, outage, or unexpected response does not establish that
-  // cookies expired. Callers separately block unverified imports and runs.
-  const failure = outcomes.find((outcome) => ![404, 410].includes(outcome.httpStatus)) ?? outcomes[0];
-  return failure ?? { status: 'unknown', reason: 'no-endpoints' };
+  return verifyXSessionInBrowser(credentials, { timeoutMs: browserTimeoutMs });
 }
 
 const xSessionHealthCache = new Map();
 const xSessionHealthInflight = new Map();
+
+function xSessionCredentialKey(credentials) {
+  return crypto.createHash('sha256').update(`${credentials.auth_token}\0${credentials.ct0}`).digest('hex');
+}
 
 /** Cached/single-flight wrapper so dashboard refreshes do not hammer X. */
 async function checkXSessionHealth(storageState, { handle = null, force = false } = {}) {
   const credentials = xSessionCredentials(storageState);
   if (!credentials.auth_token || !credentials.ct0) return xSessionHealth('invalid');
 
-  const key = crypto
-    .createHash('sha256')
-    .update(`${credentials.auth_token}\0${credentials.ct0}`)
-    .digest('hex');
+  const key = xSessionCredentialKey(credentials);
+  if (xSessionHealthInflight.has(key)) return xSessionHealthInflight.get(key);
   const cached = xSessionHealthCache.get(key);
   if (!force && cached && cached.expiresAt > Date.now()) return cached.result;
-  if (!force && xSessionHealthInflight.has(key)) return xSessionHealthInflight.get(key);
 
   const pending = (async () => {
     const outcome = await verifyXSession(storageState);
     const result = xSessionHealth(outcome.status);
-    if (X_SESSION_CHECK_CACHE_MS > 0) {
-      if (xSessionHealthCache.size > 512) xSessionHealthCache.clear();
-      xSessionHealthCache.set(key, { expiresAt: Date.now() + X_SESSION_CHECK_CACHE_MS, result });
-    }
+    // Keep the last checked state for account-menu metadata even when response
+    // caching is disabled. Only expiresAt controls whether a new probe is skipped.
+    if (xSessionHealthCache.size > 512) xSessionHealthCache.clear();
+    const cacheMs = outcome.reason === 'browser-busy' ? 0 : X_SESSION_CHECK_CACHE_MS;
+    xSessionHealthCache.set(key, { expiresAt: Date.now() + cacheMs, result });
     if (outcome.status !== 'valid') {
       const account = handle ? `@${handle}` : 'the active X account';
       const reason = outcome.reason ?? (outcome.httpStatus ? `HTTP ${outcome.httpStatus}` : 'no response');
@@ -1196,6 +1199,7 @@ async function checkXSessionHealth(storageState, { handle = null, force = false 
 
 /** Health for the hydrated active session, including "no account" and missing-cookie states. */
 async function activeXSessionHealth(active, user, { force = false } = {}) {
+  if (active?.unavailable) return xSessionHealth('unknown');
   if (active?.xSession) {
     return checkXSessionHealth(credentialsStorageState(active.xSession), {
       handle: active.xSession.handle,
@@ -1240,8 +1244,8 @@ async function hydrateUserXSession(user, { sessionToken = null } = {}) {
   } catch (error) {
     // Account metadata and an existing app session should remain usable even
     // if the saved X session cannot be read or staged right now.
-    console.warn(`[storage] Could not hydrate the saved X session: ${error.message}`);
-    return null;
+    console.warn('[storage] Could not read or stage the saved X session.');
+    return { activeXAccount: user?.preferences?.defaultXAccount ?? null, unavailable: true };
   }
 }
 
@@ -1288,7 +1292,7 @@ app.post('/api/auth/import-session', async (req, res, next) => {
     // Validate before writing anything. Rejected cookies should keep the
     // previous session intact and return the user to the re-authentication
     // dialog with a clear message. Failed verification never replaces a session.
-    const health = await checkXSessionHealth(storageState, { handle: username });
+    const health = await checkXSessionHealth(storageState, { handle: username, force: true });
     if (health.xSessionValid === false) {
       throw new HttpError(422, 'X rejected these cookies. Sign in to X again and copy fresh auth_token and ct0 values.');
     }
@@ -1410,7 +1414,8 @@ app.get('/api/auth', async (req, res, next) => {
 app.put('/api/auth', async (req, res, next) => {
   try {
     const auth = await optionalAuthenticatedUser(req);
-    const selectedSession = auth ? await activeSessionFor(auth.user, { required: true }) : null;
+    if (activeRun) throw new HttpError(409, 'A run is already in progress');
+    let selectedSession = null;
     const body = req.body ?? {};
     const updates = Object.keys(COOKIE_SPEC).filter((name) => body[name] !== undefined);
 
@@ -1422,6 +1427,12 @@ app.put('/api/auth', async (req, res, next) => {
 
     const saved = await withWriteLock(async () => {
       if (activeRun) throw new HttpError(409, 'A run is already in progress');
+      if (auth) {
+        const users = await loadUserDb();
+        const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+        if (!current) throw new HttpError(401, 'The app session is no longer active');
+        selectedSession = await activeSessionFor(current, { required: true });
+      }
       const payload = selectedSession
         ? structuredClone(selectedSession.state)
         : ((await readAuthFile(AUTH_FILE)) ?? { cookies: [] });
@@ -1472,8 +1483,9 @@ app.post('/api/auth/logout', async (req, res, next) => {
     if (auth) {
       await withWriteLock(async () => {
         const users = await loadUserDb();
-        const user = users.find((candidate) => candidate.id === auth.user.id);
-        if (user) user.sessionToken = null;
+        const user = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+        if (!user) throw new HttpError(401, 'The app session is no longer active');
+        user.sessionToken = null;
         await saveUserDb(users);
       });
       // Imports recheck this token under the same lock before saving cookies.
@@ -1482,7 +1494,11 @@ app.post('/api/auth/logout', async (req, res, next) => {
       return res.json({ ok: true, authenticated: false });
     }
 
-    await withWriteLock(deleteAuthFile);
+    if (activeRun) throw new HttpError(409, 'A run is already in progress');
+    await withWriteLock(async () => {
+      if (activeRun) throw new HttpError(409, 'A run is already in progress');
+      await deleteAuthFile();
+    });
     clearSessionCookie(res);
     return res.json({ ok: true, authenticated: false, username: null });
   } catch (error) {
@@ -1626,13 +1642,15 @@ app.get('/api/auth/me', async (req, res, next) => {
 app.post('/api/auth/x-accounts', async (req, res, next) => {
   try {
     const auth = await authenticatedUser(req);
+    if (activeRun) throw new HttpError(409, 'A run is already in progress');
     const xUsername = normalizeXUsername(req.body?.xUsername);
     const storageState = req.body?.storageState ?? (Array.isArray(req.body?.cookies) ? req.body : null);
 
     const user = await withWriteLock(async () => {
       const users = await loadUserDb();
-      const current = users.find((candidate) => candidate.id === auth.user.id);
-      if (!current) throw new HttpError(401, 'User account no longer exists');
+      const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
+      if (activeRun) throw new HttpError(409, 'A run is already in progress');
       normalizeUserAccounts(current);
 
       if (!current.xAccounts.includes(xUsername) && current.xAccounts.length >= MAX_X_ACCOUNTS) {
@@ -1666,6 +1684,7 @@ app.post('/api/auth/x-accounts', async (req, res, next) => {
 app.post('/api/auth/switch-account', async (req, res, next) => {
   try {
     const auth = await authenticatedUser(req);
+    if (activeRun) throw new HttpError(409, 'A run is already in progress');
     const xUsername = normalizeXUsername(req.body?.xUsername);
     if (!(await xSessionExists(auth.user.id, xUsername))) {
       throw new HttpError(404, `No saved session for @${xUsername}`);
@@ -1673,8 +1692,8 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
 
     const switched = await withWriteLock(async () => {
       const users = await loadUserDb();
-      const current = users.find((candidate) => candidate.id === auth.user.id);
-      if (!current) throw new HttpError(401, 'User account no longer exists');
+      const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
       normalizeUserAccounts(current);
       if (!current.xAccounts.includes(xUsername)) throw new HttpError(404, 'X account is not linked');
       if (activeRun) throw new HttpError(409, 'A run is already in progress');
@@ -1686,12 +1705,13 @@ app.post('/api/auth/switch-account', async (req, res, next) => {
       return { user: current, state };
     });
 
+    const health = await checkXSessionHealth(switched.state, { handle: xUsername });
     return res.json({
       ok: true,
       activeXAccount: xUsername,
       defaultXAccount: xUsername,
       accounts: await accountSummaries(switched.user),
-      ...(await checkXSessionHealth(switched.state, { handle: xUsername })),
+      ...health,
     });
   } catch (error) {
     next(error);
@@ -1709,8 +1729,11 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
 
     const result = await withWriteLock(async () => {
       const users = await loadUserDb();
-      const current = users.find((candidate) => candidate.id === auth.user.id);
-      if (!current) throw new HttpError(401, 'User account no longer exists');
+      const current = users.find((candidate) => candidate.id === auth.user.id && candidate.sessionToken === auth.token);
+      if (!current) throw new HttpError(401, 'The app session is no longer active');
+      if (activeRun?.userId === current.id && (!activeRun.xUsername || activeRun.xUsername === xUsername)) {
+        throw new HttpError(409, 'A run is already in progress');
+      }
       normalizeUserAccounts(current);
 
       const linked = current.xAccounts.includes(xUsername);
@@ -1727,7 +1750,7 @@ app.delete('/api/auth/x-accounts/:xUsername', async (req, res, next) => {
       await deleteXSession(current.id, xUsername);
 
       let activeSessionStaged = false;
-      if (wasActive) {
+      if (wasActive && !activeRun) {
         const nextActive = current.preferences.defaultXAccount;
         if (nextActive) {
           let nextState = null;
@@ -1994,9 +2017,8 @@ app.post('/api/run', async (req, res) => {
     attachRunCleanup(res, batchHandle);
 
     try {
-      // Validate before writing auth.json or spawning Playwright. An expired
-      // account must fail with 409 immediately instead of launching a browser
-      // that only discovers the rejected cookies after startup.
+      // Verify before staging auth.json or spawning automation. A read-only
+      // browser health probe may run, but rejected cookies cannot start a job.
       selectedSession = await activeSessionFor(appAuth.user, { required: true });
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
@@ -2014,13 +2036,16 @@ app.post('/api/run', async (req, res) => {
       }
       if (!X_SESSION_CHECK_DISABLED && health.xSessionValid !== true) {
         return res.status(503).json({
-          error: `X could not confirm the session for @${selectedSession.xUsername} through its settings endpoint. Retry shortly; publishing has not started.`,
+          error: `X could not confirm the session for @${selectedSession.xUsername} through its API or browser check. Retry shortly; publishing has not started.`,
           code: 'X_SESSION_CHECK_UNAVAILABLE',
           ...health,
         });
       }
 
-      selectedSession = await stageActiveSession(appAuth.user, { sessionToken: appAuth.token });
+      selectedSession = await stageActiveSession(appAuth.user, {
+        sessionToken: appAuth.token,
+        expectedSession: selectedSession,
+      });
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
     } catch (error) {

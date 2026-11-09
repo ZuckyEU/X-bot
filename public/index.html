@@ -905,6 +905,13 @@
         xSessionStatus = status === 'expired' ? 'invalid'
           : ['valid', 'invalid', 'unknown', 'none'].includes(status) ? status : 'unknown';
         xSessionCheckedAt = data?.xSessionCheckedAt ?? null;
+        const active = linkedXAccounts.find((account) => account.xUsername === activeXAccount);
+        if (active && ['valid', 'invalid'].includes(xSessionStatus)) {
+          active.xSessionValid = xSessionStatus === 'valid';
+          active.xSessionStatus = xSessionStatus;
+          active.xSessionCheckedAt = xSessionCheckedAt;
+          if (xSessionStatus === 'valid' && ['invalid', 'expired'].includes(active.status)) active.status = 'ready';
+        }
         renderXSessionStatus();
         renderLinkedAccounts();
       }
@@ -1036,6 +1043,11 @@
 
       function displayActiveXAccount(xUsername) {
         const username = xUsername ? String(xUsername).replace(/^@/, '') : null;
+        if (username !== activeXAccount) {
+          const selected = linkedXAccounts.find((account) => account.xUsername === username);
+          xSessionStatus = selected?.xSessionValid === false ? 'invalid' : selected?.xSessionStatus ?? 'unknown';
+          xSessionCheckedAt = selected?.xSessionCheckedAt ?? null;
+        }
         activeXAccount = username;
         currentUser = username ? `@${username}` : null;
         $('who').textContent = username ? `@${username}` : currentAppUsername || 'Not connected';
@@ -1054,6 +1066,7 @@
           status: String(account?.status ?? 'Linked'),
           xSessionValid: account?.xSessionValid ?? null,
           xSessionStatus: account?.xSessionStatus ?? 'unknown',
+          xSessionCheckedAt: account?.xSessionCheckedAt ?? null,
         };
       }
 
@@ -1244,7 +1257,7 @@
             headers: appSessionHeaders({ 'content-type': 'application/json' }),
             credentials: 'same-origin',
             body: payload,
-            signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]),
+            signal: AbortSignal.any([request.signal, AbortSignal.timeout(45_000)]),
           });
           const data = await response.json().catch(() => ({}));
           if (generation !== authStateGeneration || sessionImportRequest !== request) return;
@@ -1258,14 +1271,6 @@
           if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
           const reauthenticated = sessionImportReauthenticate;
           applyLinkedAccounts(data.accounts, data.activeXAccount);
-          if (data.xSessionValid === true) {
-            const updated = linkedXAccounts.find((account) => account.xUsername === activeXAccount);
-            if (updated) {
-              updated.xSessionValid = true;
-              updated.xSessionStatus = 'valid';
-              if (['invalid', 'expired'].includes(updated.status)) updated.status = 'ready';
-            }
-          }
           applyXSessionHealth(data);
           closeSessionImport();
           setText('auth-msg', reauthenticated
@@ -1446,7 +1451,7 @@
       async function loadAuth() {
         const generation = authStateGeneration;
         const request = new AbortController();
-        const timer = setTimeout(() => request.abort(), 10_000);
+        const timer = setTimeout(() => request.abort(), 45_000);
         try {
           const response = await fetch('/api/auth/me', {
             headers: appSessionHeaders(),
@@ -1468,7 +1473,7 @@
       }
 
       async function initialAuth() {
-        const data = await loadAuth();
+        await loadAuth();
         const params = new URLSearchParams(window.location.search);
         const auth = params.get('auth');
         const reason = params.get('reason');
@@ -1746,6 +1751,7 @@
 
           if (!response.ok) {
             const data = await response.json().catch(() => ({}));
+            if (generation === authStateGeneration && data.xSessionStatus) applyXSessionHealth(data);
             const error = new Error(data.error ?? `HTTP ${response.status}`);
             error.code = data.code;
             throw error;

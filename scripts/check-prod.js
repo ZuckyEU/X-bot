@@ -20,6 +20,7 @@ const SKIP_DIRS = new Set([
   '.nyc_output',
   '.playwright',
   '.playwright-cli',
+  '.tmp',
   'blob-report',
   'coverage',
   'node_modules',
@@ -27,6 +28,7 @@ const SKIP_DIRS = new Set([
   'sessions',
   'test-results',
   'tmp',
+  'user-data',
 ]);
 
 function fail(message) {
@@ -51,7 +53,7 @@ async function javascriptFiles(directory) {
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
       files.push(...(await javascriptFiles(join(directory, entry.name))));
-    } else if (entry.isFile() && /\.(?:js|cjs)$/.test(entry.name)) {
+    } else if (entry.isFile() && entry.name !== 'test-browserbase.cjs' && /\.(?:js|cjs)$/.test(entry.name)) {
       files.push(join(directory, entry.name));
     }
   }

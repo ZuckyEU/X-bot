@@ -17,9 +17,9 @@ GEMINI_MODEL=gemini-3.6-flash
 DATABASE_URL=your-supabase-postgres-connection-string
 ```
 
-User accounts and X sessions are stored in **Supabase PostgreSQL**; the server creates the required tables on boot. Reply automation launches **local headless Chromium** through Playwright inside the application container. The shared `lib/browser.js` launcher uses `chromium.launch({ headless: true, args: ['--no-sandbox'] })`; it never connects to a remote browser and needs no browser-service API key. On Render, select the **Docker runtime** and use the repository's Dockerfile, which includes Chromium and its Linux dependencies. Manual session imports do not launch a browser.
+User accounts and X sessions are stored in **Supabase PostgreSQL**; the server creates the required tables on boot. Reply automation launches **local headless Chromium** through Playwright inside the application container. The shared `lib/browser.js` launcher uses `chromium.launch({ headless: true, args: ['--no-sandbox'] })`; it never connects to a remote browser and needs no browser-service API key. On Render, select the **Docker runtime** and use the repository's Dockerfile, which includes Chromium and its Linux dependencies. Session imports may use an isolated background Chromium health check, but never open an interactive viewer or start automation.
 
-`gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the default is **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model — both scripts read it.
+`gemini-2.5-flash` is retired for new API keys (returns 404), and `gemini-3.8-flash` was returning 503 during setup, so the page-description demo defaults to **`gemini-3.6-flash`**. Change `GEMINI_MODEL` to use another model in `index.js`; X reply generation uses Groq instead.
 
 ## Run
 
@@ -79,7 +79,7 @@ npm run automate -- https://x.com/user/status/1234567890 --yes      # no prompt
 
 Flow: launches local headless Chromium → restores cookies and localStorage from `auth.json` → verifies the session on `x.com/home` → opens the tweet → extracts the text (expanding "Show more") → asks Groq to classify the tweet and write a reply → performs the requested reply/like actions.
 
-**Dynamic tone, not a crypto bot.** The system prompt makes Gemini identify the tweet's domain first — `crypto`, `web-development`, `software-engineering`, `ui-ux-design`, `ai-ml`, `product-startup` or `other` — and reply in that domain's vocabulary:
+**Dynamic tone, not a crypto bot.** Groq identifies the tweet's domain first — `crypto`, `web-development`, `software-engineering`, `ui-ux-design`, `ai-ml`, `product-startup` or `other` — and replies in that domain's vocabulary:
 
 ```
 Detected topic: ui-ux-design
@@ -113,7 +113,7 @@ Notes:
 
 - X changes its `data-testid` attributes from time to time. If a step breaks, inspect the page and update the `SEL` map at the top of `main.js`.
 - Automated posting/liking may violate X's automation rules and can get an account limited. This script handles one reply per run, on your own account — don't turn it into a mass-reply loop.
-- Gemini runs with thinking disabled (`thinkingBudget: 0`) so the whole token budget goes to the reply. Overload 503s are retried 3× with backoff before failing.
+- The server retries transient automation/network failures at most twice (three attempts total), with cancellation-aware backoff. An unconfirmed post is recorded as a failure rather than a successful action.
 
 ## Connect X Account: manual session import
 
@@ -137,36 +137,42 @@ The credentials are upserted into PostgreSQL (`x_sessions`), the account is link
 
 Imports require a current app session, reject changes while a browser run is active, and use serialized writes with rollback if saving fails. Account switching is also blocked until the active run finishes. Import and switch responses contain only account metadata; raw cookie values are returned only by the authenticated `GET /api/auth/me` bootstrap response so a new device can restore its active X account. The form uses masked inputs, does not write cookies to browser storage, and clears pasted values on submission, close, navigation, or app logout.
 
-Before saving, the server validates the cookies through `https://api.x.com/1.1/account/settings.json`, falling back to `https://x.com/i/api/1.1/account/settings.json` when the probe is inconclusive. Requests include the X web bearer, `auth_token` and `ct0` cookies, matching CSRF header, and `OAuth2Session` auth header. Optional comma-separated `X_SESSION_CHECK_URL` overrides are tried before these defaults; tests use only their configured local fixtures. A **200** response must contain authenticated settings JSON, not an HTML login page or an error payload. Only an HTTP **401** explicitly rejects the session as **invalid**, with no fallback that could hide the rejection. If no endpoint confirms the session (including 404/410, timeout, network, rate-limit, server failures, or non-401 error payloads), verification reports **unknown**, not expired. Missing cookies are still invalid locally. Rejected imports return **422**; inconclusive verification returns **503** with `code: "X_SESSION_CHECK_UNAVAILABLE"`. Both leave the previous saved session untouched.
+Before saving, the server tries `https://api.x.com/1.1/account/settings.json` and, when inconclusive, `https://x.com/i/api/1.1/account/settings.json`. Requests include the X web bearer, `auth_token` and `ct0` cookies, matching CSRF header, and `OAuth2Session` auth header. Optional comma-separated `X_SESSION_CHECK_URL` overrides run before these defaults. Only **200** authenticated settings JSON with a nonempty `screen_name` and no error confirms the session through HTTP.
 
-After login and on every dashboard bootstrap, `GET /api/auth/me` reads the user's active row from `x_sessions`, returns `activeXAccount` plus `xSession.auth_token`/`xSession.ct0`, and restages `auth.json` when no browser run is active. It also returns `xSessionStatus` (`valid`, `invalid`, `unknown`, or `none`), `xSessionValid` (`true`/`false`/`null`), and `xSessionCheckedAt`. Results are cached per cookie pair for 60 seconds by default. A missing or stale `auth.json` therefore no longer requires re-pasting cookies on a new device.
+If HTTP cannot confirm the cookies, `verifyXSession()` calls `lib/x-session-health.js`: a fresh local headless browser loads just the two X cookies and visits **`https://x.com/home`**. A visible account switcher, Home navigation, and feed/composer together confirm **valid (200)**; a redirect to **`/login`** or **`/i/flow/login`** confirms **invalid (401)**. A `/home` URL alone, a public shell, hidden markers, and account-access challenges are not sufficient proof. An API **401** goes directly to the browser check rather than another HTTP endpoint, because the bearer or datacenter IP may have been rejected instead of the cookies. API **404/410** and other failures never expire cookies on their own.
 
-When the active session is invalid, the dashboard shows a **X Connection Expired — Reconnection Needed** banner and disables **Publish Live Action**. `POST /api/run` validates the saved session before writing `auth.json` or spawning Playwright and returns **409** with `code: "X_SESSION_EXPIRED"` on explicit rejection or missing cookies. Inconclusive checks instead return a retryable **503** with `code: "X_SESSION_CHECK_UNAVAILABLE"`, `xSessionStatus: "unknown"`, and `xSessionValid: null`, without staging or launching automation. The banner and account menu open the **Re-authenticate Account** dialog, which accepts fresh `auth_token` and `ct0` values, updates PostgreSQL, and re-validates the badge. An X endpoint or network outage can temporarily block publishing, but does not label the session expired; retry once verification is available. Disabling checks also reports `unknown` and bypasses verification, and is intended only for offline environments.
+The probe blocks images, media, fonts, and service workers, never writes storage state, and closes Chromium even on failure or a late launch. `X_SESSION_CHECK_TIMEOUT_MS` defaults to **3500 ms per HTTP endpoint**; `X_SESSION_CHECK_BROWSER_TIMEOUT_MS` defaults to **10000 ms total** (allowed range: 500–30000 ms, including launch and page loading). One browser health probe runs at a time to bound container memory use; same-cookie callers share it, and unrelated callers receive a retryable availability result rather than launch more browsers.
+
+Browser/network errors, timeouts, challenges, and missing authenticated UI remain **unknown (503)**, not expired. Missing cookies are invalid locally. Rejected imports return **422**; inconclusive verification returns **503** with `code: "X_SESSION_CHECK_UNAVAILABLE"`. Neither overwrites the previous saved session. Explicit imports and runs request fresh verification instead of reusing cached failures.
+
+After login and on every dashboard bootstrap, `GET /api/auth/me` reads the user's active row from `x_sessions`, returns `activeXAccount` plus `xSession.auth_token`/`xSession.ct0`, and restages `auth.json` when no browser run is active. It also returns `xSessionStatus` (`valid`, `invalid`, `unknown`, or `none`), `xSessionValid` (`true`/`false`/`null`), and `xSessionCheckedAt`. Automatic checks are cached per cookie pair for 60 seconds by default; imports and runs bypass completed cached results but share an ongoing check. App login/bootstrap stay usable with unknown X health, including a temporary storage failure. A missing or stale `auth.json` therefore no longer requires re-pasting cookies on a new device.
+
+When the active session is invalid, the dashboard shows a **X Connection Expired — Reconnection Needed** banner and disables **Publish Live Action**. `POST /api/run` validates the saved session before writing `auth.json` or spawning automation and returns **409** with `code: "X_SESSION_EXPIRED"` on a confirmed login redirect or missing cookies. Inconclusive checks instead return a retryable **503** with `code: "X_SESSION_CHECK_UNAVAILABLE"`, `xSessionStatus: "unknown"`, and `xSessionValid: null`, without staging or launching automation. Both paths release the run lock.
+
+Account summaries include each cookie pair's last checked health, so switching away does not lose an expired account's status. The dropdown shows red **Session Expired** text and **Update Session** instead of a checkmark for rejected sessions. **Update Session** and the banner open the prefilled **Re-authenticate Account** dialog; an inactive account is not switched until fresh cookies pass verification and are saved. Success restores **Active** and its blue checkmark. Never-checked inactive sessions are unknown, not assumed valid or expired; this metadata is process-local and is rebuilt as accounts are checked after a restart. An outage can temporarily block publishing without marking a session expired. Disabling checks reports `unknown` and bypasses protection; use it only for offline environments.
 
 **Cookies grant account access.** Use HTTPS in production and protect the PostgreSQL connection string and `auth.json`. `auth_token` and `ct0` are stored as plain text in `x_sessions` and in the staged `auth.json`; they are not encrypted at the application layer. Health checks confirm that X still accepts the cookies, not that the handle matches the account or that the cookies were obtained with permission. A mismatched handle or X's cloud-IP restrictions can still cause a run to fail; re-import fresh matching cookies when needed.
 
-Run `npm test` for API, tenant-isolation, persistence, rollback, and runner regression checks. Run `npm run test:ui` after installing local Chromium for form submission, secret cleanup, error handling, and stale-response checks. Tests use synthetic cookies and local fixtures, not a credentialed X login.
+Install local Chromium before either test suite. Run `npm test` for API, tenant-isolation, persistence, rollback, runner, and real local-browser health regressions. Run `npm run test:ui` for dashboard submission, secret cleanup, error handling, dropdown/re-authentication synchronization, and stale-response checks. API tests use a test-only browser preload; browser health tests route all requests to synthetic pages. Test servers default to isolated local storage or explicitly configured `pg-mem://`, never an inherited deployment database. No test logs into X with real cookies.
 
 ### Browser execution and session flow
-
-Before the local-browser migration, `lib/browser.js` imported the Browserbase SDK, called `sessions.create()`, connected with `chromium.connectOverCDP()`, minted live URLs with `sessions.debug()`, and released sessions with `sessions.update()`. `main.js`, `index.js`, `auth.js`, and the optional `/auth/x` route all used that shared remote path. Only the dashboard browser tests used local `chromium.launch()`.
 
 The current execution paths are:
 
 | Entry point | Browser execution |
 |---|---|
-| `POST /api/run` in `server.js` | Stages the authenticated user's cookies, then spawns `main.js`; the server itself does not launch a browser |
+| Import, login/bootstrap, account switch, and `POST /api/run` | HTTP health fast path → isolated local Chromium fallback when needed; with checks enabled, only a verified run proceeds to stage cookies and spawn `main.js` |
 | `main.js` and `index.js` | `connectBrowser()` → local `chromium.launch({ headless: true, args: ['--no-sandbox'] })` |
 | `auth.js` | Local headed Chromium for desktop-only manual login; blocked in production/Render |
-| Dashboard browser tests | Local headless Chromium against a fixture server |
+| Browser health and dashboard tests | Local headless Chromium against routed synthetic pages or a fixture server |
 
 1. Server boot initializes PostgreSQL and creates the `users`/`x_sessions` schema. Boot hydration stages the most recently active saved account in `auth.json`; this does not launch Chromium.
 2. App login and `GET /api/auth/me` resolve that user's active `x_sessions` row. They restage `auth.json` only while idle, so dashboard bootstrap cannot replace cookies during a run.
-3. `POST /api/run` validates URLs, authenticates the app session, checks the saved Groq key, reserves the single-run lock, and re-reads/stages the selected user's `auth_token`/`ct0` from PostgreSQL. The boot-staged account is not blindly reused.
+3. `POST /api/run` validates URLs, authenticates the app session, checks the saved Groq key, reserves the single-run lock, and verifies the selected cookies through HTTP/browser health checking. Only then does it re-read and stage the selected user's `auth_token`/`ct0` from PostgreSQL. Staging rejects an account/cookie pair that changed during verification with a retryable 409, rather than launching with unverified cookies. The boot-staged account is not blindly reused. Imports, legacy cookie edits/linking, and account switching fail with 409 while a run is reserved, including startup; queued edits also recheck the app token before saving.
 4. Each target attempt spawns `main.js` with `AUTH_FILE_PATH`, `X_ACCOUNT_USERNAME`, and the user's Groq key. The child launches Chromium inside the same container, awaits a new browser context, injects the staged cookies with `context.addCookies()`, and only then opens X.
-5. The child performs the requested actions and closes its local browser in `finally`. The server preserves bounded retries, final-attempt history, NDJSON progress, cancellation-aware delays, and run-lock cleanup.
+5. The child performs the requested actions and closes its local browser in `finally`. The server preserves bounded retries, final-attempt history, NDJSON progress, cancellation-aware delays, and run-lock cleanup. Unlinking another user's account cannot replace or delete the running job's staged cookies.
 
-The Browserbase SDK and its configuration are no longer used. Existing browser-service environment variables may be removed from Render; they cannot switch automation back to a remote browser. X will now see the Render container's outbound IP, so cloud-IP restrictions and expired cookies can still block a run.
+The Browserbase SDK and its configuration are no longer used. Existing browser-service environment variables may be removed from Render; they cannot switch automation back to a remote browser. `.dockerignore` excludes local secrets, saved browser data, dependencies, and the ignored legacy login debug script from builds; production preflight also bypasses that script. X still sees the Render container's outbound IP, so a browser challenge can leave verification unavailable even with valid cookies. Do not disable production protection to work around this.
 
 ### Retired remote sign-in endpoints
 
@@ -188,7 +194,7 @@ The dashboard is served from `public/index.html` at `/`. All API routes remain u
 | `GET /api/auth/me` | App user profile plus active X account, saved `xSession.auth_token`/`ct0`, account summaries, and `xSessionStatus`/`xSessionValid`; restages `auth.json` when idle |
 | `PUT /api/auth` | Body `{"auth_token": "…", "ct0": "…"}` — either field alone is fine (browser session) |
 | `POST /api/auth/import-session` | Body `{"handle": "…", "auth_token": "…", "ct0": "…"}` — validate with X, then save, link, and activate an X session |
-| `GET /api/auth/x-accounts` | List the authenticated user's linked accounts |
+| `GET /api/auth/x-accounts` | List linked accounts and their last checked X health, including expired inactive accounts |
 | `POST /api/auth/switch-account` | Body `{"xUsername": "…"}` — stage a linked account for the bot |
 | `DELETE /api/auth/x-accounts/:xUsername` | Unlink an account and remove its saved session |
 | `POST /api/auth/logout` | Revoke the app session and stop its active run; saved X sessions survive logout |
@@ -244,7 +250,7 @@ Safety rails, because this endpoint can replace your session:
 - Binds to **0.0.0.0** on Render's dynamic `PORT` (falling back to `3000`, or `10000` in `.env.example`) so the platform can reach it.
 - CORS allows the local UI, explicitly configured origins (`PUBLIC_ORIGIN` / `ALLOWED_ORIGINS`), Render's `RENDER_EXTERNAL_URL`, and `*.onrender.com` in production. Other websites are rejected.
 - Manual imports create a cookie-only session from the supplied handle, `auth_token`, and `ct0`. The legacy `PUT /api/auth` updates just those two cookie names while preserving other cookies, `origins`, and metadata.
-- Values are validated (`[A-Za-z0-9._~%+/-]+` with optional trailing Base64 padding, 8–512 chars); responses never include raw cookie values.
+- Values are validated (`[A-Za-z0-9._~%+/-]+` with optional trailing Base64 padding, 8–512 chars); mutation responses never include raw cookie values. Only authenticated `/api/auth/me` returns the saved active credentials.
 - Writes are serialised and atomic (temp file + rename), so an interrupted save can't truncate `auth.json`.
 
 ## Persistent users and X sessions
