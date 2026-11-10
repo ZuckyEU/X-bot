@@ -33,6 +33,10 @@ SESSION_SECRET=replace-with-at-least-32-random-characters
 
 Generate the secret with `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`. Leave `DATABASE_URL` unset for local storage.
 
+## Reply language
+
+Groq receives the original tweet text, including non-English and mixed-language posts. Both prompts instruct it to translate the meaning contextually within its reasoning, preserving intent, idioms, cultural references, and technical details, then return only an English reply without reasoning or translation notes. The selected tone and reply-length limits still apply.
+
 ## How X sessions work
 
 **Interactive connect (recommended).** The server calls Playwright's `chromium.launchPersistentContext` with a real, headful browser. After you sign in, X writes its cookies and storage into the profile on disk. The app then verifies the session and saves a storage-state copy for health checks and fallbacks.
@@ -90,6 +94,7 @@ Every imported and staged session is checked before it can publish:
 - Verified cookies: saved and usable.
 - X clearly rejects the cookies: `409` (`X_SESSION_EXPIRED`).
 - Check unavailable (network, challenge, datacenter IP): retryable `503` (`X_SESSION_CHECK_UNAVAILABLE`); nothing is staged or spawned.
+- The local headless browser fallback uses a 15-second navigation timeout, then falls back to checking the locally stored session cookies before failing.
 - Before a run reports either failure, it retries verification once after 3 seconds (`X_SESSION_CHECK_RETRY_MS`). Headless failures also log how to uncheck **Headless browser** or call `/api/auth/connect-interactive` to refresh the session.
 - `X_SESSION_CHECK_DISABLED=1` is a development/test convenience only and is ignored in production.
 

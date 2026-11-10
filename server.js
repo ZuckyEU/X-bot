@@ -139,7 +139,7 @@ const X_SESSION_CHECK_URLS = X_SESSION_CHECK_CONFIGURED_URLS.length
     : [...new Set([...X_SESSION_CHECK_CONFIGURED_URLS, ...X_SESSION_CHECK_DEFAULT_URLS])]
   : X_SESSION_CHECK_DEFAULT_URLS;
 const X_SESSION_CHECK_TIMEOUT_MS = envInteger('X_SESSION_CHECK_TIMEOUT_MS', 3_500, 500, 15_000);
-const X_SESSION_CHECK_BROWSER_TIMEOUT_MS = envInteger('X_SESSION_CHECK_BROWSER_TIMEOUT_MS', 10_000, 500, 30_000);
+const X_SESSION_CHECK_BROWSER_TIMEOUT_MS = envInteger('X_SESSION_CHECK_BROWSER_TIMEOUT_MS', 15_000, 500, 30_000);
 const X_SESSION_CHECK_CACHE_MS = envInteger('X_SESSION_CHECK_CACHE_MS', 60_000, 0, 15 * 60_000);
 // Run verification retries once so a transient X/browser failure does not
 // reject cookies that are actually still valid. Zero disables the retry.
@@ -1263,6 +1263,16 @@ async function probeXSession(url, credentials, timeoutMs) {
   }
 }
 
+/** Fallback for browser timeouts: check the locally stored cookies before failing. */
+async function verifyLocalStoredXSession(credentials, { timeoutMs, urls }) {
+  for (const url of urls) {
+    const outcome = await probeXSession(url, credentials, timeoutMs);
+    if (outcome.status === 'valid') return outcome;
+    if (outcome.status === 'invalid') return outcome;
+  }
+  return null;
+}
+
 /** Confirm settings JSON or fall back to the authenticated home page in local Chromium. */
 async function verifyXSession(
   storageState,
@@ -1284,7 +1294,12 @@ async function verifyXSession(
     if (outcome.status === 'invalid') break;
   }
 
-  return verifyXSessionInBrowser(credentials, { timeoutMs: browserTimeoutMs });
+  const browserOutcome = await verifyXSessionInBrowser(credentials, { timeoutMs: browserTimeoutMs });
+  if (browserOutcome?.reason === 'browser-timeout') {
+    const fallbackOutcome = await verifyLocalStoredXSession(credentials, { timeoutMs, urls });
+    return fallbackOutcome ?? browserOutcome;
+  }
+  return browserOutcome;
 }
 
 const xSessionHealthCache = new Map();

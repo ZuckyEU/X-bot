@@ -3442,6 +3442,9 @@ test('native service uses the platform port and delegates browser execution to m
   assert.equal(server.includes('/auth/x/credentials'), false);
   assert.match(server, /\/api\/auth\/connect-interactive/);
   assert.doesNotMatch(server, /HARVEST_|remote-desktop-http|desktop-browser/);
+  assert.match(server, /X_SESSION_CHECK_BROWSER_TIMEOUT_MS = envInteger\('X_SESSION_CHECK_BROWSER_TIMEOUT_MS', 15_000, 500, 30_000\);/);
+  assert.match(server, /async function verifyLocalStoredXSession/);
+  assert.match(server, /browserOutcome\?\.reason === 'browser-timeout'/);
 });
 
 test('production preflight and Render image require local Playwright instead of a browser-service key', async () => {
@@ -3460,6 +3463,7 @@ test('production preflight and Render image require local Playwright instead of 
   assert.doesNotMatch(browserSource, /Browserbase|browserbase|connectOverCDP/);
   assert.doesNotMatch(healthSource, /Browserbase|browserbase|connectOverCDP|writeFile|storageState\(/);
   assert.match(healthSource, /connectBrowser\(/);
+  assert.match(healthSource, /timeoutMs = 15_000/);
   assert.match(checkProd, /SESSION_SECRET/);
   assert.match(checkProd, /DATABASE_URL/);
   assert.doesNotMatch(checkProd, /!databaseUrl \|\||DATABASE_URL must be set/);
