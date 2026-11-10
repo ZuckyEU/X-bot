@@ -141,6 +141,9 @@ const X_SESSION_CHECK_URLS = X_SESSION_CHECK_CONFIGURED_URLS.length
 const X_SESSION_CHECK_TIMEOUT_MS = envInteger('X_SESSION_CHECK_TIMEOUT_MS', 3_500, 500, 15_000);
 const X_SESSION_CHECK_BROWSER_TIMEOUT_MS = envInteger('X_SESSION_CHECK_BROWSER_TIMEOUT_MS', 10_000, 500, 30_000);
 const X_SESSION_CHECK_CACHE_MS = envInteger('X_SESSION_CHECK_CACHE_MS', 60_000, 0, 15 * 60_000);
+// Run verification retries once so a transient X/browser failure does not
+// reject cookies that are actually still valid. Zero disables the retry.
+const X_SESSION_CHECK_RETRY_MS = envInteger('X_SESSION_CHECK_RETRY_MS', 3_000, 0, 30_000);
 const X_SESSION_CHECK_DISABLED = !IS_PRODUCTION && (process.env.X_SESSION_CHECK_DISABLED === '1'
   || (IS_TEST && X_SESSION_CHECK_CONFIGURED_URLS.length === 0));
 if (IS_PRODUCTION && process.env.X_SESSION_CHECK_DISABLED === '1') {
@@ -2508,6 +2511,7 @@ app.post('/api/run', async (req, res) => {
   let currentChild = null;
   let cooldownTimer = null;
   let finishCooldown = null;
+  let finishVerificationRetry = null;
   let aborted = false;
   let profileDirectory = null;
   let profileExportFile = null;
@@ -2523,6 +2527,7 @@ app.post('/api/run', async (req, res) => {
       aborted = true;
       if (currentChild) killTree(currentChild);
       finishCooldown?.();
+      finishVerificationRetry?.();
     },
   };
   // Keep the single-flight lock inside one outer try/finally so every exit
@@ -2539,11 +2544,52 @@ app.post('/api/run', async (req, res) => {
       batchHandle.xUsername = selectedSession.xUsername;
       if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
 
-      const health = await checkXSessionHealth(selectedSession.state, {
+      const waitForVerificationRetry = (ms) =>
+        new Promise((resolve) => {
+          let timer = null;
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            finishVerificationRetry = null;
+            resolve();
+          };
+          finishVerificationRetry = finish;
+          timer = setTimeout(finish, ms);
+          timer.unref?.();
+        });
+
+      const verificationFailed = (health) =>
+        health.xSessionValid === false || (!X_SESSION_CHECK_DISABLED && health.xSessionValid !== true);
+
+      const logHeadlessVerificationFailure = () => {
+        if (!headless) return;
+        console.warn(
+          `[x-session] Verification failed for @${selectedSession.xUsername} in headless mode. `
+          + 'Uncheck "Headless browser" in the dashboard to sign in with a visible window, or run '
+          + 'POST /api/auth/connect-interactive to refresh the saved session.',
+        );
+      };
+
+      let health = await checkXSessionHealth(selectedSession.state, {
         handle: selectedSession.xUsername,
         force: true,
       });
+      if (verificationFailed(health) && X_SESSION_CHECK_RETRY_MS > 0) {
+        console.warn(
+          `[x-session] Initial verification for @${selectedSession.xUsername} failed (${health.xSessionStatus}); `
+          + `retrying once in ${X_SESSION_CHECK_RETRY_MS} ms.`,
+        );
+        await waitForVerificationRetry(X_SESSION_CHECK_RETRY_MS);
+        if (aborted || res.destroyed) throw new HttpError(410, 'The run was cancelled');
+        health = await checkXSessionHealth(selectedSession.state, {
+          handle: selectedSession.xUsername,
+          force: true,
+        });
+      }
       if (health.xSessionValid === false) {
+        logHeadlessVerificationFailure();
         return res.status(409).json({
           error: `X connection expired for @${selectedSession.xUsername}. Re-authenticate the account before publishing.`,
           code: 'X_SESSION_EXPIRED',
@@ -2551,6 +2597,7 @@ app.post('/api/run', async (req, res) => {
         });
       }
       if (!X_SESSION_CHECK_DISABLED && health.xSessionValid !== true) {
+        logHeadlessVerificationFailure();
         return res.status(503).json({
           error: `X could not confirm the session for @${selectedSession.xUsername} through its API or browser check. Retry shortly; publishing has not started.`,
           code: 'X_SESSION_CHECK_UNAVAILABLE',
@@ -2940,7 +2987,7 @@ await seedDefaultAdmin();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
-  console.log(`X automation API service: http://${HOST}:${PORT}`);
+  console.log(`X automation API service: http://localhost:${PORT}`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/register   (create local user)`);
   console.log(`  POST ${HOST}:${PORT}/api/auth/login      (create app session)`);
   console.log(`  GET  ${HOST}:${PORT}/api/auth/me         (current local user)`);

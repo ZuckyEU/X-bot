@@ -90,6 +90,7 @@ Every imported and staged session is checked before it can publish:
 - Verified cookies: saved and usable.
 - X clearly rejects the cookies: `409` (`X_SESSION_EXPIRED`).
 - Check unavailable (network, challenge, datacenter IP): retryable `503` (`X_SESSION_CHECK_UNAVAILABLE`); nothing is staged or spawned.
+- Before a run reports either failure, it retries verification once after 3 seconds (`X_SESSION_CHECK_RETRY_MS`). Headless failures also log how to uncheck **Headless browser** or call `/api/auth/connect-interactive` to refresh the session.
 - `X_SESSION_CHECK_DISABLED=1` is a development/test convenience only and is ignored in production.
 
 ## Scripts

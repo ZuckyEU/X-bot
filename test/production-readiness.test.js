@@ -1909,6 +1909,7 @@ test('production requires live verification despite the old disable flag and nev
   const runMarker = join(dataDir, 'run-gate');
   const { baseUrl, output, productionHealth } = await startServer(t, {
     NODE_ENV: 'production', DATABASE_URL: 'pg-mem://', X_SESSION_CHECK_DISABLED: '1',
+    X_SESSION_CHECK_RETRY_MS: '0',
     SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
   }, {
     dataDir, cleanupData: true,
@@ -2190,6 +2191,7 @@ for (const missing of ['auth_token', 'ct0', 'both', 'row']) {
     const runMarker = join(dataDir, 'run-gate');
     const { baseUrl, child, output } = await startServer(t, {
       DATABASE_URL: 'pg-mem://', SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
+      X_SESSION_CHECK_RETRY_MS: '0',
     }, {
       dataDir, cleanupData: true, ipc: true,
       nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs'),
@@ -2283,7 +2285,7 @@ test('X session health rejects expired cookies, blocks live runs, and re-authent
     X_SESSION_CHECK_DISABLED: '0',
     X_SESSION_CHECK_URL: x.url,
     X_SESSION_CHECK_TIMEOUT_MS: '2000',
-    X_SESSION_CHECK_CACHE_MS: '0',
+    X_SESSION_CHECK_CACHE_MS: '0', X_SESSION_CHECK_RETRY_MS: '0',
   });
   const owner = await register(baseUrl, 'health');
   const good = { handle: 'alpha', auth_token: 'good_auth_token_value', ct0: 'good_ct0_value' };
@@ -2432,7 +2434,7 @@ test('X health check falls back after 404 and reports unknown failures without s
     X_SESSION_CHECK_DISABLED: '0',
     X_SESSION_CHECK_URL: `${x.missingUrl},${x.url}`,
     X_SESSION_CHECK_TIMEOUT_MS: '500',
-    X_SESSION_CHECK_CACHE_MS: '0',
+    X_SESSION_CHECK_CACHE_MS: '0', X_SESSION_CHECK_RETRY_MS: '0',
     SESSION_TEST_WRITE_GATE: stageMarker,
     SESSION_TEST_RUN_GATE: runMarker,
   }, {
@@ -2584,6 +2586,7 @@ test('X browser errors after HTTP 401 or 404 return unavailable without changing
   const runMarker = join(dataDir, 'run-gate');
   const { baseUrl, output } = await startServer(t, {
     X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+    X_SESSION_CHECK_RETRY_MS: '0',
     SESSION_TEST_HEALTH_BROWSER_LOG: log, SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
   }, {
     dataDir, cleanupData: true,
@@ -2730,6 +2733,7 @@ test('run staging refuses cookies changed by a previously queued edit after veri
   const runMarker = join(dataDir, 'run-gate');
   const { baseUrl } = await startServer(t, {
     X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '0',
+    X_SESSION_CHECK_RETRY_MS: '0',
     SESSION_TEST_SESSION_WRITE_GATE: writeMarker, SESSION_TEST_RUN_GATE: runMarker,
   }, {
     dataDir, cleanupData: true,
@@ -2812,6 +2816,7 @@ test('X run verification bypasses cached health and confirms expiration before s
   const runMarker = join(dataDir, 'run-gate');
   const { baseUrl } = await startServer(t, {
     X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '60000',
+    X_SESSION_CHECK_RETRY_MS: '0',
     SESSION_TEST_WRITE_GATE: stageMarker, SESSION_TEST_RUN_GATE: runMarker,
   }, {
     dataDir, cleanupData: true,
@@ -2849,6 +2854,81 @@ test('X run verification bypasses cached health and confirms expiration before s
   assert.equal(retry.status, 200);
   assert.match(await retry.text(), /"type":"batch-complete"/);
   assert.equal(x.requests.length, count + 2, 'A forced retry must not reuse a cached rejection either');
+});
+
+test('run verification retries once after three seconds and proceeds when the cookies are still valid', { timeout: 30_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-run-verification-retry-'));
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl, output } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url, X_SESSION_CHECK_CACHE_MS: '60000',
+    SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'run_verification_retry');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'good'))).status, 201);
+  await saveGroqKey(baseUrl, owner.cookie);
+
+  let probes = 0;
+  x.setResponse((_req, res) => {
+    probes += 1;
+    res.writeHead(probes === 1 ? 401 : 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(probes === 1 ? { errors: [{ code: 32 }] } : { screen_name: 'alpha' }));
+  });
+
+  await writeFile(runMarker, 'pause');
+  const startedAt = Date.now();
+  const running = fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1', dryRun: true }),
+  });
+  await until(() => stat(`${runMarker}.entered`).then(() => true, () => false), 'The retried verification did not reach the runner');
+  const elapsed = Date.now() - startedAt;
+  await unlink(runMarker);
+  const response = await running;
+  const body = await response.text();
+  assert.equal(response.status, 200, body);
+  assert.match(body, /"type":"batch-complete"/);
+  assert.ok(elapsed >= 2_900, `expected a three-second verification retry, got ${elapsed} ms`);
+  assert.equal(probes, 2, 'The failed verification must be retried exactly once');
+  assert.match(output(), /retrying once in 3000 ms/);
+});
+
+test('headless runs log a visible-browser or connect-interactive hint when verification fails', { timeout: 20_000 }, async (t) => {
+  const x = await startXHealthFixture(t);
+  const dataDir = await mkdtemp(join(tmpdir(), 'x-engine-run-headless-hint-'));
+  const runMarker = join(dataDir, 'run-gate');
+  const { baseUrl, output } = await startServer(t, {
+    X_SESSION_CHECK_DISABLED: '0', X_SESSION_CHECK_URL: x.url,
+    X_SESSION_CHECK_CACHE_MS: '0', X_SESSION_CHECK_RETRY_MS: '0',
+    SESSION_TEST_RUN_GATE: runMarker,
+  }, {
+    dataDir, cleanupData: true,
+    nodeArgs: ['--require', join(ROOT, 'test', 'fixtures', 'session-runtime-gate.cjs')],
+  });
+  const owner = await register(baseUrl, 'run_headless_hint');
+  assert.equal((await importSession(baseUrl, owner.cookie, importPayload('alpha', 'good'))).status, 201);
+  await saveGroqKey(baseUrl, owner.cookie);
+  assert.equal((await fetch(`${baseUrl}/api/auth`, {
+    method: 'PUT', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ auth_token: 'expired_auth_token_value', ct0: 'expired_ct0_value' }),
+  })).status, 200);
+
+  const blocked = await fetch(`${baseUrl}/api/run`, {
+    method: 'POST', headers: jsonHeaders(owner.cookie),
+    body: JSON.stringify({ url: 'https://x.com/alpha/status/1' }),
+  });
+  assert.equal(blocked.status, 409);
+  assert.equal((await blocked.json()).code, 'X_SESSION_EXPIRED');
+  await until(
+    () => output().includes('[x-session] Verification failed for @alpha in headless mode.'),
+    'Headless verification failures must explain how to refresh the session',
+  );
+  assert.match(output(), /Uncheck "Headless browser"/);
+  assert.match(output(), /\/api\/auth\/connect-interactive/);
+  await assert.rejects(stat(`${runMarker}.entered`), { code: 'ENOENT' });
 });
 
 test('X forced run checks share an in-flight browser probe for the same cookies', { timeout: 30_000 }, async (t) => {
@@ -3350,6 +3430,7 @@ test('native service uses the platform port and delegates browser execution to m
   assert.match(server, /process\.env\.PORT \|\| 3000/);
   assert.match(server, /app\.listen\(PORT, '0\.0\.0\.0'/);
   assert.match(server, /Server listening on port/);
+  assert.match(server, /X automation API service: http:\/\/localhost:\$\{PORT\}/);
 
   assert.match(server, /const args = \['main\.js', targetUrl, '--yes'\]/);
   assert.match(server, /AUTH_FILE_PATH: AUTH_FILE/);
