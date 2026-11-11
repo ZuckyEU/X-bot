@@ -2,17 +2,56 @@
 
 Local-first X reply automation. The dashboard stores accounts and settings locally, opens a real Chromium window for X sign-in, and runs automation from the saved Playwright profile — no cookie copying required.
 
-## Quick start (local)
+## Quick Start and Setup
 
-Requirements: Node.js 20+ and Windows, macOS, or Linux with a desktop session.
+### Project overview
+
+X-Engine is a local-first X automation and AI reply engine. It stores app accounts, Groq keys, and execution history locally, connects X through a persistent Chromium profile, verifies sessions before publishing, and drafts or publishes AI replies.
+
+### Prerequisites
+
+- Node.js v18+ (the package metadata currently declares Node 20+, so use a current LTS release).
+- Git.
+- Google Chrome or Chromium; the app installs and uses local Chromium.
+- A Groq API key.
+- A desktop session for interactive X sign-in on Windows, macOS, or Linux.
+
+### 1-Click Quick Start (Windows)
+
+1. Open the project folder.
+2. Run `start.bat`.
+3. The script checks for `node_modules`, runs `npm install` if missing, starts the local server via `npm start`, waits briefly, and opens `http://localhost:3000`.
+
+### Manual CLI Setup
 
 ```bash
 git clone https://github.com/ZuckyEU/X-bot.git
 cd X-bot
-npm run setup
-cp .env.example .env    # Windows: copy .env.example .env
+npm install
+npx playwright install chromium
+cp .env.example .env
 npm start
 ```
+
+### Configuration setup
+
+1. Copy `.env.example` to `.env`.
+2. Set `PORT=3000`, `SESSION_SECRET=...`, and `GROQ_API_KEY=...`.
+3. Optionally configure `DATABASE_URL`, `PERSISTENT_PROFILES`, and the X session check variables.
+4. Create a Groq key at <https://console.groq.com/keys> and paste it into the dashboard or `.env`.
+5. Restart the server.
+
+### How to connect X accounts
+
+- Start the server and open the dashboard at <http://localhost:3000>.
+- Click **Connect X**, enter the X handle, and complete the headful Chromium sign-in.
+- On headless servers, use the advanced fallback to paste `auth_token` and `ct0`.
+
+### Batch URL formatting rules
+
+- Enter one target tweet URL per line, such as `https://x.com/<user>/status/<id>`.
+- The Target Tweet URLs field accepts newline-separated values, and a `.txt` file upload is also supported.
+- For content shared through Telegram or other messaging apps, copy the original X/Twitter status URL and use that as the batch target.
 
 Open <http://localhost:3000>.
 
